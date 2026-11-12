@@ -9,6 +9,10 @@ claude="$HOME/.claude"   # the skill's Stop hook is written for this location
 skill="$claude/skills/dsk"
 agent="$claude/agents/dsk-reviewer.md"
 
+if ! python3 -c 'import sys; sys.exit(sys.version_info < (3, 13))' 2>/dev/null; then
+    echo "install.sh: dsk needs python3 to be Python 3.13 or newer. The Stop hook runs python3 too." >&2
+    exit 1
+fi
 mkdir -p "$claude/skills" "$claude/agents"
 chmod +x "$here/skill/scripts/dsk.py"
 if [ -L "$skill" ]; then
