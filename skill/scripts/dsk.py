@@ -6,7 +6,7 @@ Python script; dsk runs it and sends back only what it printed. One file,
 standard library only. See README.md for the protocol.
 """
 import argparse, ast, datetime, fcntl, hashlib, http.client, json, os, re, secrets, select, shutil, signal
-import socket, subprocess, sys, tempfile, time, traceback, types, urllib.error, urllib.request
+import socket, subprocess, sys, tempfile, threading, time, traceback, types, urllib.error, urllib.request
 from glob import translate as glob_regex
 
 IMPORTS = ("re", "json", "math", "itertools", "functools", "collections", "textwrap", "difflib", "datetime",
@@ -62,7 +62,7 @@ DEFAULTS = {
                               "model": "deepseek-flash", "compact_at": 48000, "extra": {}}},
     "search": {"base_url": "https://api.deepseek.com", "key_env": "DEEPSEEK_API_KEY"},
     "sh_deny": ["terraform apply", "terraform destroy", "kubectl apply", "kubectl delete", "helm install",
-                "helm upgrade", "helm uninstall", "pip install", "npm install"],
+                "helm upgrade", "helm uninstall", "pip install", "pip3 install", "npm install", "npm ci"],
     "env_pass": [],
     "backoff": [2, 6, 18],
     "limits": {"turn_seconds": 600, "run_seconds": 3600, "run_tokens": 2000000},
@@ -90,7 +90,9 @@ def config():
                 user = json.load(f)
         except ValueError as e:
             raise Fail(f"{path}: {e}") from None
-        for nested in ("profiles", "limits"):
+        for name, block in user.pop("profiles", {}).items():  # a profile, too, may hold only what differs
+            cfg["profiles"].setdefault(name, {}).update(block)
+        for nested in ("limits", "search"):
             cfg[nested].update(user.pop(nested, {}))
         cfg.update(user)
     return cfg
@@ -133,6 +135,7 @@ class Session:
             try:
                 with open(self.path, encoding="utf-8") as f:  # a line torn by a crash has no newline: skip it
                     self.recs = [json.loads(line) for line in f if line.endswith("\n")]
+                    self.alive = os.fstat(f.fileno()).st_mtime  # the last write or beat of the process that drove it
             except OSError:
                 raise Fail(f"no session {sid}") from None
 
@@ -142,6 +145,12 @@ class Session:
             f.write(json.dumps(rec, ensure_ascii=False) + "\n")
         self.recs.append(rec)
         return rec
+
+    def beat(self):
+        """Proof of life, once a second: a run killed mid-script is charged only for what changed while it lived."""
+        while True:
+            os.utime(self.path)
+            time.sleep(1)
 
     def of(self, *types):
         return [r for r in self.recs if r["t"] in types]
@@ -222,7 +231,7 @@ def post(url, key, payload, backoff):
     """POST with backoff on transient failures. Every retry sends the identical bytes."""
     for wait in [*backoff, None]:
         status, data = send(url, key, payload)
-        if status == 200 and "choices" in data and data["choices"][0].get("finish_reason") in (
+        if status == 200 and "choices" in data and data["choices"] and data["choices"][0].get("finish_reason") in (
                 "insufficient_system_resource", "aborted"):
             status, data = 503, "generation interrupted by the server"
         if status == 400 and "limit" in str(data).lower():  # some gateways report a rate or concurrency limit this way
@@ -287,8 +296,9 @@ NUDGE = ("Nothing was run: your reply was not exactly one run_code call with a `
 TRUNCATED = ("Your reply reached the output limit and was cut off, so nothing was run. Take smaller steps: write "
              "one file per script, and use edit() for small changes.")
 ONE_CALL = "not run: send exactly one run_code call per reply"
-BANNED = {"open": "read() or write()", "exec": "plain code", "eval": "plain code", "compile": "plain code",
-          "__import__": "an import statement", "input": "ask()"}
+OPENERS = ("open", "FileIO", "open_code")  # refused as attributes too, so `io` is no way around read() and write()
+BANNED = {**dict.fromkeys(OPENERS, "read() or write()"), "exec": "plain code", "eval": "plain code",
+          "compile": "plain code", "__import__": "an import statement", "input": "ask()"}
 HINTS = {"os": "sh(), glob() and read()", "sys": "print() and done()", "subprocess": "sh()", "shutil": "sh()",
          "pathlib": "read(), write() and glob()", "glob": "glob()", "time": "sh('sleep 1')", "urllib": "fetch()",
          "requests": "fetch()"}
@@ -322,14 +332,15 @@ def gate(script):
         for name in names:
             if name.startswith("__"):
                 return f"{name} is not allowed: no names starting with __; write plain top-level code"
-            if name in BANNED and (not isinstance(node, ast.Attribute) or name == "open"):
+            if name in BANNED and (not isinstance(node, ast.Attribute) or name in OPENERS):
                 return f"{name}() is not allowed; use {BANNED[name]}"
     return None
 
 
 # ---------------------------------------------------------------- script execution
 
-GIT_READ_ONLY = ("status", "diff", "log", "show", "grep", "ls-files", "blame", "rev-parse")
+GIT_READ_ONLY = ("status", "diff", "log", "show", "grep", "ls-files", "blame", "rev-parse", "rev-list")
+BRANCHES = re.compile(r"(?: (?:-[arv]+|--all|--remotes|--list|--show-current))* ?(?:$|[;&|)])")  # after `git branch`
 SECRET = re.compile(r"KEY|TOKEN|SECRET|PASSWORD|CREDENTIAL|^(AWS_|ARM_|AZURE_|GOOGLE_|KUBE|VAULT_|GH_|GITHUB_)"
                     r"|^SSH_AUTH_SOCK$", re.I)
 CAP = 6000  # characters of a turn's output that go back to the worker
@@ -345,10 +356,11 @@ def matcher(globs):
 
 def denied(cmd, deny):
     """Why sh() refuses this command, or None. It stops an obedient worker's mistake; it is not a sandbox."""
-    flat = " ".join(cmd.split())
+    flat = " ".join(re.sub(r"""(["']).*?\1""", " ", cmd).split())  # quoted text is an argument, not a command
     for found in re.finditer(r"""(?:^|[\s;&|(/"'])git\s+(?:-[cC]\s*\S+\s+|-\S+\s+)*([\w-]+)""", flat):
-        if found.group(1) not in GIT_READ_ONLY:
-            return f"git {found.group(1)} is refused: git is read-only here ({', '.join(GIT_READ_ONLY)})"
+        sub = found.group(1)
+        if sub not in GIT_READ_ONLY and not (sub == "branch" and BRANCHES.match(flat, found.end())):
+            return f"git {sub} is refused: git is read-only here ({', '.join(GIT_READ_ONLY)})"
     if re.search(r"(?:^|[\s;&|(/])sudo\s", flat + " "):
         return "sudo is refused"
     return next((f"`{d}` is refused" for d in deny if d in flat), None)
@@ -596,32 +608,35 @@ def run_script(s, cfg, env, turn, script):
 # ---------------------------------------------------------------- git snapshots and gates
 
 def git(cwd, *args, env=None, stdin=None):
-    done = subprocess.run(["git", *args], cwd=cwd, env=env, input=stdin, capture_output=True, encoding="utf-8",
-                          errors="surrogateescape")
+    done = subprocess.run(["git", *args], cwd=cwd, env=env, capture_output=True,
+                          input=None if stdin is None else stdin.encode("utf-8", "surrogateescape"))
     if done.returncode:
-        raise Fail(f"git {args[0]}: {' '.join(done.stderr.split())[:300]}")
-    return done.stdout
+        raise Fail(f"git {args[0]}: {' '.join(done.stderr.decode('utf-8', 'replace').split())[:300]}")
+    return done.stdout.decode("utf-8", "surrogateescape")  # not text mode, which turns the \r\n in a patch into \n
 
 
-def snapshot(cwd, index):
+def snapshot(cwd, index, older=None, late=()):
     """The working tree as a tree object, built in the session's own index so mine is untouched. The index is
-    kept between snapshots, so only files that changed are hashed again."""
+    kept between snapshots, so only files that changed are hashed again. Paths in `late` go in as in `older`."""
     mine = os.path.join(cwd, git(cwd, "rev-parse", "--git-path", "index").strip())
     if not os.path.exists(index) and os.path.exists(mine):
         shutil.copy2(mine, index)  # copy2 keeps the index's own mtime, which git needs to spot same-second edits
     env = {**os.environ, "GIT_INDEX_FILE": index}
     git(cwd, "add", "-A", env=env)
+    if late:
+        git(cwd, "reset", "-q", older, "--", *[":(literal)" + path for path in late], env=env)
     return git(cwd, "write-tree", env=env).strip()
 
 
-def tree(s):
-    return snapshot(s.head["workdir"], os.path.join(s.dir, "index"))
+def tree(s, older=None, late=()):
+    return snapshot(s.head["workdir"], os.path.join(s.dir, "index"), older, late)
 
 
-def settle(s, before, turn=None):
+def settle(s, before, turn=None, alive=None):
     """Attribute to the worker what changed since the tree `before`, taken just before a script or the checks
     ran: edits anyone else makes between turns are never the worker's. Changes outside --allow are undone, and a
-    copy of what is undone stays in the session directory. Logs the result and returns the reverted paths."""
+    copy of what is undone stays in the session directory. Logs the result and returns the reverted paths.
+    `alive` is given when the run died in the middle: what was touched after that time is someone else's."""
     if not before:
         return []
     workdir, allowed = s.head["workdir"], matcher(s.head["allow"])
@@ -633,6 +648,10 @@ def settle(s, before, turn=None):
         here = os.path.realpath(workdir)
         wrote = {os.path.relpath(os.path.realpath(os.path.join(here, r["arg"])), here) for r in calls if r["fn"] in ("write", "edit")}
         pairs = [(kind, path) for kind, path in pairs if path in wrote]
+    if alive:  # a deletion carries no time, so it still counts: restoring a file loses nothing
+        late = [path for kind, path in pairs
+                if kind != "D" and os.lstat(os.path.join(workdir, path)).st_ctime > alive]
+        pairs, s.late = [(kind, path) for kind, path in pairs if path not in late], (before, late)
     outside = [(kind, path) for kind, path in pairs if not allowed(path)]
     for kind, path in outside:
         current, kept = os.path.join(workdir, path), os.path.join(s.dir, "reverted", path)
@@ -678,11 +697,12 @@ def gates(s, cfg, env):
 
 def changes(s):
     """(The tree of the working directory now, [added, deleted, path] for each file the worker changed since the
-    start.) A file that only someone else changed during the run is not part of the worker's change set."""
+    start.) A file that only someone else changed during the run is not part of the worker's change set. After
+    a run that died, a file touched since is in the tree as the run last saw it, so --drop will not undo that."""
     head = s.head
     if not head["start"]:
         return None, []
-    end, touched = tree(s), {path for g in s.of("gate") for path in g.get("touched", [])}
+    end, touched = tree(s, *getattr(s, "late", ())), {path for g in s.of("gate") for path in g.get("touched", [])}
     stat = git(head["workdir"], "diff", "--numstat", "--no-renames", "-z", head["start"], end)
     return end, [entry.split("\t") for entry in stat.split("\0") if entry and entry.split("\t")[2] in touched]
 
@@ -700,11 +720,15 @@ def halt(s, status=None, **info):
     """Record a stop: snapshot the tree, measure what the worker changed, log the state."""
     end, changed = changes(s)
     if s.head["web"] and "summary" in info:  # research gate: a cited URL must come from search() or fetch() here
-        seen = {u.rstrip("/") for r in s.of("ledger") if r["fn"] in ("search", "fetch") and "err" not in r
+        page = lambda u: u.split("#")[0].rstrip("/")  # noqa: E731 (an anchor is still the page that was opened)
+        seen = {page(u) for r in s.of("ledger") if r["fn"] in ("search", "fetch") and "err" not in r
                 for u in r.get("urls") or [r["arg"]]}
-        cited = sorted({u.rstrip(".,;:!?/") for u in re.findall(r"https?://[^\s<>\"'`)\]]+", answer_text(s, info["summary"]))})
-        info.update(cited=len(cited), unverified=[u for u in cited if u not in seen])
+        found = re.findall(r"https?://(?:[^\s<>\"'`()\]]|\([^\s<>\"'`()]*\))+", answer_text(s, info["summary"]))
+        cited = sorted({u.rstrip(".,;:!?/") for u in found})  # a URL may hold a balanced pair of brackets, as wikis do
+        info.update(cited=len(cited), unverified=[u for u in cited if page(u) not in seen])
     status = status or ("review" if changed else "done")
+    if status == "done" and s.head["worktree"]:  # nothing to apply, so nothing needs the worktree any more
+        remove_worktree(s.head)
     s.add("state", status=status, end=end, changed=changed, **info)
     return status
 
@@ -720,6 +744,7 @@ def digest(recs, upto, changed):
     for r in ledger:
         if r["fn"] == "ask":
             out += [f"you asked: {r['arg']}", f"the lead answered: {next(answers, '(not yet)')}"]
+    out += [f"the lead sent your work back: {r['text']}" for r in recs if r["t"] == "reject"]
     acts = [r for r in ledger if r["turn"] <= upto and r["fn"] in ("write", "edit", "sh", "search", "fetch")]
     out += [f"t{r['turn']} {r['fn']} {r['arg']}" + (" (failed)" if "err" in r else f" → {r['code']}" if r["fn"] == "sh" else "")
             for r in acts[-80:]]
@@ -813,14 +838,14 @@ def loop(s, cfg, extra=""):
                 s.add("msg", turn=pending["turn"], m={"role": "tool", "tool_call_id": call["id"], "content": ONE_CALL})
             target = {"role": "tool", "tool_call_id": calls[-1]["id"]} if calls else {"role": "user"}
             s.add("msg", turn=pending["turn"], m={**target, "content": pending["text"] + extra})
-            extra = ""
             compact(s, cfg)
         previous = next((said(r["m"]) for r in reversed(s.of("msg")) if r["m"]["role"] == "assistant"), None)
         reply, finish = chat(s, cfg)
         turn = s.turn + 1
         s.add("msg", turn=turn, m=reply)
         left = max(0, head["max_turns"] - len(s.since("round", "result")) - 1)
-        repeated = said(reply) == previous
+        repeated = said(reply) == previous and not extra  # once the lead has spoken, the same script is a new try
+        extra = ""
         if repeated:
             body, failed, stop = "not run: this reply is identical to your previous one", "repeat", None
         else:
@@ -933,6 +958,7 @@ def report(s, review=False):
 def drive(s, cfg, extra=""):
     """Run the loop to its next stop, print the report, return the exit code. Any failure becomes `error`."""
     s.add("state", status="running")
+    threading.Thread(target=s.beat, daemon=True).start()
     try:
         loop(s, cfg, extra)
     except (Exception, KeyboardInterrupt) as e:
@@ -953,14 +979,16 @@ def resume(sid, *states):
     s = Session(sid).lock()
     if s.head["start"] and not s.head["worktree"]:
         s._tree = tree_lock(s.head["root"])
+    if s.status() not in states:  # checked first: a command that is refused must leave the log and the tree alone
+        raise Fail(f"session {sid} is {s.status()}; this command needs {' or '.join(states)}")
+    with open(s.path, "rb+") as f:  # cut off a line torn by a crash, or the next record would run on from it
+        f.truncate(f.read().rfind(b"\n") + 1)
     if s.last("state")["status"] == "running":  # we hold its lock, so the process that ran it died: record where it stopped
         window = s.last("span", "gate")
         if window and window["t"] == "span":
-            settle(s, window["before"])
+            settle(s, window["before"], alive=s.alive + 2)  # its beats were a second apart
         end, changed = changes(s)
         s.add("state", status="error", end=end, changed=changed, error="interrupted: its dsk process was killed")
-    if s.status() not in states:
-        raise Fail(f"session {sid} is {s.status()}; this command needs {' or '.join(states)}")
     return s
 
 

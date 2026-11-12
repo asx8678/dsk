@@ -36,7 +36,7 @@ dsk run [--allow GLOB]... [--check CMD]... [--file PATH]... [--web] [--worktree]
 - **`--web`:** search and fetch, for research. Leave it off for tasks that also run commands in a repository with secrets.
 - **`--owner`:** always pass `${CLAUDE_SESSION_ID}`; the Stop hook needs it.
 - **`--effort`:** only for briefs that need judgment. The default is no thinking.
-- Paths, globs and checks are relative to the repository root, wherever you call `dsk` from.
+- `--allow` globs and `--check` commands are relative to the repository root, wherever you call `dsk` from. `--file` and `--brief` paths are relative to the directory you call it from.
 - **Short tasks:** run in the foreground with a Bash timeout of 600000 ms, and do not touch the tree until it returns. If the timeout passes, the run is moved to the background and keeps going: wait for its completion notice. While one of the worker's shell commands is running, any change outside `--allow` is undone (a copy is kept in the session directory), whoever made it.
 - **Long or parallel tasks:** add `--worktree` and start it as a background Bash command. Keep working in the main tree and review when it reports. A worktree has no git-ignored files, so a check that needs `node_modules` or a virtualenv must create them.
 - **One in-place run per tree.** A second run without `--worktree` is refused while the first is working, and so is `dsk accept` of a worktree session. Wait, or use `--worktree`.

@@ -297,6 +297,19 @@ class Wire(Case):
         with open(s.path) as f:
             self.assertNotIn("sk-fake", f.read())
 
+    def test_a_built_in_profile_and_the_search_block_may_be_overridden_in_part(self):
+        self.config = {"profiles": {"official": {"compact_at": 24000}}, "search": {"key_env": "KEY_S"}}
+        self.write_config()
+        cfg = dsk.config()
+        self.assertEqual({k: cfg["profiles"]["official"][k] for k in ("base_url", "key_env", "compact_at")},
+                         {"base_url": "https://api.deepseek.com", "key_env": "DEEPSEEK_API_KEY", "compact_at": 24000})
+        self.assertEqual(cfg["search"], {"base_url": "https://api.deepseek.com", "key_env": "KEY_S"})
+
+    def test_a_reply_without_choices_is_an_error_that_names_the_provider(self):
+        with mock.patch.object(dsk, "send", return_value=(200, {"choices": []})):
+            with self.assertRaisesRegex(dsk.Fail, "a: unexpected response"):
+                dsk.chat(self.session(route=["a"]), dsk.config())
+
 
 class Cli(Case):
     """Drives the real command line against the fake API."""
@@ -363,7 +376,9 @@ class Gate(unittest.TestCase):
                  "from pathlib import Path": "read()", "import requests": "fetch()", "import sys": "done()",
                  "import mypackage.core": "sh('python3 ...') to run the project's own code", "from . import x": "import",
                  "open('x')": "read()", "f = open": "read()", "import io\nio.open('x')": "read()",
-                 "from io import open": "read()", "exec('1')": "plain code", "eval('1')": "plain code",
+                 "from io import open": "read()", "import io\nio.FileIO('x', 'w')": "write()",
+                 "from io import FileIO": "write()", "import io\nio.open_code('x')": "read()",
+                 "exec('1')": "plain code", "eval('1')": "plain code",
                  "compile('1', '', 'exec')": "plain code", "__import__('os')": "__",
                  "input()": "ask()", "x = ().__class__": "__", "print(__builtins__)": "__",
                  "if __name__ == '__main__':\n    pass": "top-level"}
@@ -450,7 +465,8 @@ class Loop(Cli):
         attempts = ['sh("git commit -m x")', 'sh("cd . && git push")', 'sh("/usr/bin/git stash")', 'sh("sudo ls")',
                     'sh("pip install x")', 'read("../outside.txt")', 'read("/etc/hosts")', 'write("../x", "1")',
                     'write("src/a.py", "1")', 'edit("src/a.py", "a", "b")', 'write("t.py", "1")', 'search("q")',
-                    'fetch("http://x")']
+                    'fetch("http://x")', 'sh("git branch -D master")', 'sh("git branch -a scratch")',
+                    'sh("pip3 install x")', 'sh("npm ci")']
         body = "attempts = [" + ", ".join(f"lambda: {a}" for a in attempts) + """]
 for attempt in attempts:
     try:
@@ -462,12 +478,14 @@ write("tests/new/deep.py", "ok = 1\\n")
 edit("tests/t.py", "t = 1", "t = 2")
 print(sh("git status --short").code, sh("git -C . log --oneline -1").code, sh("git --no-pager diff --stat").code,
       grep("needle", glob("tests/*.txt")) == grep("needle", "tests/*.txt") == [("tests/list.txt", 1, "needle")])
+print(sh("git rev-list --all | wc -l").code, sh("git branch -a; git branch --list 'm*'").code,
+      sh("echo 'run git push first' && echo \\"git commit, then pip install\\"").code)
 done("tried everything")"""
         self.api.replies = [script(body)]
         out, sid = self.run_ok("--allow", "tests/**", "probe", cwd=repo)
         printed = self.output(sid, 1).splitlines()
-        self.assertEqual([line[:8] for line in printed[:-1]], ["refused:"] * len(attempts), printed)
-        self.assertEqual(printed[-1], "0 0 0 True")
+        self.assertEqual([line[:8] for line in printed[:-2]], ["refused:"] * len(attempts), printed)
+        self.assertEqual(printed[-2:], ["0 0 0 True", "0 0 0"])  # reading git and quoted mentions are not refused
         self.assertIn("src/a.py does not match the allow patterns (tests/**)", printed[8])
         self.assertIn("needs --web", printed[11])
         self.assertEqual((self.cat(repo, "src/a.py"), self.cat(repo, "tests/t.py"), self.cat(repo, "tests/new/deep.py")),
@@ -521,6 +539,15 @@ done("tried everything")"""
         self.assertIn("why:     same reply twice in a row", out)
         self.assertEqual(self.output(sid, 1), "once\n")
         self.assertFalse(os.path.exists(f"{self.tmp}/state/dsk/{sid}/out/2"))
+
+    def test_the_same_script_is_run_again_once_the_lead_has_spoken(self):
+        repo = self.repo({"a.txt": "one\n"})
+        self.api.replies = [script('r = sh("test -f flag.txt")\nprint(r.code)\nif r.code == 0:\n    done("the flag is there")')] * 2
+        _, sid = self.run_ok("--max-turns", "1", "check the flag", cwd=repo, code=3)
+        self.put(repo, {"flag.txt": "now it exists\n"})
+        code, out, _ = self.dsk("reject", sid, "I created flag.txt. Run the same check again.", cwd=repo)
+        self.assertEqual((code, self.output(sid, 2)), (0, "0\n"), out)
+        self.assertIn("answer:  the flag is there\n", out)
 
     def test_turn_limit(self):
         self.api.replies = [script(f'print({n})') for n in range(3)]
@@ -776,6 +803,19 @@ class Compaction(Cli):
                                   capture_output=True, text=True).stdout for seed in ("1", "2", "3")}
         self.assertEqual(outputs, {dsk.dumps(logged)})
 
+    def test_the_defect_list_survives_compaction(self):
+        self.config["profiles"]["a"]["compact_at"] = 4000
+        self.write_config()
+        repo = self.repo({"big.txt": "x" * 20000 + "\n", "tests/t.py": "t = 1\n"})
+        self.api.replies = [script('edit("tests/t.py", "t = 1", "t = 2")\ndone("bumped")')]
+        _, sid = self.run_ok("--file", "big.txt", "--allow", "tests/**", "bump t", cwd=repo)
+        self.api.replies = [script('print("two")'), script('print("three")'), script('print("four")'), script('done("five")')]
+        self.assertEqual(self.dsk("reject", sid, "1. t must be 3\n2. add a test", cwd=repo)[0], 0)
+        self.assertEqual([(r["why"], r.get("turn")) for r in dsk.Session(sid).of("series")], [("start", None), ("compact", 3)])
+        compacted = self.api.bodies()[3]["messages"]
+        self.assertNotIn("t must be 3", json.dumps(compacted[2:]))  # the turn that carried the list is gone
+        self.assertIn("\nthe lead sent your work back: 1. t must be 3\n2. add a test\nt1 edit tests/t.py\n", compacted[1]["content"])
+
 
 class Review(Cli):
     WORK = ('note("t.py holds the constant")\nedit("tests/t.py", "t = 1", "t = 2")\n'
@@ -880,6 +920,37 @@ class Review(Cli):
         self.assertEqual(self.dsk("reject", sid, "--drop", cwd=repo)[0], 0)
         self.assertEqual((self.git(repo, "branch", "--list", f"dsk/{sid}"), os.path.exists(f"{self.tmp}/state/dsk/{sid}/wt")), ("", False))
         self.assertEqual(self.cat(repo, "tests/t.py"), "t = 7  # I changed the same line\n")
+
+    def test_a_worktree_run_that_changes_nothing_leaves_no_worktree_behind(self):
+        repo = self.repo({"src/a.py": "a = 1\n"})
+        self.api.replies = [script('done("a is 1")')]
+        out, sid = self.run_ok("--worktree", "what is a?", cwd=repo)
+        self.assertIn("· done ·", out)
+        self.assertEqual((self.git(repo, "branch", "--list", f"dsk/{sid}"), os.path.exists(f"{self.tmp}/state/dsk/{sid}/wt")), ("", False))
+        self.assertEqual(self.dsk("show", sid, "--answer", cwd=repo)[1], "a is 1\n")
+
+    def raw(self, *parts):
+        with open(os.path.join(*parts), "rb") as f:  # `cat` reads as text, which hides the line endings
+            return f.read()
+
+    def test_crlf_line_endings_survive_a_worktree_run_from_seed_to_accept(self):
+        repo = self.repo({"src/a.bat": "a = 1\r\nb = 1\r\n", "tests/t.py": "t = 1\r\nu = 1\r\n"})
+        self.put(repo, {"src/a.bat": "a = 1\r\nb = 2\r\n"})  # my uncommitted edit, which the worktree is seeded with
+        self.api.replies = [script('print(repr(read("src/a.bat")))\nedit("tests/t.py", "t = 1", "t = 2")\n'
+                                   'write("tests/new.bat", "n = 1\\r\\n")\ndone("x")')]
+        _, sid = self.run_ok("--worktree", "--allow", "tests/**", "bump t", cwd=repo)
+        self.assertEqual(self.output(sid, 1), repr("a = 1\r\nb = 2\r\n") + "\n")
+        self.assertEqual(self.dsk("accept", sid, cwd=repo)[0], 0)
+        self.assertEqual((self.raw(repo, "tests/t.py"), self.raw(repo, "tests/new.bat"), self.raw(repo, "src/a.bat")),
+                         (b"t = 2\r\nu = 1\r\n", b"n = 1\r\n", b"a = 1\r\nb = 2\r\n"))
+
+    def test_drop_in_place_restores_a_file_with_crlf_line_endings(self):
+        repo = self.repo({"tests/t.py": "t = 1\r\nu = 1\r\n"})
+        self.api.replies = [script('edit("tests/t.py", "t = 1", "t = 2")\ndone("x")')]
+        _, sid = self.run_ok("--allow", "tests/**", "bump t", cwd=repo)
+        self.assertEqual(self.raw(repo, "tests/t.py"), b"t = 2\r\nu = 1\r\n")
+        self.assertEqual(self.dsk("reject", sid, "--drop", cwd=repo)[0], 0)
+        self.assertEqual(self.raw(repo, "tests/t.py"), b"t = 1\r\nu = 1\r\n")
 
 
 class Protocol(Cli):
@@ -996,6 +1067,13 @@ class Protocol(Cli):
         self.assertEqual(sum(r["path"] == "/v1/tools/fetch" for r in self.api.requests), 1)  # the second read is not billed
         self.assertTrue(out.splitlines()[0].endswith(" · fetch 1"))
 
+    def test_a_cited_url_may_hold_brackets_and_an_anchor(self):
+        self.api.pages = {"https://ok.example/wiki/B_(letter)": {"title": "B", "content": "Body."}}
+        self.api.replies = [script('fetch("https://ok.example/wiki/B_(letter)")\n'
+                                   'done("See (https://ok.example/wiki/B_(letter)#history) and https://ok.example/wiki/B_(letter).")')]
+        out, _ = self.run_ok("--web", "research this")
+        self.assertIn("sources: 2 cited, all opened in this session\n", out)
+
     def test_raw_search_and_fetch(self):
         self.api.search_results = [{"title": "T", "url": "https://ok.example/a", "date": None, "summary": "S"}] * 3
         self.api.pages = {"https://ok.example/b": {"title": "Page B", "content": "Body of B."}}
@@ -1038,6 +1116,58 @@ class Protocol(Cli):
             self.assertEqual(self.dsk("reject", sid, "--drop", cwd=repo)[0], 0, kill)
             self.assertEqual((sorted(os.listdir(f"{repo}/src")), sorted(os.listdir(f"{repo}/tests"))), (["a.py"], ["t.py"]), kill)
             self.assertEqual(self.cat(self.tmp, "state/dsk", sid, "reverted/src/stray.py"), "stray\n")
+
+    def killed(self, repo, *replies, sleeping):
+        """Start a run, kill dsk hard while its script sleeps, and come back after its last beat and the margin."""
+        self.api.replies = list(replies)
+        proc = subprocess.Popen([sys.executable, DSK, "run", "--allow", "tests/**", "edit"], cwd=repo, env=self.env,
+                                stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+        self.wait_for(sleeping)
+        proc.kill()
+        proc.communicate(timeout=30)
+        subprocess.run(["pkill", "-f", sleeping])
+        __import__("time").sleep(2.2)
+        return next(d for d in os.listdir(f"{self.tmp}/state/dsk") if os.path.exists(f"{self.tmp}/state/dsk/{d}/log.jsonl"))
+
+    def test_a_killed_run_is_charged_only_for_what_changed_while_it_lived(self):
+        repo = self.repo({"src/a.py": "a = 1\n", "docs/old.md": "old\n", "tests/t.py": "t = 1\n"})
+        sid = self.killed(repo, script('sh("echo stray > src/stray.py; echo n > tests/new.py; sleep 49.876")'),
+                          sleeping="sleep 49.876")
+        mine = {"src/a.py": "a = 1\nmine = True\n", "src/mine.py": "written later\n", "tests/t.py": "t = 1\nmine = True\n"}
+        self.put(repo, mine)
+        os.remove(f"{repo}/docs/old.md")
+        code, out, _ = self.dsk("accept", sid, cwd=repo)
+        self.assertEqual((code, os.path.exists(f"{repo}/src/stray.py")), (1, True), out)  # refused, so nothing was settled
+        self.assertEqual(self.dsk("reject", sid, "--drop", cwd=repo)[0], 0)
+        self.assertEqual({name: self.cat(repo, name) for name in mine}, mine)
+        self.assertEqual((os.path.exists(f"{repo}/src/stray.py"), os.path.exists(f"{repo}/tests/new.py")), (False, False))
+        self.assertEqual(self.cat(self.tmp, "state/dsk", sid, "reverted/src/stray.py"), "stray\n")
+        self.assertEqual(self.cat(repo, "docs/old.md"), "old\n")  # a deletion carries no time, so it is put back
+
+    def test_drop_after_a_kill_refuses_to_undo_my_later_edit_to_a_file_the_run_had_changed(self):
+        repo = self.repo({"tests/t.py": "t = 1\n"})
+        sid = self.killed(repo, script('edit("tests/t.py", "t = 1", "t = 2")'), script('sh("sleep 49.877")'),
+                          sleeping="sleep 49.877")
+        self.put(repo, {"tests/t.py": "t = 2\nmine = True\n"})
+        code, out, _ = self.dsk("reject", sid, "--drop", cwd=repo)
+        self.assertEqual(code, 1, out)
+        self.assertIn("the tree has moved since the run, nothing was reverted", out)
+        self.assertEqual(self.cat(repo, "tests/t.py"), "t = 2\nmine = True\n")
+        self.assertIn("changed: tests/t.py (+1 -1)\n", self.dsk("show", sid, cwd=repo)[1])  # the run's edit, not mine
+        self.put(repo, {"tests/t.py": "t = 2\n"})  # once the file is as the run left it, the drop goes through
+        self.assertEqual(self.dsk("reject", sid, "--drop", cwd=repo)[0], 0)
+        self.assertEqual(self.cat(repo, "tests/t.py"), "t = 1\n")
+
+    def test_a_torn_last_line_is_cut_off_before_the_next_record(self):
+        self.api.replies = [script('done("x")')]
+        _, sid = self.run_ok("finish")
+        path = f"{self.tmp}/state/dsk/{sid}/log.jsonl"
+        with open(path, "a") as f:
+            f.write('{"t": "ledger", "turn": 1, "fn": "sh", "arg": "sle')
+        self.assertEqual(self.dsk("reject", sid, "--drop")[0], 0)
+        with open(path) as f:
+            self.assertEqual([json.loads(line)["t"] for line in f][-1], "state")
+        self.assertEqual((self.dsk("show", sid)[1].split(" · ")[1], self.dsk("status")[0]), ("dropped", 0))
 
     def wait_for(self, pattern):
         for _ in range(200):
