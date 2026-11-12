@@ -1,6 +1,6 @@
 # dsk
 
-A small headless CLI that Claude Code calls through Bash to hand work to DeepSeek V4.1 Flash. Claude plans and reviews; DeepSeek writes code, tests, docs and web research. One Python file, standard library only, Python 3.13 or newer.
+A small headless CLI that Claude Code calls through Bash to hand work to DeepSeek V4.1 Flash. Claude plans and reviews; DeepSeek writes code, tests, docs and web research. One Python file, standard library only, Python 3.14 or newer.
 
 Each turn the worker sends one Python script. The script reads, edits, runs and searches through a small function API, and only what it prints comes back. A task takes about 3 turns, not 30.
 
@@ -23,12 +23,12 @@ Then, by hand:
        "official":   {"base_url": "https://api.deepseek.com", "key_env": "DEEPSEEK_API_KEY", "model": "deepseek-flash", "compact_at": 48000, "extra": {}}
      },
      "search": {"base_url": "https://api.deepseek.com", "key_env": "DEEPSEEK_API_KEY"},
-     "sh_deny": ["terraform apply", "kubectl delete", "pip install", "npm install"],
+     "sh_deny": ["make deploy", "docker push"],
      "env_pass": []
    }
    ```
 
-   The `official` profile, the `search` block and a default `sh_deny` list are built in, so the file may hold only what differs, down to one field of a profile or of the `search` block. A `sh_deny` list in the file replaces the built-in one. `extra` is merged into the request body; a `null` value removes a key the provider rejects. Optional keys: `backoff` (retry waits in seconds, default `[2, 6, 18]`) and `limits` (`turn_seconds` 600, `run_seconds` 3600, `run_tokens` 2000000).
+   The `official` profile, the `search` block and a default `sh_deny` list are built in, so the file may hold only what differs, down to one field of a profile or of the `search` block. A `sh_deny` list in the file adds to the built-in one; a built-in entry cannot be removed. A broken file, or a profile without `base_url`, `key_env` or `model`, ends every command with one `dsk · error:` line that names the file. `extra` is merged into the request body; a `null` value removes a key the provider rejects. Optional keys: `backoff` (retry waits in seconds, default `[2, 6, 18]`) and `limits` (`turn_seconds` 600, `run_seconds` 3600, `run_tokens` 2000000).
 3. **Check it.** `dsk doctor` tests each profile: the key, the model ID, that thinking-off is honoured, five replies over a three-turn exchange, and whether and where cached tokens are reported.
 4. **Permissions.** The skill pre-approves `dsk` only for the turn that invokes it. For later turns and background runs, add `"Bash(dsk *)"` to `permissions.allow` in `~/.claude/settings.json`.
 
@@ -44,8 +44,6 @@ dsk accept ID              mark as reviewed; after --worktree, apply the changes
 dsk reject ID "defects"    send defects back into the same session; the run continues
 dsk reject ID --drop       discard the work
 dsk status [--hook]        this project's open sessions; --hook is the Claude Code Stop hook
-dsk search "query"         raw web search, no model
-dsk fetch URL              raw page fetch, no model
 dsk doctor [--profile NAME]
 ```
 
@@ -87,7 +85,7 @@ next:    dsk show 7f3a --review | dsk accept 7f3a | dsk reject 7f3a "defects"
 
 **Compaction.** When the last request exceeds the profile's `compact_at`, the series restarts as: system prompt, first message with a digest in place of the large attached files, then the last two turns verbatim. Attached files of up to 4,000 characters stay. If larger ones were dropped, one last message names them and tells the worker to read a file again before relying on it. The digest holds all notes, every question with its answer, every defect list sent with `reject`, one ledger line per action in the dropped turns, and the files changed so far. There is no model call, so the same log always compacts to the same bytes.
 
-**Gates.** Write mode (`--allow`) needs a git repository.
+**Gates.** Write mode (`--allow`) needs a git repository. An `--allow` value that ends in `/` or names a directory means everything under it (`--allow tests` is `tests/**`, `--allow .` is `**`); a leading `./` is ignored. `write()` and `edit()` refuse the repository's own `.git` (in any letter case), whatever `--allow` says; `.github/` and `.gitignore` are ordinary paths. An `answer:` or `summary:` line longer than 1,500 characters is cut and ends with how many were left out and `dsk show ID --answer`.
 - *Snapshots:* the working tree is recorded as a tree object at start, around every script and check, and at every stop, in an index kept in the session directory, so your own index is untouched and only changed files are hashed again. Only what changes while a script or a check is running is attributed to the worker. Its change set is those files, from the start snapshot to the last stop, so it excludes your uncommitted changes and anything you edit between its turns.
 - *Scope:* after every script and after the checks, what changed outside `--allow` during that script is undone by `dsk`, listed as `scope: reverted ...`, and reported to the worker. A copy of whatever is undone stays in the session directory. A script that started no shell command is charged only for the files it wrote, since `write` and `edit` are checked when called. A script that is interrupted or killed is still settled, by the same run or by the next command on the session that is not refused. A running `dsk` touches its log once a second. When a killed run is settled later, only files last touched up to two seconds after the final touch count as its work, so what you do in the tree afterwards is left alone. A deletion carries no time and is put back. If you later edit a file the run itself had changed, `--drop` refuses, as it does whenever the tree has moved.
 - *One in-place run per tree:* a second run without `--worktree` is refused while the first is working, so one run never undoes another's work.
@@ -97,13 +95,18 @@ next:    dsk show 7f3a --review | dsk accept 7f3a | dsk reject 7f3a "defects"
 
 **Worktrees.** `--worktree` runs the task in a fresh git worktree seeded with your uncommitted state. `accept` applies the worker's diff to the main tree with `git apply`: changes land uncommitted, a conflict is refused as a whole, and it waits for any in-place run in that tree. A worktree run that changes nothing ends `done` and removes its worktree and branch at once. In place, `reject --drop` reverse-applies the worker's diff and refuses if those files have moved.
 
-**Providers.** A session starts on the first profile in `route`. On 402, or when retries of a network failure, 408, 429 or 5xx are used up, it continues on the next profile in a new series. A 400 whose message mentions a limit is treated as a 429, because one gateway reports its concurrency limit that way.
+**Providers.** A session starts on the first profile in `route`. On 402, or when retries of a network failure, 408, 429 or any status from 500 to 599 are used up, it continues on the next profile in a new series. A 400 carrying `tier_limit_exceeded` is treated as a 429, because one gateway reports its concurrency limit that way; any other 400 fails at once. A redirect is refused, not followed, and counts as an error: `urllib` would resend the key to the new address.
 
 **State** lives in `~/.local/state/dsk/<id>/`: the log, full turn outputs, the answer, the worktree and a lock.
 
 ## Guardrails, stated honestly
 
-The AST gate, the scrubbed environment, the denylist and the scope gate stop an obedient but mistaken model. They are not a sandbox: a worker with `sh()` is as powerful as a shell and can read any file you can. The gate refuses `open` and the `io` openers by name, but not a module reached through another module's attributes, such as `fnmatch.os`; what a script changes that way, without `sh()`, appears in neither `changed:` nor `scope:`. Keep `--web` off for tasks that also need `sh()` in a repository with secrets, because fetched pages are untrusted input. Nothing here prevents running `dsk` inside a container.
+The AST gate, the scrubbed environment, the denylist and the scope gate stop an obedient but mistaken model. They are not a sandbox: a worker with `sh()` is as powerful as a shell and can read any file you can. The gate refuses `open` and the `io` openers by name, but not a module reached through another module's attributes, such as `fnmatch.os`; what a script changes that way, without `sh()`, appears in neither `changed:` nor `scope:`. Keep `--web` off for tasks that also need `sh()` in a repository with secrets, because fetched pages are untrusted input. That includes dsk's own keys: with the documented install they sit in `~/.config/dsk/env`, which any script can read through `sh()`. Nothing here prevents running `dsk` inside a container.
+
+What the gates do not see:
+- *Outside a git repository* nothing is tracked or undone, so a run without `--allow` is read-only only as far as the worker obeys. In a repository it is enforced: every change git sees is undone.
+- *In any run,* changes to git-ignored files and whatever `sh()` writes under `.git/` are not seen by the scope gate. Only `write()` and `edit()` refuse `.git`, and only the repository's own, not one in a subfolder.
+- *The environment* loses every variable whose name looks like a credential (`KEY`, `TOKEN`, `SECRET`, `PASSWORD`, cloud prefixes), but connection URLs such as `DATABASE_URL` or `SENTRY_DSN` are passed on to scripts and checks. `GH_TOKEN` is set to a dummy value so that `gh` does not fall back to its stored login; to give a check a real one, name `GH_TOKEN` in `env_pass`. `PYTHONDONTWRITEBYTECODE=1` keeps a check that imports the code from adding `__pycache__` files to the change set.
 
 An in-place run cannot tell its own script's side effects from an edit someone else makes during the same seconds. Such an edit outside `--allow` is undone with the script's (a copy is kept). Use `--worktree` when anyone else is working in the tree.
 
@@ -129,12 +132,13 @@ Measured on 2026-11-11 with `deepseek-flash` on the official API and `deepseek-v
 - **The git list adds `rev-list` and a `git branch` that only lists.** These two were refused in 16 of 1,268 trial turns. Quoted text is no longer checked, which ends refusals such as `pytest -k 'git and not slow'`. The built-in `sh_deny` list adds `pip3 install` and `npm ci`.
 - **`python3 -I` discards `PYTHONHASHSEED`,** so the seed is pinned for `sh()` and checks but not for the script process itself.
 - **In a git repository the working directory is the repository root.**
-- **Size:** `dsk.py` has 1,295 lines, over the 1,000-line target. It is under the 1,300-line limit only because 33 lines are longer than 120 characters; wrapped, it would be about 30 over. By your rule the next step is to cut a feature: the candidates are `doctor` (about 55 lines), the raw `search` and `fetch` commands (12), and the time and token limits (6).
+- **The raw `dsk search` and `dsk fetch` commands were removed** to stay under the 1,300-line limit. `search()` and `fetch()` inside scripts, with `--web`, and the `search:` line of `dsk doctor` work as before.
+- **Size:** `dsk.py` has 1,300 lines, over the 1,000-line target and exactly at the 1,300-line limit, and only because 34 lines are longer than 120 characters; wrapped, it would be about 30 over. The raw `search` and `fetch` commands were cut to pay for the fixes of the 2026-11-12 review. The candidates left to cut are `doctor` (about 55 lines) and the time and token limits (6).
 
 ## Tests
 
 ```
-python3 -m unittest discover -s tests     # 83 tests against a scripted API server and temp git repositories
+python3 -m unittest discover -s tests     # 99 tests against a scripted API server and temp git repositories
 python3 tests/live.py --table             # real toy tasks on the real providers; costs a few cents
 ```
 

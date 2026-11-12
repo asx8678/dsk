@@ -30,10 +30,10 @@ dsk run [--allow GLOB]... [--check CMD]... [--file PATH]... [--web] [--worktree]
 ```
 
 - **Brief:** two to five lines saying what to produce and what done looks like. Structure goes in the flags; project facts go in `DSK.md`. Name files and functions by path: the worker asks when a task cannot be done as written, but when a name fits two things it picks the likelier one without saying so.
-- **`--allow`:** the only paths the worker may change. Make it as narrow as the task permits. `*` stays inside one directory, `**` crosses them. Without `--allow` the run is read-only.
+- **`--allow`:** the only paths the worker may change. Make it as narrow as the task permits. `*` stays inside one directory, `**` crosses them; a directory name (`tests`, `tests/`) means everything under it. Without `--allow` the run is read-only: in a git repository every change git sees is undone, but outside one nothing is tracked, so it holds only as far as the worker obeys. Changes to git-ignored files are not seen in any run, and `write()` and `edit()` always refuse `.git`.
 - **`--check`:** give at least one for any change. `dsk` runs it itself and reaches `review` only when it passes.
 - **`--file`:** attach what the worker must read (`-` is stdin), so it spends no turn fetching it. A file of up to 4,000 characters stays attached for the whole run; a larger one is dropped if a long run is compacted, so keep instructions in the brief or in a small file.
-- **`--web`:** search and fetch, for research. Leave it off for tasks that also run commands in a repository with secrets.
+- **`--web`:** search and fetch, for research. Leave it off for tasks that also run commands in a repository with secrets. A fetched page can steer the worker, and `sh()` can read dsk's own keys in `~/.config/dsk/env`.
 - **`--owner`:** always pass `${CLAUDE_SESSION_ID}`; the Stop hook needs it.
 - **`--effort`:** only for briefs that need judgment. The default is no thinking.
 - `--allow` globs and `--check` commands are relative to the repository root, wherever you call `dsk` from. `--file` and `--brief` paths are relative to the directory you call it from.
@@ -69,5 +69,4 @@ Say what was delegated, the verdict, the turns, the cached share and the tokens.
 
 - `dsk status`: this project's open sessions.
 - `dsk show ID [--diff | --log | --answer]`: the whole diff, tokens and actions per turn, or the whole answer.
-- `dsk search "query"` and `dsk fetch URL`: raw web search and page fetch, with no model.
 - `dsk doctor`: check each provider profile.

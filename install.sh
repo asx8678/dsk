@@ -3,14 +3,18 @@
 #   ./install.sh          symlink, so edits in this checkout take effect at once
 #   ./install.sh --copy   copy, so the install survives moving or deleting this checkout
 set -eu
+if [ $# -gt 1 ] || { [ $# -eq 1 ] && [ "$1" != "--copy" ]; }; then
+    echo "usage: ./install.sh [--copy]" >&2
+    exit 1
+fi
 
 here=$(cd "$(dirname "$0")" && pwd)
 claude="$HOME/.claude"   # the skill's Stop hook is written for this location
 skill="$claude/skills/dsk"
 agent="$claude/agents/dsk-reviewer.md"
 
-if ! python3 -c 'import sys; sys.exit(sys.version_info < (3, 13))' 2>/dev/null; then
-    echo "install.sh: dsk needs python3 to be Python 3.13 or newer. The Stop hook runs python3 too." >&2
+if ! python3 -c 'import sys; sys.exit(sys.version_info < (3, 14))' 2>/dev/null; then
+    echo "install.sh: dsk needs python3 to be Python 3.14 or newer. The Stop hook runs python3 too." >&2
     exit 1
 fi
 mkdir -p "$claude/skills" "$claude/agents"

@@ -13,7 +13,7 @@ You are given a dsk session ID. `dsk` may be on PATH; if it is not, use `~/.clau
 
 1. Run `dsk show ID --review` for the packet and `dsk show ID --diff` if the diff was cut. The packet's `brief:` is what was asked. Its `summary:` and `notes:` are the worker's claims: trust none of them.
 2. Find the code. If the packet has a `where:` line, the change lives in that worktree; otherwise it is already in the working tree.
-3. Re-run every command on the `checks:` line yourself, in that directory, and read the output. A check that passes proves only what it tests.
+3. Re-run every command on the `checks:` line yourself, in that directory, and read the output. The code is unreviewed, so start the Bash call by removing the key variables, which also covers compound checks: the names are the `key_env` values in `~/.config/dsk/config.json`, for example `unset DEEPSEEK_API_KEY DSK_THIRDPARTY_API_KEY; <check>`. A check that passes proves only what it tests.
 4. Read the whole diff against the brief:
    - **Correctness:** does the code do what the brief asked, including the edge cases the brief names?
    - **Scope:** does it change only what was asked? Flag refactors, renames, new dependencies and unrelated edits.

@@ -224,6 +224,12 @@ class Wire(Case):
         self.assertEqual(dsk.chat(s, dsk.config())[0]["content"], "from b")
         self.assertEqual(s.profile, "b")
 
+    def test_a_permanent_400_that_mentions_a_limit_is_not_retried(self):
+        self.api.replies = [{"status": 400, "error": "max_tokens exceeds the model limit of 8192"}] * 8
+        with self.assertRaisesRegex(dsk.Fail, "^a: HTTP 400 .*max_tokens exceeds"):
+            dsk.chat(self.session(), dsk.config())
+        self.assertEqual(len(self.api.chats()), 1)
+
     def test_client_errors_are_not_retried(self):
         self.api.replies = [{"status": 400, "error": "bad request body"}]
         with self.assertRaisesRegex(dsk.Fail, "a: HTTP 400 .*bad request body"):
@@ -309,6 +315,53 @@ class Wire(Case):
         with mock.patch.object(dsk, "send", return_value=(200, {"choices": []})):
             with self.assertRaisesRegex(dsk.Fail, "a: unexpected response"):
                 dsk.chat(self.session(route=["a"]), dsk.config())
+
+    def test_a_sh_deny_list_in_the_config_adds_to_the_built_in_one(self):
+        self.config["sh_deny"] = ["make deploy"]
+        self.write_config()
+        deny = dsk.config()["sh_deny"]
+        self.assertIn("make deploy", deny)
+        self.assertLessEqual(set(dsk.DEFAULTS["sh_deny"]), set(deny))
+
+    def test_scripts_write_no_bytecode_and_gh_gets_a_dummy_token_unless_passed(self):
+        env = dsk.clean_env(dsk.config(), self.tmp)
+        self.assertEqual((env.get("PYTHONDONTWRITEBYTECODE"), env.get("GH_TOKEN")), ("1", "scrubbed"))
+        with mock.patch.dict(os.environ, GH_TOKEN="real"):
+            self.assertEqual(dsk.clean_env(dsk.config(), self.tmp)["GH_TOKEN"], "scrubbed")
+            self.config["env_pass"] = ["GH_TOKEN"]
+            self.write_config()
+            self.assertEqual(dsk.clean_env(dsk.config(), self.tmp)["GH_TOKEN"], "real")
+
+    def test_a_redirect_is_not_followed(self):
+        seen = []
+
+        class Second(BaseHTTPRequestHandler):
+            def log_message(self, *args):
+                pass
+
+            def do_GET(self):
+                seen.append((self.command, self.headers["Authorization"]))
+                self.send_response(200)
+                self.end_headers()
+                self.wfile.write(b"{}")
+            do_POST = do_GET
+
+        second = ThreadingHTTPServer(("127.0.0.1", 0), Second)
+
+        class First(Second):
+            def do_POST(self):
+                self.rfile.read(int(self.headers["Content-Length"]))
+                self.send_response(302)
+                self.send_header("Location", f"http://127.0.0.1:{second.server_address[1]}/elsewhere")
+                self.end_headers()
+
+        first = ThreadingHTTPServer(("127.0.0.1", 0), First)
+        for server in (first, second):
+            threading.Thread(target=server.serve_forever, args=(0.01,), daemon=True).start()
+            self.addCleanup(server.server_close)
+            self.addCleanup(server.shutdown)
+        status, _ = dsk.send(f"http://127.0.0.1:{first.server_address[1]}/chat/completions", "sk-fake-a", "{}")
+        self.assertEqual((status, seen), (302, []))
 
 
 class Cli(Case):
@@ -589,6 +642,38 @@ done("tried everything")"""
             self.assertEqual((code, out[:12]), (1, "dsk · error:"), args)
         self.assertEqual(self.api.requests, [])
 
+    def test_any_5xx_is_retried(self):
+        for status in (524, 529):
+            before = len(self.api.chats())
+            self.api.replies = [{"status": status}, script('done("ok")')]
+            self.run_ok("x")
+            self.assertEqual([r["path"] for r in self.api.chats()[before:]], ["/a/chat/completions"] * 2, status)
+
+    def test_what_a_script_printed_before_the_time_limit_reaches_the_worker(self):
+        self.config["limits"] = {"turn_seconds": 2}
+        self.write_config()
+        self.api.replies = [script('print("step 1 finished")\nsh("sleep 30.417", timeout=60)'), script('done("x")')]
+        self.run_ok("slow")
+        self.assertIn("step 1 finished", self.back(1))
+        self.assertIn("timed out after 2s", self.back(1))
+
+    def test_a_cut_answer_says_how_much_is_left_and_where(self):
+        self.api.replies = [script(f'done("{"x" * 3500}THE-CONCLUSION")')]
+        out, sid = self.run_ok("long")
+        answer = next(line for line in out.splitlines() if line.startswith("answer:"))
+        self.assertTrue(answer.endswith(f"[... 2014 more characters: dsk show {sid} --answer]"), answer[-80:])
+
+    def test_a_broken_config_is_one_line_not_a_traceback(self):
+        path = f"{self.tmp}/config/dsk/config.json"
+        del self.config["profiles"]["a"]["key_env"]
+        self.write_config()
+        self.assertEqual(self.dsk("run", "x"), (1, f"dsk · error: {path}: profile a lacks key_env\n", ""))
+        with open(path, "w") as f:
+            f.write("[]")
+        code, out, err = self.dsk("status")
+        self.assertEqual((code, err), (1, ""))
+        self.assertTrue(out.startswith(f"dsk · error: {path}: "), out)
+
 
 class Gates(Cli):
     def test_failed_check_goes_back_to_the_worker_and_the_run_continues(self):
@@ -663,10 +748,11 @@ class Gates(Cli):
 
     def test_reverted_file_does_not_leave_stale_bytecode_behind(self):
         repo = self.repo({".gitignore": "__pycache__/\n", "flag.py": "VALUE = 1\n", "tests/t.py": "t = 1\n"})
-        self.api.replies = [script('sh("printf \'VALUE = 2\\n\' > flag.py && python3 -c \'import flag\'")\n'
+        # dsk turns bytecode off for scripts and checks; switch it back on, or this tests nothing
+        self.api.replies = [script('sh("printf \'VALUE = 2\\n\' > flag.py && PYTHONDONTWRITEBYTECODE= python3 -c \'import flag\'")\n'
                                    'edit("tests/t.py", "t = 1", "t = 2")\ndone("x")')]
-        out, _ = self.run_ok("--allow", "tests/**", "--check", "python3 -c 'import flag, sys; sys.exit(flag.VALUE != 1)'",
-                             "edit", cwd=repo)
+        check = "PYTHONDONTWRITEBYTECODE= python3 -c 'import flag, sys; sys.exit(flag.VALUE != 1)'"
+        out, _ = self.run_ok("--allow", "tests/**", "--check", check, "edit", cwd=repo)
         self.assertIn("· review ·", out)
         self.assertIn("scope:   reverted flag.py (copies in ", out)
 
@@ -686,6 +772,19 @@ class Gates(Cli):
                                  ([], ["tests/t.py"]) if turn == 1 else (["src/a.py"], ["tests/t.py", "tests/u.py"]))
         self.assertEqual(self.cat(repo, "src/a.py"), "a = 2  # someone else, meanwhile\n")
 
+    def test_a_refused_write_is_not_charged_for_someone_elses_edit(self):
+        refused = {"src/a.py": "PermissionError", "src/b.py": "ValueError", "src/c.py": "FileNotFoundError",
+                   "src/d.py": "UnicodeDecodeError"}
+        repo = self.repo({**dict.fromkeys(refused, "x = 1\n"), "src/e.py": "x = 1\n", "tests/t.py": "t = 1\n"})
+        log = dsk.Session()
+        log.add("head", id=log.id, workdir=repo, root=repo, allow=["tests/**"], start=dsk.snapshot(repo, f"{log.dir}/index"))
+        before, log.shelled = dsk.span(log), None
+        self.put(repo, dict.fromkeys([*refused, "src/e.py"], "x = 2  # someone else, meanwhile\n"))
+        for path, error in [*refused.items(), ("src/e.py", "OSError")]:  # an OSError may come after a partial write
+            log.add("ledger", turn=1, fn="write", arg=path, err=f"{error}: {path}")
+        self.assertEqual(dsk.settle(log, before, 1), ["src/e.py"])
+        self.assertEqual({p: self.cat(repo, p) for p in refused}, dict.fromkeys(refused, "x = 2  # someone else, meanwhile\n"))
+
     def test_read_only_run_reverts_every_change(self):
         repo = self.repo({"a.txt": "one\n"})
         self.api.replies = [script('sh("echo two > a.txt; echo x > b.txt")\ndone("The file says one.")')]
@@ -704,6 +803,63 @@ class Gates(Cli):
         self.assertIn("scope:   reverted src/a.py (copies in ", out)
         self.assertIn("changed: tests/t.py (+1 -1)\n", out)
         self.assertEqual(self.cat(repo, "src/a.py"), "a = 1\n")
+
+
+    def test_a_write_with_the_path_by_keyword_is_charged_and_dropped(self):
+        repo = self.repo({"a.txt": "old\n"})
+        self.api.replies = [script('write(text="new\\n", path="a.txt")\ndone("x")')]
+        out, sid = self.run_ok("--allow", "a.txt", "write", cwd=repo)
+        self.assertIn("· review ·", out)
+        self.assertIn("changed: a.txt (+1 -1)\n", out)
+        self.dsk("reject", sid, "--drop", cwd=repo)
+        self.assertEqual(self.cat(repo, "a.txt"), "old\n")
+
+    def test_a_write_to_a_long_path_is_charged(self):
+        repo = self.repo({"a.txt": "a\n"})
+        path = "/".join(["d" * 40] * 5) + "/file.txt"
+        self.api.replies = [script(f'write("{path}", "x\\n")\ndone("x")')]
+        out, _ = self.run_ok("--allow", "**", "write", cwd=repo)
+        self.assertIn("· review ·", out)
+        self.assertIn(f"changed: {path} (+1)\n", out)
+
+    def test_reverting_a_file_with_glob_characters_leaves_other_files_alone(self):
+        repo = self.repo({"a[bc].txt": "one\n", "ab.txt": "one\n"})
+        self.api.replies = [script('sh("echo two >> \'a[bc].txt\'; echo two >> ab.txt")\ndone("x")')]
+        out, _ = self.run_ok("--allow", "ab.txt", "append", cwd=repo)
+        self.assertIn("scope:   reverted a[bc].txt (copies in ", out)
+        self.assertIn("changed: ab.txt (+1)\n", out)
+        self.assertEqual((self.cat(repo, "a[bc].txt"), self.cat(repo, "ab.txt")), ("one\n", "one\ntwo\n"))
+
+    def test_git_internals_are_never_writable_but_dot_github_and_gitignore_are(self):
+        self.assertFalse(dsk.matcher(["**"])(".git"))
+        self.assertFalse(dsk.matcher(["**"])(".GIT/config"))
+        repo = self.repo({".gitignore": "*.log\n"})
+        self.api.replies = [script('write(".git/hooks/pre-commit", "#!/bin/sh\\n")'),
+                            script('write(".github/workflows/ci.yml", "on: push\\n")\n'
+                                   'write(".gitignore", "*.log\\n*.tmp\\n")\ndone("x")')]
+        out, _ = self.run_ok("--allow", "**", "hook", cwd=repo)
+        self.assertIn("PermissionError", self.back(1))
+        self.assertFalse(os.path.exists(f"{repo}/.git/hooks/pre-commit"))
+        self.assertIn("changed: .github/workflows/ci.yml (+1), .gitignore (+1)\n", out)
+
+    def test_a_directory_in_allow_means_everything_under_it(self):
+        for allow in ("tests/", "tests", "./tests/**", "."):
+            repo = self.repo({"tests/keep.txt": "k\n"})
+            self.api.replies = [script('write("tests/test_a.py", "assert True\\n")\ndone("x")')]
+            out, _ = self.run_ok("--allow", allow, "add a test", cwd=repo)
+            self.assertIn("changed: tests/test_a.py (+1)\n", out, allow)
+        for allow in ("src/*.py", "**"):
+            repo = self.repo({"tests/keep.txt": "k\n"})
+            self.api.replies = [script('done("x")')]
+            _, sid = self.run_ok("--allow", allow, "nothing", cwd=repo)
+            self.assertEqual(dsk.Session(sid).head["allow"], [allow])
+
+    def test_a_check_that_imports_the_code_leaves_no_bytecode_in_the_report(self):
+        repo = self.repo({"pkg/__init__.py": "", "pkg/mod.py": "x = 1\n"})
+        self.api.replies = [script('edit("pkg/mod.py", "x = 1", "x = 2")\ndone("x")')]
+        out, _ = self.run_ok("--allow", "pkg/**", "--check", "python3 -c 'import pkg.mod'", "bump", cwd=repo)
+        changed = next(line for line in out.splitlines() if line.startswith("changed:"))
+        self.assertEqual(changed, "changed: pkg/mod.py (+1 -1)")
 
 
 class Cache(Cli):
@@ -1074,15 +1230,12 @@ class Protocol(Cli):
         out, _ = self.run_ok("--web", "research this")
         self.assertIn("sources: 2 cited, all opened in this session\n", out)
 
-    def test_raw_search_and_fetch(self):
-        self.api.search_results = [{"title": "T", "url": "https://ok.example/a", "date": None, "summary": "S"}] * 3
-        self.api.pages = {"https://ok.example/b": {"title": "Page B", "content": "Body of B."}}
-        self.assertEqual(self.dsk("search", "a query", "--count", "2")[:2],
-                         (0, "1. T\n   https://ok.example/a · undated\n   S\n2. T\n   https://ok.example/a · undated\n   S\n"))
-        self.assertEqual(self.dsk("fetch", "https://ok.example/b")[:2], (0, "# Page B\n\nBody of B.\n"))
-        code, out, _ = self.dsk("fetch", "https://gone.example/c")
-        self.assertEqual((code, out[:32]), (1, "dsk · error: fetch: HTTP 404 {\"e"))
-        self.assertEqual(self.api.chats(), [])
+    def test_raw_search_and_fetch_commands_are_gone(self):
+        for args in (["search", "x"], ["fetch", "https://ok.example/b"]):
+            code, out, _ = self.dsk(*args)
+            self.assertEqual(code, 1, args)
+            self.assertIn(f"invalid choice: '{args[0]}'", out)
+        self.assertEqual(self.api.requests, [])
 
     def test_sigterm_ends_the_run_as_error_and_leaves_nothing_running(self):
         self.api.replies = [script('print("going", flush=True)\nsh("sleep 49.871")')]
@@ -1188,6 +1341,12 @@ class Protocol(Cli):
         self.assertIn("error:   interrupted: its dsk process is gone\n", self.dsk("show", sid)[1])
         self.assertEqual(self.dsk("reject", sid, "--drop")[0], 0)
         self.assertIn("error:   interrupted: its dsk process was killed\n", self.dsk("show", sid)[1].replace("dropped", "error"))
+
+    def test_doctor_reports_a_reply_without_choices_without_a_traceback(self):
+        self.api.answer = lambda path, body: (200, {"object": "error"}, 0)
+        code, out, err = self.dsk("doctor", "--profile", "a")
+        self.assertEqual((code, err), (1, ""))
+        self.assertIn("model:    HTTP 200 ", out)
 
     def test_doctor_checks_a_profile_and_reports_a_missing_key(self):
         self.api.search_results = [{"title": "T", "url": "https://ok.example/a", "date": None, "summary": "S"}]
