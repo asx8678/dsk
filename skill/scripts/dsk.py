@@ -7,6 +7,9 @@ standard library only. See README.md for the protocol.
 """
 import argparse, ast, datetime, fcntl, hashlib, http.client, json, os, re, secrets, select, shutil, signal
 import socket, subprocess, sys, tempfile, threading, time, traceback, types, urllib.error, urllib.request
+if sys.version_info < (3, 14):  # the supported floor; keep this file compilable by older versions so the message shows
+    print(f"dsk · error: needs Python 3.14 or newer; python3 here is {sys.version.split()[0]}")
+    sys.exit(1)
 from glob import translate as glob_regex
 
 IMPORTS = ("re", "json", "math", "itertools", "functools", "collections", "textwrap", "difflib", "datetime",
@@ -55,7 +58,7 @@ TOOLS = [{"type": "function", "function": {
     "parameters": {"type": "object", "properties": {"code": {"type": "string", "description": "The Python script to run."}},
                    "required": ["code"]}}}]
 MAX_TOKENS = {"off": 16000, "low": 32000, "high": 64000, "max": 128000}  # thinking spends from the same budget
-RETRY = (0, 408, 429, 500, 502, 503, 504)  # 0 is a network failure
+RETRY = (0, 408, 429, *range(500, 600))  # 0 is a network failure
 DEFAULTS = {
     "route": ["official"],
     "profiles": {"official": {"base_url": "https://api.deepseek.com", "key_env": "DEEPSEEK_API_KEY",
@@ -88,13 +91,17 @@ def config():
         try:
             with open(path, encoding="utf-8") as f:
                 user = json.load(f)
-        except ValueError as e:
+            for name, block in user.pop("profiles", {}).items():  # a profile, too, may hold only what differs
+                cfg["profiles"].setdefault(name, {}).update(block)
+            for nested in ("limits", "search"):
+                cfg[nested].update(user.pop(nested, {}))
+            cfg["sh_deny"] += [d for d in user.pop("sh_deny", []) if d not in cfg["sh_deny"]]
+            cfg.update(user)
+        except (ValueError, TypeError, AttributeError) as e:
             raise Fail(f"{path}: {e}") from None
-        for name, block in user.pop("profiles", {}).items():  # a profile, too, may hold only what differs
-            cfg["profiles"].setdefault(name, {}).update(block)
-        for nested in ("limits", "search"):
-            cfg[nested].update(user.pop(nested, {}))
-        cfg.update(user)
+        for name, block in cfg["profiles"].items():
+            if lacking := [k for k in ("base_url", "key_env", "model") if k not in block]:
+                raise Fail(f"{path}: profile {name} lacks {', '.join(lacking)}")
     return cfg
 
 
@@ -213,12 +220,16 @@ def request_body(profile, effort, msgs):
     return dumps({k: v for k, v in body.items() if v is not None})
 
 
+class NoRedirect(urllib.request.HTTPRedirectHandler):
+    redirect_request = lambda *args: None  # a 3xx becomes an HTTPError: urllib would resend the key to the new URL
+
+
 def send(url, key, payload):
     """One POST. Returns (status, parsed JSON) on success, else (status, error text); status 0 is a network failure."""
     headers = {"Authorization": "Bearer " + key, "Content-Type": "application/json", "User-Agent": "dsk"}
     req = urllib.request.Request(url, payload.encode(), headers)
     try:
-        with urllib.request.urlopen(req, timeout=600) as r:
+        with urllib.request.build_opener(NoRedirect).open(req, timeout=600) as r:
             return r.status, json.loads(r.read())  # blank keep-alive lines before the body are JSON whitespace
     except urllib.error.HTTPError as e:
         with e:
@@ -234,7 +245,7 @@ def post(url, key, payload, backoff):
         if status == 200 and "choices" in data and data["choices"] and data["choices"][0].get("finish_reason") in (
                 "insufficient_system_resource", "aborted"):
             status, data = 503, "generation interrupted by the server"
-        if status == 400 and "limit" in str(data).lower():  # some gateways report a rate or concurrency limit this way
+        if status == 400 and "tier_limit_exceeded" in str(data):  # one gateway's concurrency limit
             status = 429
         if status not in RETRY or wait is None:
             return status, data
@@ -351,7 +362,7 @@ VERBOSE = False
 def matcher(globs):
     """The one path matcher, for --allow and glob(): `*` stays inside a directory, `**` crosses them."""
     patterns = [re.compile(glob_regex(g, recursive=True, include_hidden=True)) for g in globs]
-    return lambda path: any(p.match(path) for p in patterns)
+    return lambda path: path.split("/")[0].lower() != ".git" and any(p.match(path) for p in patterns)
 
 
 def denied(cmd, deny):
@@ -374,7 +385,9 @@ def clean_env(cfg, sdir):
     os.makedirs(empty, exist_ok=True)
     env.update(KUBECONFIG=os.devnull, AWS_SHARED_CREDENTIALS_FILE=os.devnull, AWS_CONFIG_FILE=os.devnull,
                AWS_EC2_METADATA_DISABLED="true", CLOUDSDK_CONFIG=empty, AZURE_CONFIG_DIR=empty, DOCKER_CONFIG=empty,
-               GIT_TERMINAL_PROMPT="0", PYTHONHASHSEED="0", LC_ALL="C.UTF-8", LANG="C.UTF-8", TZ="UTC")
+               GIT_TERMINAL_PROMPT="0", PYTHONHASHSEED="0", LC_ALL="C.UTF-8", LANG="C.UTF-8", TZ="UTC",
+               PYTHONDONTWRITEBYTECODE="1")
+    env.setdefault("GH_TOKEN", "scrubbed")  # else gh falls back to its stored login
     return env
 
 
@@ -459,7 +472,7 @@ def child(fd):
         else:  # not a git repository
             names = [os.path.relpath(os.path.join(d, f)) for d, _, fs in os.walk(".") for f in fs]
         match = matcher([pattern] if isinstance(pattern, str) else pattern)
-        return sorted(n for n in names if match(n) and os.path.isfile(n) and not n.startswith(".git/"))
+        return sorted(n for n in names if match(n) and os.path.isfile(n))
 
     def grep(pattern, glob="**/*"):
         regex, hits = re.compile(pattern), []
@@ -494,7 +507,8 @@ def child(fd):
 
     def logged(name, fn):
         def call(*args, **kwargs):
-            arg = str(next(iter([*args, *kwargs.values()]), ""))[:200]
+            arg = str(kwargs.get(fn.__code__.co_varnames[0], next(iter([*args, *kwargs.values()]), "")))
+            arg = arg[:4096 if name in ("write", "edit") else 200]  # settle() needs the whole path
             try:
                 result = fn(*args, **kwargs)
             except Exception as e:
@@ -557,7 +571,7 @@ def run_script(s, cfg, env, turn, script):
     limit, out_path = cfg["limits"]["turn_seconds"], os.path.join(s.dir, "out", str(turn))
     ours, theirs = socket.socketpair()
     with open(out_path, "wb") as out:
-        proc = subprocess.Popen([sys.executable, "-I", os.path.abspath(__file__), "_exec", str(theirs.fileno())],
+        proc = subprocess.Popen([sys.executable, "-I", "-u", os.path.abspath(__file__), "_exec", str(theirs.fileno())],
                                 cwd=s.head["workdir"], env=env, stdin=subprocess.DEVNULL, stdout=out, stderr=out,
                                 pass_fds=[theirs.fileno()], start_new_session=True)
     theirs.close()
@@ -643,10 +657,10 @@ def settle(s, before, turn=None, alive=None):
     listing = git(workdir, "diff", "--name-status", "--no-renames", "-z", before, tree(s)).split("\0")
     pairs, calls = list(zip(listing[0::2], listing[1::2])), [r for r in s.of("ledger") if r["turn"] == turn]
     if turn and not getattr(s, "shelled", None):
-        # write() and edit() are checked when they are called, so a script that started no shell command changed
-        # exactly the files it wrote: whatever else moved meanwhile is someone else's and is left alone
+        # with no shell command a script changed only what it wrote; whatever else moved is someone else's
         here = os.path.realpath(workdir)
-        wrote = {os.path.relpath(os.path.realpath(os.path.join(here, r["arg"])), here) for r in calls if r["fn"] in ("write", "edit")}
+        wrote = {os.path.relpath(os.path.realpath(os.path.join(here, r["arg"])), here) for r in calls if r["fn"] in ("write", "edit")
+                 and not r.get("err", "").startswith(("PermissionError", "ValueError", "FileNotFoundError", "UnicodeDecodeError"))}
         pairs = [(kind, path) for kind, path in pairs if path in wrote]
     if alive:  # a deletion carries no time, so it still counts: restoring a file loses nothing
         late = [path for kind, path in pairs
@@ -660,7 +674,7 @@ def settle(s, before, turn=None, alive=None):
             os.makedirs(os.path.dirname(kept), exist_ok=True)
             shutil.move(current, kept)
         if kind != "A":
-            git(workdir, "restore", f"--source={before}", "--worktree", "--", path)
+            git(workdir, "restore", f"--source={before}", "--worktree", "--", ":(literal)" + path)
         if kind == "M":  # caches keyed on mtime and size (Python bytecode) must not mistake it for the undone edit
             os.utime(current, (max(time.time(), undone + 1),) * 2, follow_symlinks=False)
     reverted = [path for _, path in outside]
@@ -931,7 +945,9 @@ def report(s, review=False):
     line("error", st.get("error") or (st["status"] == "running" and status == "error" and "interrupted: its dsk process is gone"))
     line("why", st.get("why"))
     line("notes", partial and " | ".join(r["arg"] for r in ledger if r["fn"] == "note"))
-    line("answer" if status == "done" else "summary", (answer_text(s) if status == "done" else st.get("summary", ""))[:1500])
+    text = answer_text(s) if status == "done" else st.get("summary", "")
+    more = len(text) > 1500 and f" [... {len(text) - 1500} more characters: dsk show {s.id} --answer]"
+    line("answer" if status == "done" else "summary", text[:1500] + (more or ""))
     line("open", st.get("open"))
     line("checks", "; ".join(f"{cmd} → {code}" for cmd, code in checks["results"]))
     reverted = list(dict.fromkeys(path for g in s.of("gate") for path in g["reverted"]))
@@ -1029,6 +1045,8 @@ def cmd_run(args, cfg):
     root = project_root()
     if (args.allow or args.worktree) and not root:
         raise Fail("--allow and --worktree need a git repository")
+    args.allow = [os.path.normpath(os.path.join(g, "**") if g.endswith("/") or os.path.isdir(os.path.join(root, g)) else g)
+                  for g in args.allow]  # a directory means everything under it
     route = [args.profile] if args.profile else cfg["route"]
     for name in route:
         if name not in cfg["profiles"]:
@@ -1162,17 +1180,6 @@ def cmd_status(args, cfg):
     return 0
 
 
-def cmd_web(args, cfg):
-    status, data = web_tool(cfg, args.command, args.target, getattr(args, "count", 5))
-    if status != 200:
-        raise Fail(f"{args.command}: HTTP {status} {data}")
-    if args.command == "fetch":
-        print(f"# {data.get('title', '')}\n\n{data.get('content', '')}")
-    for n, r in enumerate(data.get("results", []), 1):
-        print(f"{n}. {r.get('title')}\n   {r.get('url')} · {r.get('date') or 'undated'}\n   {r.get('summary')}")
-    return 0
-
-
 def cmd_doctor(args, cfg):
     """Per profile: key, model, thinking-off, well-formed replies over a three-turn exchange, cache reporting."""
     healthy = True
@@ -1193,7 +1200,7 @@ def cmd_doctor(args, cfg):
         good, thought, field, hits = 0, 0, "not reported", []
         for step in range(5):  # the same request three times a few seconds apart, then two that extend it
             status, data = post(url, key, request_body(profile, "off", msgs), cfg["backoff"])
-            if status != 200:
+            if status != 200 or not data.get("choices"):
                 healthy = False
                 print(f"model:    HTTP {status} {data}")
                 break
@@ -1271,11 +1278,9 @@ def main():
     reject.add_argument("text", nargs="?", help="the defects, as a numbered list")
     reject.add_argument("--drop", action="store_true", help="discard the work")
     command("status", "this project's sessions").add_argument("--hook", action="store_true", help="act as a Stop hook")
-    command("search", "raw web search, no model", "target").add_argument("--count", type=int, default=5)
-    command("fetch", "raw page fetch, no model", "target")
     command("doctor", "check each provider profile").add_argument("--profile")
     commands = {"run": cmd_run, "answer": cmd_answer, "show": cmd_show, "accept": cmd_accept, "reject": cmd_reject,
-                "status": cmd_status, "search": cmd_web, "fetch": cmd_web, "doctor": cmd_doctor}
+                "status": cmd_status, "doctor": cmd_doctor}
     args = parser.parse_args()
     VERBOSE = args.verbose
 
