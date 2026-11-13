@@ -1,2 +1,4 @@
 __pycache__/
 .DS_Store
+# Written by Claude Code beside the plugin when it loads it: its own API types.
+skill/.claude-plugin/types/

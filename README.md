@@ -1,16 +1,36 @@
 # dsk
 
-A small headless CLI that Claude Code calls through Bash to hand work to DeepSeek V4.1 Flash. Claude plans and reviews; DeepSeek writes code, tests, docs and web research. One Python file, standard library only, Python 3.13 or newer.
+A small headless CLI that Claude Code calls through Bash to hand work to DeepSeek V4.1 Flash. Claude plans and reviews; DeepSeek writes code, tests, docs and web research. One Python file, standard library only, Python 3.13 or newer. It ships as a Claude Code plugin: the skill, a reviewer agent, the review gate and a display of the jobs.
 
 Each turn the worker sends one Python script. The script reads, edits, runs and searches through a small function API, and only what it prints comes back. A task takes about 3 turns, not 30.
 
 ## Install
 
+In Claude Code:
+
 ```
-./install.sh            # links the skill, the reviewer agent and a `dsk` command (use --copy to copy instead)
+/plugin install dsk --marketplace asx8678/dsk
 ```
 
-Then, by hand:
+Claude Code then asks which provider runs the worker, and for what that provider needs:
+
+| Provider | What you enter |
+|---|---|
+| `official` | your DeepSeek API key |
+| `custom` | the endpoint URL of any OpenAI-compatible API that serves a DeepSeek model, the model name, and that endpoint's API key. A DeepSeek API key is optional here: with one, the official API is the fallback and web search (`--web`) is available |
+
+Keys are masked as you type and kept in Claude Code's secure store. `/plugin configure dsk@asx8678` opens the same form again; restart Claude Code after changing it. From a shell, `claude plugin install dsk --marketplace asx8678/dsk` installs without asking, and each `--config KEY=VALUE` sets one option (`provider`, `deepseek_api_key`, `custom_base_url`, `custom_model`, `custom_api_key`). Until a provider is set, each session starts by saying what is missing, and `dsk configure` shows how dsk is set up. `dsk doctor` checks the key and the model against the provider.
+
+The plugin needs Python 3.13 or newer on `PATH`, as `python3` or as `python3.13`, `python3.14` or `python3.15`.
+
+### From a checkout
+
+```
+./install.sh            # links the plugin into ~/.claude/skills/dsk (as dsk@skills-dir) and a `dsk` command into ~/.local/bin
+                        # use --copy to copy instead
+```
+
+`/plugin configure dsk@skills-dir` asks for the provider in the same way. Everything below is optional: it is how to set dsk up by hand, with more than one provider. What a config file and the key file say wins over the plugin's form.
 
 1. **Keys.** `dsk` takes each key from the environment, or else from `~/.config/dsk/env`, a private file (mode 600) of lines like `export DEEPSEEK_API_KEY='...'`. Nothing has to be sourced, so Claude Code needs no setup. A key read from the file never enters `dsk`'s environment, so scripts, `sh()` and checks cannot see it.
 2. **Config.** `~/.config/dsk/config.json` names the environment variables; it never holds a key.
@@ -28,15 +48,17 @@ Then, by hand:
    }
    ```
 
-   The `official` profile, the `search` block and a default `sh_deny` list are built in, so the file may hold only what differs. `extra` is merged into the request body; a `null` value removes a key the provider rejects. Optional keys: `backoff` (retry waits in seconds, default `[2, 6, 18]`) and `limits` (`turn_seconds` 600, `run_seconds` 3600, `run_tokens` 2000000). A profile may set `max_sessions`, the number of runs the provider serves at once; see **Providers**.
+   The `official` profile, the `search` block and a default `sh_deny` list are built in, so the file may hold only what differs. `extra` is merged into the request body; a `null` value removes a key the provider rejects. Optional keys: `backoff` (retry waits in seconds, default `[2, 6, 18]`) and `limits` (`turn_seconds` 600, `run_seconds` 3600, `run_tokens` 2000000). A profile may set `max_sessions`, the number of runs the provider serves at once (see **Providers**), and `price`, dollars per million tokens as `{"in": 0.005, "cached": 0.003, "out": 0.57}`, from which `status --json` reports each job's cost.
 3. **Check it.** `dsk doctor` tests each profile: the key, the model ID, that thinking-off is honoured, five replies over a three-turn exchange, and whether and where cached tokens are reported.
 4. **Permissions.** The skill pre-approves `dsk` only for the turn that invokes it. For later turns and background runs, add `"Bash(dsk *)"` to `permissions.allow` in `~/.claude/settings.json`.
+5. **Display.** In a session that was already open, run `/reload-plugins` once. `/dsk-jobs on` loads the live display and `/dsk-jobs off` unloads it; see **The plugin**.
 
 ## Commands
 
 ```
 dsk run [--allow GLOB]... [--check CMD]... [--file PATH]... [--web] [--worktree]
-        [--effort off|low|high|max] [--profile NAME] [--max-turns 12] [--owner ID]
+        [--effort off|low|high|max] [--profile NAME] [--max-turns 12]
+        [--owner ID]       (default: $CLAUDE_CODE_SESSION_ID, which Claude Code sets for every command)
         "brief"            (or --brief FILE)
 dsk answer ID "text"       reply to the worker's question; the run continues
 dsk show   ID [--review | --diff | --log | --answer]
@@ -44,9 +66,11 @@ dsk accept ID              mark as reviewed; after --worktree, apply the changes
 dsk reject ID "defects"    send defects back into the same session; the run continues
 dsk reject ID --drop       discard the work
 dsk status [--hook]        this project's open sessions; --hook is the Claude Code Stop hook
+dsk status --json          the last day's sessions on any project, as JSON, for a display to poll
 dsk search "query"         raw web search, no model
 dsk fetch URL              raw page fetch, no model
 dsk doctor [--profile NAME]
+dsk configure              how dsk is set up: the route, and whether each provider has its key
 ```
 
 Every command prints a short plain-text report on stdout. `--verbose` adds one line per turn on stderr. The last line of a report names the commands that are valid next.
@@ -101,6 +125,36 @@ next:    dsk show 7f3a --review | dsk accept 7f3a | dsk reject 7f3a "defects"
 
 **State** lives in `~/.local/state/dsk/<id>/`: the log, full turn outputs, the answer, the worktree and a lock.
 
+**Progress.** `dsk status --json` prints `{"jobs": [...]}`, newest first, one object per session created in the last day on any project. Each is read off the session's log, so a run in flight shows where it is: `status`, and while running `phase` (`model` while it waits for a reply, `script`, `checks`), `doing` (the shell command or check in flight) and `act` (the last action the turn finished); `turn` of `max_turns` in the current round and `turns` overall; `in`, `out` and `cached` (the cached share of the input tokens, or null); `cost` in dollars, or null when a profile it used has no `price`; `failover` (the profile it left and why, such as `coralbricks 429`); `note` (the question, or why it stopped), `changed`, `brief`, `profile`, `owner`, `root`, `worktree`, and `created` and `active` in epoch seconds. What it read of a log is kept in `~/.local/state/dsk/status.json` and used again until that log moves, so a reading costs the same however many sessions the day holds: about 0.05 s, most of it Python starting.
+
+## The plugin
+
+`skill/` is the plugin, in Claude Code's standard layout, and `.claude-plugin/marketplace.json` at the root of this repository is what lets `/plugin install` find it:
+
+| Part | File | What it is |
+|---|---|---|
+| Manifest | `.claude-plugin/plugin.json` | the name, the version, and `userConfig`: the five options of the form above |
+| Skill | `SKILL.md` | tells Claude when and how to delegate. `/dsk` from a checkout, `/dsk:dsk` installed from the marketplace |
+| Agent | `agents/reviewer.md` | `dsk:reviewer`, for review packets too long to read inline |
+| Command | `bin/dsk` | on the `PATH` of Claude's Bash tool while the plugin is enabled |
+| Hooks | `hooks/hooks.json` | three commands: at session start and before each prompt, `dsk configure --hook`; at each stop, `dsk status --hook` |
+| Hooks module | `hooks/register.tsx` | the display; TypeScript, because Claude Code runs it itself |
+| CLI | `scripts/dsk.py` | everything else. Claude Code never loads it, it only runs it |
+
+**How the form's answers reach dsk.** Claude Code hands a plugin's options to its hooks, as `CLAUDE_PLUGIN_OPTION_*` variables, and not to the commands Claude runs through Bash. So `dsk configure --hook` writes them to `options.json` in the plugin's data folder (`~/.claude/plugins/data/dsk-<marketplace>/`, mode 600) and leaves a pointer to it in `~/.config/dsk/plugin.json`. `dsk` builds its configuration from the built-in defaults, then those options, then `~/.config/dsk/config.json`; a key comes from the environment, else `~/.config/dsk/env`, else the options. The data folder is Claude Code's: uninstalling the plugin deletes it, and the keys with it. At session start the same hook says what is still missing; before a prompt it says nothing, and it never fails a session.
+
+The Stop hook and the two configure hooks are always on. The display is not: `/dsk-jobs on` loads it and `/dsk-jobs off` unloads it, in the session where you type it and in the sessions you start afterwards. Unloaded, it reads nothing and draws nothing.
+
+Loaded, it reads `dsk status --json` every two seconds while a job runs or a dsk call is in flight, and every sixteen otherwise, and draws:
+
+- **Above the prompt,** as Claude Code draws its own subagents: one line for the whole (how many workers, how long, tokens, cached share), then a branch per running job of this session, with what it is doing, its turns as a bar, the command in flight, `quiet 1m10s` once its log has not moved for 45 seconds, and `↯ coralbricks 429 → thirdparty` after a failover.
+- **Under the prompt,** a status line: `✻ dsk 2 running · ↑ 12.3k · ↓ 2.1k · 83% cached`, or `⏺ dsk 1 waiting for you`.
+- **On a `dsk run`, `answer` or `reject` row,** the brief in place of the whole command line, and under it the job's progress while the call runs or its run goes on in the background. ctrl+o shows the command as it was run.
+- **Under a dsk call,** its report as a card: how the job stopped and its figures, the worker's words, each check with ✔ or ✘, each changed file with its lines added and removed. A review packet's diff, and the output of `dsk show ID --diff`, are drawn as Claude Code draws its own edits, the first 60 lines.
+- **In the pane (`/dsk-jobs`),** this session's jobs from the last day as trees (running, waiting for you, finished) with their cost, and what runs in other sessions. `[ diff ]` and `[ turns ]` on a job open its whole diff, or each turn's cache level and tokens, in the pane.
+
+A row is tied to its job by the brief the command holds; of 23 dsk calls in one day's session, 22 were tied to the right job, and the one that was not started four jobs from a shell loop. `claude plugin test skill` runs the plugin's 13 tests on all four surfaces; they check the tree that is drawn, not how a terminal paints it.
+
 ## Guardrails, stated honestly
 
 The AST gate, the scrubbed environment, the denylist and the scope gate stop an obedient but mistaken model. They are not a sandbox: a worker with `sh()` is as powerful as a shell and can read any file you can. Keep `--web` off for tasks that also need `sh()` in a repository with secrets, because fetched pages are untrusted input. Nothing here prevents running `dsk` inside a container.
@@ -126,12 +180,12 @@ Measured on 2026-11-11 with `deepseek-flash` on the official API and `deepseek-v
 - **A 429 that survives the retries also fails over,** like a repeated 5xx. So does a network failure.
 - **`python3 -I` discards `PYTHONHASHSEED`,** so the seed is pinned for `sh()` and checks but not for the script process itself.
 - **In a git repository the working directory is the repository root.**
-- **Size:** `dsk.py` has 1,308 lines, over the 1,000-line target and, since the key file and `max_sessions` were added, over the 1,300-line limit too (34 lines are longer than 120 characters). By your rule the next step is to cut a feature: the candidates are `doctor` (about 55 lines), the raw `search` and `fetch` commands (12), and the time and token limits (6).
+- **Size:** `dsk.py` has 1,463 lines, over the 1,000-line target and, since the key file, `max_sessions`, `status --json` and `configure` were added, over the 1,300-line limit too (49 lines are longer than 120 characters). By your rule the next step is to cut a feature: the candidates are `doctor` (about 55 lines), the raw `search` and `fetch` commands (12), and the time and token limits (6).
 
 ## Tests
 
 ```
-python3 -m unittest discover -s tests     # 74 tests against a scripted API server and temp git repositories
+python3 -m unittest discover -s tests     # 83 tests against a scripted API server and temp git repositories
 python3 tests/live.py --table             # real toy tasks on the real providers; costs a few cents
 ```
 
@@ -142,7 +196,9 @@ python3 tests/live.py --table             # real toy tasks on the real providers
 - The worker asks when a brief cannot be done as written (51 of 51 trial runs), but when a name fits two things it takes the likelier one without asking (38 of 38). Name files and functions by path in the brief.
 - An interrupted run can only be dropped, not resumed. What it changed is still attributed to it. Claude Code 2.1.322 does not kill a command whose Bash timeout passes; it moves it to the background, and stopping the task sends SIGTERM and then kills the whole process tree. If `dsk` alone is killed with SIGKILL, a script in the middle of a shell command runs on until that command returns, and may write after a `--drop`.
 - A snapshot writes a blob for every untracked file that is not git-ignored into the repository's object store, and the first snapshot of a session hashes them all (6.5 s for 300 MB; 0.04 s for later ones). `git gc` removes those objects later. Ignore large data directories.
-- The Stop hook has passed `claude plugin validate` but has not been seen firing in a real Claude Code session.
+- The Stop hook runs at every turn end once it is loaded: in one real session it ran 16 times in a row, each in under 0.1 s. Every one of those runs found nothing to review, so its blocking path (exit 2) is covered by the tests but has not yet been seen live. As part of the plugin it has not run in a real session yet.
+- The display has been tested as a drawn tree, not as painted pixels: nobody has yet checked a screenshot of it.
+- The plugin's install has been run from the shell in a scratch home (marketplace add, install, `--config`, `configure`), and its hooks by hand with the variables Claude Code documents, against the real official API and a real custom endpoint. It has not yet been installed from GitHub into a live session, so the form itself and the hooks as Claude Code fires them are unseen.
 
 ## Later, not now
 
