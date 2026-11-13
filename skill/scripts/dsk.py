@@ -7,6 +7,17 @@ standard library only. See README.md for the protocol.
 """
 import argparse, ast, datetime, fcntl, hashlib, http.client, json, os, re, secrets, select, shlex, shutil, signal
 import socket, subprocess, sys, tempfile, time, traceback, types, urllib.error, urllib.request
+
+if sys.version_info < (3, 13):  # this file parses on older Pythons, so that it can say so, or hand over to a newer one
+    newer = next(filter(None, map(shutil.which, ("python3.15", "python3.14", "python3.13"))), None)
+    if newer:
+        os.execv(newer, [newer, os.path.abspath(__file__), *sys.argv[1:]])
+    needs = f"dsk needs Python 3.13 or newer on PATH; {sys.executable} is {sys.version.split()[0]}"
+    if "--announce" in sys.argv:  # the session-start hook: Claude Code shows this to the user once
+        print(json.dumps({"systemMessage": needs}))
+    elif "--hook" not in sys.argv:  # any other hook stays quiet, so that it does not fail on every turn
+        print(needs, file=sys.stderr)
+    sys.exit(0 if "--hook" in sys.argv else 1)
 from glob import translate as glob_regex
 
 IMPORTS = ("re", "json", "math", "itertools", "functools", "collections", "textwrap", "difflib", "datetime",
@@ -80,9 +91,34 @@ def xdg(var, default):
 STATE = xdg("XDG_STATE_HOME", "~/.local/state")
 
 
+# The options the Claude Code plugin asks for (plugin.json `userConfig`), and the key variable each key stands for.
+OPTIONS = ("provider", "deepseek_api_key", "custom_base_url", "custom_model", "custom_api_key")
+OPTION_KEYS = {"DEEPSEEK_API_KEY": "deepseek_api_key", "DSK_CUSTOM_API_KEY": "custom_api_key"}
+SETUP = "enter your DeepSeek API key, or pick provider `custom` and enter its endpoint URL, model name and API key"
+
+
+def plugin(part="options"):
+    """What the plugin's hooks last stored (`dsk configure --hook`): its options, or its id. Empty when there is none.
+    ~/.config/dsk/plugin.json only points at the options, which live in the plugin's own data folder and go with it."""
+    try:
+        with open(os.path.join(xdg("XDG_CONFIG_HOME", "~/.config"), "plugin.json"), encoding="utf-8") as f:
+            pointer = json.load(f)
+        if part == "id":
+            return pointer["id"]
+        with open(pointer["options"], encoding="utf-8") as f:
+            return json.load(f)
+    except (OSError, ValueError, KeyError, TypeError):
+        return {} if part == "options" else "dsk@<its marketplace>"
+
+
 def config():
-    """Built-in defaults overlaid with ~/.config/dsk/config.json. It names key variables, never keys."""
-    cfg = json.loads(json.dumps(DEFAULTS))
+    """Built-in defaults, then the plugin's options, then ~/.config/dsk/config.json. It names key variables, never keys."""
+    cfg, opts = json.loads(json.dumps(DEFAULTS)), plugin()
+    if opts.get("custom_base_url") and opts.get("custom_model"):  # the plugin's `custom`: any OpenAI-compatible endpoint
+        cfg["profiles"]["custom"] = {"base_url": opts["custom_base_url"], "key_env": "DSK_CUSTOM_API_KEY",
+                                     "model": opts["custom_model"], "compact_at": 24000, "extra": {}}
+        if opts.get("provider") == "custom":  # with a DeepSeek key as well, the official API is the fallback
+            cfg["route"] = ["custom"] + ["official"] * bool(opts.get("deepseek_api_key"))
     path = os.path.join(xdg("XDG_CONFIG_HOME", "~/.config"), "config.json")
     if os.path.exists(path):
         try:
@@ -97,23 +133,39 @@ def config():
 
 
 def secret(name):
-    """A key from the environment, else from ~/.config/dsk/env (lines like `export NAME='value'`), else "".
-    A key read from the file never enters os.environ, so it cannot reach scripts, sh() or checks."""
+    """A key from the environment, else from ~/.config/dsk/env (lines like `export NAME='value'`), else from the
+    plugin's options, else "". A key read from a file never enters os.environ, so it cannot reach scripts, sh() or checks."""
     if os.environ.get(name):
         return os.environ[name]
     try:
         with open(os.path.join(xdg("XDG_CONFIG_HOME", "~/.config"), "env"), encoding="utf-8") as f:
             words = [w for line in f for w in shlex.split(line, comments=True)]
     except (OSError, ValueError):
-        return ""
-    return ([w.split("=", 1)[1] for w in words if w.startswith(name + "=")] or [""])[-1]
+        words = []
+    found = [w.split("=", 1)[1] for w in words if w.startswith(name + "=")]
+    return found[-1] if found else plugin().get(OPTION_KEYS.get(name), "") or ""
 
 
 def api_key(block):
     key = secret(block["key_env"])
     if not key:
-        raise Fail(f"{block['key_env']} is not set, in the environment or in ~/.config/dsk/env")
+        raise Fail(f"{block['key_env']} is not set. In Claude Code, run /plugin configure {plugin('id')} and {SETUP}; "
+                   f"or export it in ~/.config/dsk/env")
     return key
+
+
+def setup(cfg):
+    """(Whether the first provider on the route has its key, and what stands in the way or which provider it is.)"""
+    opts, first = plugin(), cfg["route"][0]
+    profile = cfg["profiles"].get(first, {})
+    if secret(profile.get("key_env", "")):
+        return True, f"{first} · {profile['base_url']} · {profile['model']}"
+    need = [label for field, label in (("custom_base_url", "endpoint URL"), ("custom_model", "model name"),
+                                       ("custom_api_key", "API key")) if not opts.get(field)]
+    if opts.get("provider") == "custom" and need:
+        return False, "provider custom still needs its " + ", ".join(need)
+    key = profile.get("key_env", first)
+    return False, "it has no DeepSeek API key" if key == "DEEPSEEK_API_KEY" else f"{key} is not set"
 
 
 def flock(path, busy):
@@ -504,7 +556,7 @@ def child(fd):
         refusal = denied(cmd, job["sh_deny"])
         if refusal:
             raise PermissionError(refusal)
-        code, out = shell(cmd, timeout, started=lambda pid: tell(pgid=pid))
+        code, out = shell(cmd, timeout, started=lambda pid: tell(pgid=pid, cmd=cmd))
         return types.SimpleNamespace(code=code, out=out)
 
     def web(kind, *args):  # runs in the parent, which holds the key
@@ -607,6 +659,7 @@ def run_script(s, cfg, env, turn, script):
             for record in map(json.loads, lines):
                 if "pgid" in record:  # a shell command has started: from here on the script can change anything
                     running = s.shelled = record["pgid"]
+                    s.add("doing", turn=turn, arg=record.get("cmd", ""))
                 elif "rpc" in record:
                     reply = web_call(s, cfg, turn, record["rpc"], record["args"])
                     ours.sendall((json.dumps(reply) + "\n").encode())
@@ -706,6 +759,7 @@ def gates(s, cfg, env):
     before, results, problem = span(s), [], ""
     try:
         for cmd in s.head["checks"]:
+            s.add("doing", arg=cmd)
             code, out = shell(cmd, cfg["limits"]["turn_seconds"], env, s.head["workdir"])
             results.append([cmd, code])
             if code:
@@ -1156,7 +1210,59 @@ def sessions(wanted):
             yield Session(sid)
 
 
+def job(s, cfg):
+    """One session as plain data, for `status --json`: what a progress display needs. All of it is measured."""
+    head, usage, status, st, series = s.head, s.of("usage"), s.status(), s.last("state"), s.of("series")
+    tail = s.recs[max(i for i, r in enumerate(s.recs) if r["t"] in ("req", "state")):]  # the turn in flight
+    acts = [r for r in tail if r["t"] == "ledger"]
+    checking = any(r["fn"] == "done" for r in acts) and not any(r["t"] == "checks" for r in tail)
+    phase = "model" if not any(r["t"] == "usage" for r in tail) else "checks" if checking else "script"
+    last = next((r for r in reversed(tail) if r["t"] in ("doing", "ledger", "checks", "result")), {"t": ""})
+    prices = [cfg["profiles"].get(u["profile"], {}).get("price") for u in usage]  # dollars per million tokens
+    cost = None if not all(prices) else sum(((u["prompt"] - (u["hit"] or 0)) * p["in"] + (u["hit"] or 0) * p["cached"]
+                                             + u["out"] * p["out"]) / 1e6 for u, p in zip(usage, prices))
+    return {"id": s.id, "status": status, "phase": phase if status == "running" else "", "profile": s.profile,
+            "doing": " ".join(last["arg"].split())[:80] if last["t"] == "doing" and status == "running" else "",
+            "failover": next((f"{a['profile']} {b['status'] or 'network'}" for a, b in reversed(list(zip(series, series[1:])))
+                              if b["why"] == "failover"), ""), "cost": cost,
+            "turn": len(s.since("round", "result")), "max_turns": head["max_turns"], "turns": s.turn,
+            "in": sum(u["prompt"] for u in usage), "out": sum(u["out"] for u in usage), "cached": cached_share(usage),
+            "act": " ".join(f"{acts[-1]['fn']} {acts[-1]['arg']}".split())[:80] if acts else "",
+            "note": " ".join(str(st.get("question") or st.get("why") or st.get("error") or "").split())[:160],
+            "changed": len(st.get("changed") or []), "brief": " ".join(head["brief"].split())[:300],
+            "owner": head["owner"], "root": head["root"], "worktree": head["worktree"], "created": head["created"],
+            "active": os.path.getmtime(s.path)}
+
+
 def cmd_status(args, cfg):
+    if args.json:  # every session of the last day, on any project, newest first: for a display that polls
+        # What a kept job was made with besides its log: this code's fields (bump the number) and the prices.
+        path, new = os.path.join(STATE, "status.json"), {"for": [2, {k: v.get("price") for k, v in cfg["profiles"].items()}]}
+        try:
+            with open(path, encoding="utf-8") as f:
+                old = json.load(f)
+        except (OSError, ValueError):
+            old = {}
+        old = old if old.get("for") == new["for"] else {}
+        for sid in os.listdir(STATE) if os.path.isdir(STATE) else []:
+            try:
+                stat = os.stat(os.path.join(STATE, sid, "log.jsonl"))
+            except OSError:
+                continue
+            key, had = [stat.st_mtime_ns, stat.st_size], old.get(sid)
+            if had and had["key"] == key and had["job"]["status"] != "running":
+                new[sid] = had  # a log that has not moved since its session stopped is not read again
+                continue
+            s = Session(sid)
+            if s.recs and s.head.get("t") == "head" and s.last("state"):
+                new[sid] = {"key": key, "job": job(s, cfg)}
+        if new != old:
+            with open(path + f".{os.getpid()}", "w", encoding="utf-8") as f:
+                json.dump(new, f)
+            os.replace(f.name, path)
+        recent = [e["job"] for sid, e in new.items() if sid != "for" and e["job"]["created"] > time.time() - 86400]
+        print(dumps({"jobs": sorted(recent, key=lambda j: -j["created"])}))
+        return 0
     if args.hook:  # a Claude Code Stop hook: exit 2 sends Claude back to review what it delegated
         event = json.load(sys.stdin)
         mine = lambda head: head["owner"] and head["owner"] == event.get("session_id")  # noqa: E731
@@ -1173,6 +1279,48 @@ def cmd_status(args, cfg):
         print(f"dsk {s.id} · {s.status()} · {age // 60}h{age % 60:02}m ago · {s.head['brief'][:60]}")
     print(f"{len(open_)} open, {len(mine) - len(open_)} finished" + (f"\nnext:    dsk show {open_[0].id}" if open_ else ""))
     return 0
+
+
+def cmd_configure(args, cfg):
+    """How dsk is set up. As a Claude Code hook (--hook) it first stores the plugin's options, which Claude Code hands
+    to hooks alone, where `config` and `secret` read them; at session start (--announce) it says what is still missing."""
+    if args.hook:
+        try:
+            home = xdg("XDG_CONFIG_HOME", "~/.config")
+            data = args.data or os.environ.get("CLAUDE_PLUGIN_DATA") or home
+            name = os.path.basename(data.rstrip("/"))  # the data folder is named after the plugin's id: dsk-<marketplace>
+            files = {os.path.join(data, "options.json"): {o: os.environ.get(f"CLAUDE_PLUGIN_OPTION_{o.upper()}", "") for o in OPTIONS},
+                     os.path.join(home, "plugin.json"): {"options": os.path.join(data, "options.json"),
+                                                         "id": "dsk@" + name[4:] if name.startswith("dsk-") else plugin("id")}}
+            for path, value in files.items():  # written only when it changed: this runs before every prompt
+                try:
+                    with open(path, encoding="utf-8") as f:
+                        same = json.load(f) == value
+                except (OSError, ValueError):
+                    same = False
+                if not same:
+                    os.makedirs(os.path.dirname(path), exist_ok=True)
+                    with open(os.open(path + ".new", os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600), "w", encoding="utf-8") as f:
+                        json.dump(value, f)
+                    os.replace(path + ".new", path)
+            ready, state = setup(config())
+            if args.announce and not ready:
+                how = f"Run /plugin configure {plugin('id')} and {SETUP}. Then restart Claude Code."
+                print(json.dumps({"systemMessage": f"dsk is not set up yet: {state}. {how}", "hookSpecificOutput": {
+                    "hookEventName": "SessionStart", "additionalContext": f"The dsk plugin has no working provider ({state}), so "
+                    f"`dsk run` will fail. If the user wants to delegate with dsk, tell them: {how} Never ask for a key in the chat."}}))
+        except Exception:  # a hook must never stand in the way of a session or a prompt
+            pass
+        return 0
+    ready, state = setup(cfg)
+    print(f"dsk · {'ready' if ready else 'not set up'} · {state}")
+    for name in cfg["route"]:
+        profile = cfg["profiles"].get(name, {})
+        print(f"{name + ':':<8} {profile.get('base_url')} · {profile.get('model')} · key {'set' if secret(profile.get('key_env', '')) else 'missing'}")
+    if not ready:
+        print(f"next:    in Claude Code, /plugin configure {plugin('id')}: {SETUP}; then restart Claude Code. "
+              f"Or export the key in ~/.config/dsk/env.")
+    return 0 if ready else 1
 
 
 def cmd_web(args, cfg):
@@ -1273,7 +1421,8 @@ def main():
     run.add_argument("--effort", choices=list(MAX_TOKENS), default="off", help="thinking effort")
     run.add_argument("--profile", help="use this provider profile only")
     run.add_argument("--max-turns", type=int, default=12)
-    run.add_argument("--owner", default="", help="the Claude Code session that started the run")
+    run.add_argument("--owner", default=os.environ.get("CLAUDE_CODE_SESSION_ID", ""),
+                     help="the Claude Code session that started the run (default: $CLAUDE_CODE_SESSION_ID)")
     command("answer", "answer the worker's question", "id", "text")
     view = command("show", "print a session's report", "id").add_mutually_exclusive_group()
     for flag, text in (("review", "the review packet"), ("diff", "the worker's whole diff"),
@@ -1283,12 +1432,18 @@ def main():
     reject = command("reject", "send defects back, or --drop the work", "id")
     reject.add_argument("text", nargs="?", help="the defects, as a numbered list")
     reject.add_argument("--drop", action="store_true", help="discard the work")
-    command("status", "this project's sessions").add_argument("--hook", action="store_true", help="act as a Stop hook")
+    status = command("status", "this project's sessions")
+    status.add_argument("--hook", action="store_true", help="act as a Stop hook")
+    status.add_argument("--json", action="store_true", help="the last day's sessions on any project, as JSON")
     command("search", "raw web search, no model", "target").add_argument("--count", type=int, default=5)
     command("fetch", "raw page fetch, no model", "target")
     command("doctor", "check each provider profile").add_argument("--profile")
+    configure = command("configure", "show how dsk is set up")
+    configure.add_argument("--hook", action="store_true", help="act as a Claude Code hook: store the plugin's options first")
+    configure.add_argument("--announce", action="store_true", help="with --hook: say what is still missing")
+    configure.add_argument("--data", metavar="DIR", help="with --hook: the plugin's data folder")
     commands = {"run": cmd_run, "answer": cmd_answer, "show": cmd_show, "accept": cmd_accept, "reject": cmd_reject,
-                "status": cmd_status, "search": cmd_web, "fetch": cmd_web, "doctor": cmd_doctor}
+                "status": cmd_status, "search": cmd_web, "fetch": cmd_web, "doctor": cmd_doctor, "configure": cmd_configure}
     args = parser.parse_args()
     VERBOSE = args.verbose
 
