@@ -1,0 +1,3 @@
+#!/bin/sh
+# The dsk command. Claude Code puts a plugin's bin/ on the PATH of the Bash tool while the plugin is enabled.
+exec python3 "$(dirname "$0")/../scripts/dsk.py" "$@"

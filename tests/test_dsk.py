@@ -4,7 +4,7 @@ Run from the project root:  python3 -m unittest discover -s tests
 The scripted server covers what a real API cannot produce on demand (a 402, a cut-off reply, exact request
 bytes); tests/live.py runs real tasks against the real providers.
 """
-import importlib.util, json, os, shutil, subprocess, sys, tempfile, threading, unittest
+import ast, importlib.util, json, os, shutil, subprocess, sys, tempfile, threading, unittest
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from unittest import mock
 
@@ -128,7 +128,7 @@ class Case(unittest.TestCase):
         self.addCleanup(self.api.close)
         self.env = {**os.environ, "XDG_STATE_HOME": f"{self.tmp}/state", "XDG_CONFIG_HOME": f"{self.tmp}/config",
                     "KEY_A": "sk-fake-a", "KEY_B": "sk-fake-b", "KEY_S": "sk-fake-search",
-                    "GIT_CONFIG_GLOBAL": os.devnull, "GIT_CONFIG_NOSYSTEM": "1"}
+                    "GIT_CONFIG_GLOBAL": os.devnull, "GIT_CONFIG_NOSYSTEM": "1", "CLAUDE_CODE_SESSION_ID": ""}
         self.config = {
             "route": ["a", "b"], "backoff": [0, 0],
             "profiles": {"a": {"base_url": self.api.url + "/a", "key_env": "KEY_A", "model": "model-a"},
@@ -369,6 +369,99 @@ class Cli(Case):
 
     def output(self, sid, turn):
         return self.cat(self.tmp, "state/dsk", sid, "out", str(turn))
+
+
+class Plugin(Cli):
+    """The Claude Code plugin's options: stored by `configure --hook`, read by `config` and `secret`."""
+
+    def setUp(self):
+        super().setUp()
+        os.remove(f"{self.tmp}/config/dsk/config.json")  # nothing but the plugin's options sets these runs up
+        self.env.update(DEEPSEEK_API_KEY="", DSK_CUSTOM_API_KEY="")
+        self.data = f"{self.tmp}/data/dsk-acme"  # Claude Code names a plugin's data folder after its id
+
+    def hook(self, *flags, **options):
+        env = {f"CLAUDE_PLUGIN_OPTION_{name.upper()}": value for name, value in options.items()}
+        done = subprocess.run([sys.executable, DSK, "configure", "--hook", "--data", self.data, *flags], env={**self.env, **env},
+                              input='{"hook_event_name": "SessionStart"}', capture_output=True, text=True, timeout=60)
+        return done.returncode, done.stdout
+
+    def test_hook_stores_the_options_for_their_owner_alone_and_points_at_them(self):
+        self.assertEqual(self.hook(provider="official", deepseek_api_key="sk-official"), (0, ""))
+        self.assertEqual(json.loads(self.cat(self.data, "options.json")),
+                         {"provider": "official", "deepseek_api_key": "sk-official", "custom_base_url": "", "custom_model": "",
+                          "custom_api_key": ""})
+        self.assertEqual(json.loads(self.cat(self.tmp, "config/dsk/plugin.json")),
+                         {"options": f"{self.data}/options.json", "id": "dsk@acme"})
+        self.assertEqual(os.stat(f"{self.data}/options.json").st_mode & 0o777, 0o600)
+        code, out, _ = self.dsk("configure")
+        self.assertEqual((code, out.splitlines()), (0, ["dsk · ready · official · https://api.deepseek.com · deepseek-flash",
+                                                        "official: https://api.deepseek.com · deepseek-flash · key set"]))
+        before = os.stat(f"{self.data}/options.json").st_mtime_ns
+        self.hook(provider="official", deepseek_api_key="sk-official")  # before the next prompt: nothing changed, nothing written
+        self.assertEqual(os.stat(f"{self.data}/options.json").st_mtime_ns, before)
+
+    def test_custom_provider_runs_on_its_endpoint_with_its_model_and_key(self):
+        custom = {"provider": "custom", "custom_base_url": self.api.url + "/c", "custom_model": "my-model", "custom_api_key": "sk-custom"}
+        self.hook(**custom)
+        self.api.replies = [script('done("x")')]
+        out, _ = self.run_ok("task")
+        request = self.api.chats()[0]
+        self.assertIn(" · done · custom · ", out)
+        self.assertEqual([request["path"], request["key"], json.loads(request["raw"])["model"]],
+                         ["/c/chat/completions", "Bearer sk-custom", "my-model"])
+        self.assertNotIn("sk-custom", json.dumps(dsk.clean_env(dsk.config(), self.tmp)))
+        self.hook(**custom, deepseek_api_key="sk-official")  # with a DeepSeek key as well, the official API is the fallback
+        self.assertEqual(self.dsk("configure")[1].splitlines()[1:],
+                         [f"custom:  {self.api.url}/c · my-model · key set", "official: https://api.deepseek.com · deepseek-flash · key set"])
+        self.hook(**{**custom, "provider": "official"}, deepseek_api_key="sk-official")  # the picker decides which one runs
+        self.assertEqual(self.dsk("configure")[1].splitlines()[0], "dsk · ready · official · https://api.deepseek.com · deepseek-flash")
+
+    def test_what_is_missing_is_said_at_session_start_and_a_hook_never_blocks(self):
+        code, out = self.hook("--announce")
+        said = json.loads(out)
+        self.assertEqual(code, 0)
+        self.assertEqual(said["systemMessage"], "dsk is not set up yet: it has no DeepSeek API key. Run /plugin configure dsk@acme "
+                         "and enter your DeepSeek API key, or pick provider `custom` and enter its endpoint URL, model name and API key. "
+                         "Then restart Claude Code.")
+        self.assertEqual(said["hookSpecificOutput"]["hookEventName"], "SessionStart")
+        self.assertIn("Never ask for a key in the chat.", said["hookSpecificOutput"]["additionalContext"])
+        self.assertEqual(self.hook(), (0, ""))  # before a prompt the options are stored and nothing is said
+        code, out = self.hook("--announce", provider="custom", custom_base_url="https://example.invalid/v1")
+        self.assertIn("dsk is not set up yet: provider custom still needs its model name, API key. ", json.loads(out)["systemMessage"])
+        code, out, _ = self.dsk("configure")
+        self.assertEqual((code, out.splitlines()[0]), (1, "dsk · not set up · provider custom still needs its model name, API key"))
+        self.assertIn("next:    in Claude Code, /plugin configure dsk@acme: enter your DeepSeek API key", out)
+        code, out, _ = self.dsk("run", "task")
+        self.assertEqual(code, 1)
+        self.assertIn("error: DEEPSEEK_API_KEY is not set. In Claude Code, run /plugin configure dsk@acme and enter", out)
+        self.assertEqual(self.api.requests, [])
+        self.assertEqual(self.hook("--announce", provider="official", deepseek_api_key="sk-official"), (0, ""))  # set up: silent
+        with mock.patch.dict(os.environ, {"XDG_CONFIG_HOME": "/dev/null/nowhere"}):  # even when it cannot write
+            self.assertEqual(subprocess.run([sys.executable, DSK, "configure", "--hook", "--announce", "--data", "/dev/null/x"],
+                                            env={**self.env, "XDG_CONFIG_HOME": "/dev/null/nowhere"}, input="{}", capture_output=True,
+                                            text=True, timeout=60).returncode, 0)
+
+    def test_a_config_file_and_the_env_file_win_over_the_plugins_options(self):
+        self.hook(provider="custom", custom_base_url=self.api.url + "/c", custom_model="m", custom_api_key="sk-custom")
+        with open(f"{self.tmp}/config/dsk/env", "w") as f:
+            f.write("export DSK_CUSTOM_API_KEY='sk-from-the-env-file'\n")
+        self.api.replies = [script('done("x")')]
+        self.run_ok("task")
+        self.assertEqual(self.api.chats()[0]["key"], "Bearer sk-from-the-env-file")
+        self.write_config()  # the route and profiles a hand-written config.json names stand
+        self.assertEqual(self.dsk("configure")[1].splitlines()[0], f"dsk · ready · a · {self.api.url}/a · model-a")
+
+    def test_a_removed_plugin_takes_its_keys_with_it(self):
+        self.hook(provider="official", deepseek_api_key="sk-official")
+        self.assertEqual(self.dsk("configure")[0], 0)
+        shutil.rmtree(self.data)  # Claude Code deletes the data folder when the plugin is uninstalled
+        code, out, _ = self.dsk("configure")
+        self.assertEqual((code, out.splitlines()[0]), (1, "dsk · not set up · it has no DeepSeek API key"))
+
+    def test_the_file_parses_on_an_older_python_so_that_it_can_say_what_it_needs(self):
+        with open(DSK, encoding="utf-8") as f:
+            ast.parse(f.read(), feature_version=(3, 9))
 
 
 class Parser(unittest.TestCase):
@@ -927,6 +1020,62 @@ class Protocol(Cli):
         done = subprocess.run([sys.executable, DSK, "status", "--hook"], env=self.env, capture_output=True, text=True,
                               input=json.dumps({"hook_event_name": "Stop", "cwd": self.tmp, **event}))
         return done.returncode, done.stderr
+
+    def test_status_json_follows_a_run_through_its_phases(self):
+        repo = self.repo({"tests/t.py": "t = 1\n"})
+        status = f"{sys.executable} {DSK} status --json"
+        self.api.between_turns[2] = lambda: self.put(self.tmp, {"model.json": self.dsk("status", "--json")[1]})
+        self.api.replies = [script(f'read("tests/t.py")\nsh("{status} > {self.tmp}/script.json")'),
+                            script('edit("tests/t.py", "t = 1", "t = 2")\ndone("x")')]
+        out, sid = self.run_ok("--owner", "claude-1", "--allow", "tests/**", "--max-turns", "5",
+                               "--check", f"{status} > {self.tmp}/checks.json", "edit  it\nnow", cwd=repo)
+        seen = {name: json.loads(self.cat(self.tmp, f"{name}.json"))["jobs"] for name in ("script", "model", "checks")}
+        seen["end"] = json.loads(self.dsk("status", "--json")[1])["jobs"]
+        self.assertEqual({name: [[job[k] for k in ("status", "phase", "turn", "act")] for job in jobs]
+                          for name, jobs in seen.items()},
+                         {"script": [["running", "script", 0, "read tests/t.py"]], "model": [["running", "model", 1, ""]],
+                          "checks": [["running", "checks", 1, "done x"]], "end": [["review", "", 2, ""]]})
+        # `doing` is the shell command or check in flight, which here is the one that asked
+        self.assertEqual([seen[name][0]["doing"] for name in ("script", "model", "checks", "end")],
+                         [f"{status} > {self.tmp}/script.json"[:80], "", f"{status} > {self.tmp}/checks.json"[:80], ""])
+        end = seen["end"][0]
+        self.assertEqual([end["failover"], end["cost"]], ["", None])
+        self.assertEqual([end[k] for k in ("id", "profile", "max_turns", "turns", "changed", "brief", "owner", "root", "note")],
+                         [sid, "a", 5, 2, 1, "edit it now", "claude-1", repo, ""])
+        self.assertIn(f"in {dsk.kilo(end['in'])} ({end['cached']:.0%} cached) · out {dsk.kilo(end['out'])}", out)
+        self.assertLessEqual(end["created"], end["active"])
+
+    def test_status_json_reads_a_stopped_log_once_and_reports_failover_and_cost(self):
+        self.config["profiles"]["a"]["price"] = {"in": 2.0, "cached": 1.0, "out": 10.0}
+        self.config["profiles"]["b"]["price"] = {"in": 4.0, "cached": 2.0, "out": 20.0}
+        self.write_config()
+        self.api.replies = [{"status": 429}, {"status": 429}, {"status": 429}, script('done("x")'), script('done("y")')]
+        _, moved = self.run_ok("first")
+        _, stayed = self.run_ok("--profile", "b", "second")
+        first = {j["id"]: j for j in json.loads(self.dsk("status", "--json")[1])["jobs"]}
+        self.assertEqual([first[moved]["failover"], first[moved]["profile"], first[stayed]["failover"]], ["a 429", "b", ""])
+        usage = [r for r in dsk.Session(stayed).recs if r["t"] == "usage"]
+        self.assertAlmostEqual(first[stayed]["cost"], sum((u["prompt"] - u["hit"]) * 4.0 + u["hit"] * 2.0 + u["out"] * 20.0
+                                                          for u in usage) / 1e6)
+        self.assertGreater(first[stayed]["cost"], 0)
+        with mock.patch.object(dsk, "job", wraps=dsk.job) as job, mock.patch("builtins.print") as printed:
+            self.assertEqual(dsk.cmd_status(mock.Mock(json=True, hook=False), dsk.config()), 0)
+        self.assertEqual(job.call_count, 0)  # neither log has moved since its session stopped
+        self.assertEqual({j["id"]: j for j in json.loads(printed.call_args[0][0])["jobs"]}, first)
+        with open(os.path.join(self.tmp, "state/dsk", stayed, "log.jsonl"), "a") as f:
+            f.write(json.dumps({"t": "state", "status": "accepted"}) + "\n")
+        with mock.patch.object(dsk, "job", wraps=dsk.job) as job, mock.patch("builtins.print") as printed:
+            dsk.cmd_status(mock.Mock(json=True, hook=False), dsk.config())
+        self.assertEqual([c.args[0].id for c in job.call_args_list], [stayed])  # only the log that moved is read again
+        self.assertEqual({j["id"]: j["status"] for j in json.loads(printed.call_args[0][0])["jobs"]},
+                         {moved: "done", stayed: "accepted"})
+
+    def test_owner_defaults_to_the_claude_code_session_that_runs_dsk(self):
+        self.api.replies = [script('done("x")'), script('done("y")')]
+        self.env["CLAUDE_CODE_SESSION_ID"] = "claude-7"
+        _, mine = self.run_ok("no flag")
+        _, named = self.run_ok("--owner", "claude-9", "flag wins")
+        self.assertEqual([dsk.Session(mine).head["owner"], dsk.Session(named).head["owner"]], ["claude-7", "claude-9"])
 
     def test_stop_hook_blocks_only_for_the_owners_sessions_in_review(self):
         repo = self.repo({"tests/t.py": "t = 1\n"})
