@@ -265,6 +265,38 @@ class Wire(Case):
                 dsk.chat(self.session(), dsk.config())
         self.assertEqual(self.api.requests, [])
 
+    def test_key_falls_back_to_the_env_file_and_stays_out_of_the_environment(self):
+        with open(f"{self.tmp}/config/dsk/env", "w") as f:
+            f.write("# keys\nexport KEY_A='sk-from-file' # a comment\nKEY_B=\"sk-b-file\"\n")
+        self.api.replies = ["one", "two"]
+        with mock.patch.dict(os.environ, {"KEY_A": "", "KEY_B": ""}):
+            dsk.chat(self.session(), dsk.config())
+            self.assertEqual(os.environ["KEY_A"], "")
+            self.assertNotIn("sk-from-file", json.dumps(dsk.clean_env(dsk.config(), self.tmp)))
+        dsk.chat(self.session(), dsk.config())
+        self.assertEqual([r["key"] for r in self.api.requests], ["Bearer sk-from-file", "Bearer sk-fake-a"])
+
+    def test_full_profile_is_skipped_and_the_last_one_waits_for_a_slot(self):
+        def release():
+            for handle in dsk.slots.values():
+                handle.close()
+            dsk.slots.clear()
+        self.addCleanup(release)
+        self.config["profiles"]["a"]["max_sessions"] = 1
+        self.write_config()
+        os.makedirs(f"{self.tmp}/state/dsk/slots")
+        other = dsk.flock(f"{self.tmp}/state/dsk/slots/a.0", "")  # another run holds a's only slot
+        self.api.replies = ["from b", "from a"]
+        s = self.session()
+        self.assertEqual(dsk.chat(s, dsk.config())[0]["content"], "from b")
+        self.assertEqual([(r["why"], r.get("status")) for r in s.of("series")], [("start", None), ("failover", "full")])
+        self.assertEqual([r["path"] for r in self.api.chats()], ["/b/chat/completions"])
+        threading.Timer(0.2, other.close).start()
+        with mock.patch.object(dsk, "SLOT_POLL", 0.05):
+            self.assertEqual(dsk.chat(self.session(route=["a"]), dsk.config())[0]["content"], "from a")
+        with self.assertRaises(dsk.Fail):  # this process now holds the slot
+            dsk.flock(f"{self.tmp}/state/dsk/slots/a.0", "")
+
     def test_series_guard_rejects_a_rewritten_prefix(self):
         self.api.replies = ["one", "two"]
         s, cfg = self.session(), dsk.config()

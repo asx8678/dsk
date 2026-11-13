@@ -12,7 +12,7 @@ Each turn the worker sends one Python script. The script reads, edits, runs and 
 
 Then, by hand:
 
-1. **Keys.** `dsk` reads keys only from the environment. Export them in your shell profile, or source a private file that does: `[ -f ~/.config/dsk/env ] && . ~/.config/dsk/env`.
+1. **Keys.** `dsk` takes each key from the environment, or else from `~/.config/dsk/env`, a private file (mode 600) of lines like `export DEEPSEEK_API_KEY='...'`. Nothing has to be sourced, so Claude Code needs no setup. A key read from the file never enters `dsk`'s environment, so scripts, `sh()` and checks cannot see it.
 2. **Config.** `~/.config/dsk/config.json` names the environment variables; it never holds a key.
 
    ```json
@@ -28,7 +28,7 @@ Then, by hand:
    }
    ```
 
-   The `official` profile, the `search` block and a default `sh_deny` list are built in, so the file may hold only what differs. `extra` is merged into the request body; a `null` value removes a key the provider rejects. Optional keys: `backoff` (retry waits in seconds, default `[2, 6, 18]`) and `limits` (`turn_seconds` 600, `run_seconds` 3600, `run_tokens` 2000000).
+   The `official` profile, the `search` block and a default `sh_deny` list are built in, so the file may hold only what differs. `extra` is merged into the request body; a `null` value removes a key the provider rejects. Optional keys: `backoff` (retry waits in seconds, default `[2, 6, 18]`) and `limits` (`turn_seconds` 600, `run_seconds` 3600, `run_tokens` 2000000). A profile may set `max_sessions`, the number of runs the provider serves at once; see **Providers**.
 3. **Check it.** `dsk doctor` tests each profile: the key, the model ID, that thinking-off is honoured, five replies over a three-turn exchange, and whether and where cached tokens are reported.
 4. **Permissions.** The skill pre-approves `dsk` only for the turn that invokes it. For later turns and background runs, add `"Bash(dsk *)"` to `permissions.allow` in `~/.claude/settings.json`.
 
@@ -97,7 +97,7 @@ next:    dsk show 7f3a --review | dsk accept 7f3a | dsk reject 7f3a "defects"
 
 **Worktrees.** `--worktree` runs the task in a fresh git worktree seeded with your uncommitted state. `accept` applies the worker's diff to the main tree with `git apply`: changes land uncommitted, a conflict is refused as a whole, and it waits for any in-place run in that tree. In place, `reject --drop` reverse-applies the worker's diff and refuses if those files have moved.
 
-**Providers.** A session starts on the first profile in `route`. On 402, or when retries of a network failure, 408, 429 or 5xx are used up, it continues on the next profile in a new series. A 400 whose message mentions a limit is treated as a 429, because one gateway reports its concurrency limit that way.
+**Providers.** A session starts on the first profile in `route`. On 402, or when retries of a network failure, 408, 429 or 5xx are used up, it continues on the next profile in a new series. A 400 whose message mentions a limit is treated as a 429, because one gateway reports its concurrency limit that way. A profile with `max_sessions` N has N slots, file locks in `~/.local/state/dsk/slots/`; a run holds one from its first request on that profile until its `dsk` process exits. When all are taken, the run moves to the next profile without sending a request, or, on the last profile in the route, waits for a slot.
 
 **State** lives in `~/.local/state/dsk/<id>/`: the log, full turn outputs, the answer, the worktree and a lock.
 
@@ -126,12 +126,12 @@ Measured on 2026-11-11 with `deepseek-flash` on the official API and `deepseek-v
 - **A 429 that survives the retries also fails over,** like a repeated 5xx. So does a network failure.
 - **`python3 -I` discards `PYTHONHASHSEED`,** so the seed is pinned for `sh()` and checks but not for the script process itself.
 - **In a git repository the working directory is the repository root.**
-- **Size:** `dsk.py` has 1,267 lines, over the 1,000-line target. It is under the 1,300-line limit only because 34 lines are longer than 120 characters; wrapped, it would be just over. By your rule the next step is to cut a feature: the candidates are `doctor` (about 55 lines), the raw `search` and `fetch` commands (12), and the time and token limits (6).
+- **Size:** `dsk.py` has 1,308 lines, over the 1,000-line target and, since the key file and `max_sessions` were added, over the 1,300-line limit too (34 lines are longer than 120 characters). By your rule the next step is to cut a feature: the candidates are `doctor` (about 55 lines), the raw `search` and `fetch` commands (12), and the time and token limits (6).
 
 ## Tests
 
 ```
-python3 -m unittest discover -s tests     # 72 tests against a scripted API server and temp git repositories
+python3 -m unittest discover -s tests     # 74 tests against a scripted API server and temp git repositories
 python3 tests/live.py --table             # real toy tasks on the real providers; costs a few cents
 ```
 
