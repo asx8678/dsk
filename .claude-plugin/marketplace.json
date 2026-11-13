@@ -1,0 +1,14 @@
+{
+  "name": "asx8678",
+  "owner": {
+    "name": "Adam"
+  },
+  "description": "dsk: a DeepSeek worker that Claude Code delegates to",
+  "plugins": [
+    {
+      "name": "dsk",
+      "source": "./skill",
+      "description": "Delegate bounded, checkable work from Claude Code to a DeepSeek worker: the skill, a reviewer agent, the review gate, and an optional live display of the jobs (/dsk-jobs on)."
+    }
+  ]
+}

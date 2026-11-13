@@ -1,0 +1,54 @@
+{
+  "name": "dsk",
+  "version": "0.3.0",
+  "description": "Delegate bounded, checkable work from Claude Code to a DeepSeek worker: the skill, a reviewer agent, the review gate, and an optional live display of the jobs (/dsk-jobs on).",
+  "author": {
+    "name": "Adam"
+  },
+  "homepage": "https://github.com/asx8678/dsk",
+  "repository": "https://github.com/asx8678/dsk",
+  "keywords": [
+    "deepseek",
+    "delegation",
+    "worker",
+    "code-review"
+  ],
+  "skills": [
+    "./"
+  ],
+  "types": "./types/index.d.ts",
+  "userConfig": {
+    "provider": {
+      "type": "string",
+      "title": "Provider",
+      "description": "official: DeepSeek's own API, which needs only the DeepSeek API key. custom: any OpenAI-compatible endpoint that serves a DeepSeek model, which needs the three custom fields.",
+      "options": [
+        "official",
+        "custom"
+      ],
+      "default": "official"
+    },
+    "deepseek_api_key": {
+      "type": "string",
+      "title": "DeepSeek API key",
+      "description": "The key from DeepSeek's API platform. Needed for provider official. With provider custom it is optional: it adds the official API as a fallback and makes web search (--web) available.",
+      "sensitive": true
+    },
+    "custom_base_url": {
+      "type": "string",
+      "title": "Custom endpoint URL",
+      "description": "Provider custom only. The base URL of the OpenAI-compatible API, such as https://example.com/v1."
+    },
+    "custom_model": {
+      "type": "string",
+      "title": "Custom model name",
+      "description": "Provider custom only. The model id as that endpoint lists it."
+    },
+    "custom_api_key": {
+      "type": "string",
+      "title": "Custom API key",
+      "description": "Provider custom only. The API key for that endpoint.",
+      "sensitive": true
+    }
+  }
+}
