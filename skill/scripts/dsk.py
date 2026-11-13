@@ -5,7 +5,7 @@ Claude plans and reviews, DeepSeek writes. Each turn the worker replies with one
 Python script; dsk runs it and sends back only what it printed. One file,
 standard library only. See README.md for the protocol.
 """
-import argparse, ast, datetime, fcntl, hashlib, http.client, json, os, re, secrets, select, shutil, signal
+import argparse, ast, datetime, fcntl, hashlib, http.client, json, os, re, secrets, select, shlex, shutil, signal
 import socket, subprocess, sys, tempfile, time, traceback, types, urllib.error, urllib.request
 from glob import translate as glob_regex
 
@@ -96,10 +96,23 @@ def config():
     return cfg
 
 
+def secret(name):
+    """A key from the environment, else from ~/.config/dsk/env (lines like `export NAME='value'`), else "".
+    A key read from the file never enters os.environ, so it cannot reach scripts, sh() or checks."""
+    if os.environ.get(name):
+        return os.environ[name]
+    try:
+        with open(os.path.join(xdg("XDG_CONFIG_HOME", "~/.config"), "env"), encoding="utf-8") as f:
+            words = [w for line in f for w in shlex.split(line, comments=True)]
+    except (OSError, ValueError):
+        return ""
+    return ([w.split("=", 1)[1] for w in words if w.startswith(name + "=")] or [""])[-1]
+
+
 def api_key(block):
-    key = os.environ.get(block["key_env"])
+    key = secret(block["key_env"])
     if not key:
-        raise Fail(f"{block['key_env']} is not set")
+        raise Fail(f"{block['key_env']} is not set, in the environment or in ~/.config/dsk/env")
     return key
 
 
@@ -112,6 +125,25 @@ def flock(path, busy):
         handle.close()
         raise Fail(busy) from None
     return handle
+
+
+SLOT_POLL = 2  # seconds between looks for a free slot when the last profile in the route is full
+slots = {}  # STATE/slots/<profile> -> this process's lock on one of that profile's max_sessions slots
+
+
+def claim_slot(cfg, name):
+    """Hold one of profile `name`'s max_sessions slots until this process exits. True if it has no limit."""
+    limit, key = cfg["profiles"][name].get("max_sessions"), os.path.join(STATE, "slots", name)
+    if not limit or key in slots:
+        return True
+    os.makedirs(os.path.dirname(key), exist_ok=True)
+    for n in range(int(limit)):
+        try:
+            slots[key] = flock(f"{key}.{n}", "")
+            return True
+        except Fail:
+            pass
+    return False
 
 
 # ---------------------------------------------------------------- session log
@@ -252,6 +284,14 @@ def chat(s, cfg):
     """Send the current series and return (assistant message, finish_reason). Fails over along the route."""
     while True:
         name, profile = s.profile, cfg["profiles"][s.profile]
+        route = s.head["route"]
+        later = route[route.index(name) + 1:]
+        if not claim_slot(cfg, name):
+            if later:  # other runs hold all of its max_sessions slots: move on instead of collecting 429s
+                s.add("series", why="failover", profile=later[0], status="full")
+                continue
+            while not claim_slot(cfg, name):
+                time.sleep(SLOT_POLL)
         msgs = messages(s.recs)
         wire = dumps(msgs)[:-1]
         prev = s.last("req", "series")
@@ -273,10 +313,11 @@ def chat(s, cfg):
             s.add("usage", turn=s.turn + 1, profile=name, prompt=usage.get("prompt_tokens") or len(body) // 4,
                   hit=hit, out=usage.get("completion_tokens") or 0)
             return reply, choice.get("finish_reason")
-        route = s.head["route"]
-        later = route[route.index(name) + 1:]
         if not later or (status != 402 and status not in RETRY):
             raise Fail(f"{name}: HTTP {status} {data}")
+        held = slots.pop(os.path.join(STATE, "slots", name), None)
+        if held:
+            held.close()
         s.add("series", why="failover", profile=later[0], status=status)
 
 
@@ -1156,7 +1197,7 @@ def cmd_doctor(args, cfg):
             raise Fail(f"unknown profile {name}")
         profile = cfg["profiles"][name]
         print(f"dsk doctor · {name} · {profile['base_url']} · {profile['model']}")
-        if not os.environ.get(profile["key_env"]):
+        if not secret(profile["key_env"]):
             healthy = False
             print(f"key:      {profile['key_env']} is not set")
             continue
@@ -1192,7 +1233,7 @@ def cmd_doctor(args, cfg):
             print("settings: " + (f"caching works, compact_at {profile.get('compact_at', 32000)} is fine" if cached else
                                   "no cache hits seen, so every turn is billed in full: set compact_at to 24000 or lower"))
     block = cfg["search"]
-    if os.environ.get(block["key_env"]):
+    if secret(block["key_env"]):
         status, data = web_tool(cfg, "search", "DeepSeek API documentation", 1)
         print("search:   " + ("works" if status == 200 else f"HTTP {status} {data}"))
     else:

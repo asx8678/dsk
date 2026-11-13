@@ -43,9 +43,9 @@ fi
 cat <<'EOF'
 
 Still to do by hand:
-1. Keys. dsk reads them only from the environment. Export DEEPSEEK_API_KEY and DSK_THIRDPARTY_API_KEY
-   in your shell profile, or source a private file that does, for example:
-       [ -f ~/.config/dsk/env ] && . ~/.config/dsk/env
+1. Keys. dsk takes each key from the environment, or else from ~/.config/dsk/env (chmod 600), with
+   lines like:
+       export DEEPSEEK_API_KEY='...'
 2. Config. Put your provider profiles in ~/.config/dsk/config.json (see README.md), then run: dsk doctor
 3. Permissions. The skill pre-approves dsk only for the turn that invokes it. For later turns and
    background runs, add this to "permissions": {"allow": [...]} in ~/.claude/settings.json:
