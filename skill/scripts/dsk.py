@@ -183,9 +183,18 @@ SLOT_POLL = 2  # seconds between looks for a free slot when the last profile in 
 slots = {}  # STATE/slots/<profile> -> this process's lock on one of that profile's max_sessions slots
 
 
+def pool(cfg, name):
+    """(The slot file prefix, the limit) of profile `name`. Profiles that reach the same endpoint with the same key
+    share one set of slots, under the first one's name, limited by the smallest max_sessions any of them sets."""
+    reach = lambda p: (p["base_url"].rstrip("/"), p.get("key_env"))  # noqa: E731
+    same = [k for k, p in cfg["profiles"].items() if reach(p) == reach(cfg["profiles"][name])]
+    limits = [int(cfg["profiles"][k]["max_sessions"]) for k in same if cfg["profiles"][k].get("max_sessions")]
+    return os.path.join(STATE, "slots", same[0]), min(limits, default=None)
+
+
 def claim_slot(cfg, name):
     """Hold one of profile `name`'s max_sessions slots until this process exits. True if it has no limit."""
-    limit, key = cfg["profiles"][name].get("max_sessions"), os.path.join(STATE, "slots", name)
+    key, limit = pool(cfg, name)
     if not limit or key in slots:
         return True
     os.makedirs(os.path.dirname(key), exist_ok=True)
@@ -378,7 +387,7 @@ def chat(s, cfg):
         route = s.head["route"]
         later = route[route.index(name) + 1:]
         if later and paused(name):  # its credit ran out (see pause): skip it, but always try the last profile
-            release(name)
+            release(cfg, name)
             s.add("series", why="failover", profile=later[0], status="paused")
             continue
         if not claim_slot(cfg, name):
@@ -418,13 +427,13 @@ def chat(s, cfg):
             pause(cfg, name, data)
         if not later or (status not in RETRY and not spent(status, data)):
             raise Fail(f"{name}: HTTP {status} {data}")
-        release(name)
+        release(cfg, name)
         s.add("series", why="failover", profile=later[0], status=status)
 
 
-def release(name):
+def release(cfg, name):
     """Give back this process's max_sessions slot on profile `name`, if it holds one."""
-    held = slots.pop(os.path.join(STATE, "slots", name), None)
+    held = slots.pop(pool(cfg, name)[0], None)
     if held:
         held.close()
 
@@ -1407,6 +1416,10 @@ def cmd_doctor(args, cfg):
             healthy = False
             print(f"key:      {profile['key_env']} is not set")
             continue
+        if not claim_slot(cfg, name):  # runs hold all of its max_sessions slots: a test request would be one too many
+            print(f"slots:    all {pool(cfg, name)[1]} in use by running jobs, so it was not checked; "
+                  f"run dsk doctor --profile {name} when they finish")
+            continue
         url, key = profile["base_url"].rstrip("/") + "/chat/completions", api_key(profile)
         sent = headers(profile, "dsk-doctor-" + secrets.token_hex(4))  # one value for all five requests
         msgs = [{"role": "system", "content": SYSTEM}, {"role": "user", "content": task}]
@@ -1439,6 +1452,7 @@ def cmd_doctor(args, cfg):
             print(f"cache:    {field} · same request three times: {', '.join(hits[:3])} · extended: {', '.join(hits[3:])}")
             print("settings: " + (f"caching works, compact_at {profile.get('compact_at', 32000)} is fine" if cached else
                                   "no cache hits seen, so every turn is billed in full: set compact_at to 24000 or lower"))
+        release(cfg, name)
     block = cfg["search"]
     if secret(block["key_env"]):
         status, data = web_tool(cfg, "search", "DeepSeek API documentation", 1)
