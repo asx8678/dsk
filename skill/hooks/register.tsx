@@ -459,7 +459,14 @@ const branch = (
   under: readonly RenderNode[],
   actions: RenderNode | undefined,
 ) => {
-  const moved = job.failover === '' ? '' : ` · ↯ ${job.failover} → ${job.profile}`
+  // A profile whose slots other runs held was skipped before any request: nothing failed, so it is no warning.
+  const isBusy = job.failover.endsWith(' full')
+  const moved =
+    job.failover === ''
+      ? ''
+      : isBusy
+        ? ` · ${job.failover.slice(0, -' full'.length)} busy → ${job.profile}`
+        : ` · ↯ ${job.failover} → ${job.profile}`
   const tail = ` · ${job.id}${about}`
   const room = Math.max(12, columns - 5 - tail.length - moved.length)
   const lead = isLast ? '     ⎿  ' : '  │  ⎿  '
@@ -470,7 +477,8 @@ const branch = (
         <Text dimColor>{isLast ? '  └─ ' : '  ├─ '}</Text>
         {cut(job.brief, room)}
         <Text dimColor>{tail}</Text>
-        {moved !== '' && <Text color="warning">{moved}</Text>}
+        {moved !== '' &&
+          (isBusy ? <Text dimColor>{moved}</Text> : <Text color="warning">{moved}</Text>)}
       </Text>
       {under.map(line => (
         <Text wrap="truncate-end">
