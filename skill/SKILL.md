@@ -9,7 +9,7 @@ allowed-tools:
 
 # dsk: you plan and review, DeepSeek writes
 
-`dsk` hands one bounded task to a DeepSeek worker and prints a short report. Nothing the worker produces counts as finished until you have reviewed it and run `dsk accept`. A Stop hook sends you back to any session you started that is still waiting for review.
+`dsk` hands one bounded task to a DeepSeek worker and prints a short report. Nothing the worker produces counts as finished until you have reviewed it and run `dsk accept`. A Stop hook sends you back to any session you started that is still waiting for review. It reminds you of `review` only: a run without `--worktree` that stopped as `question`, `stuck`, `limit` or `error` leaves its partial edits in the tree with no reminder, so settle it before you move on.
 
 `dsk` is on PATH while the plugin is enabled. If the shell does not find it, use `${CLAUDE_SKILL_DIR}/bin/dsk` in its place.
 
@@ -24,20 +24,23 @@ If a command fails with `... is not set`, dsk has no provider yet. Do not ask fo
 
 ```
 dsk run [--allow GLOB]... [--check CMD]... [--file PATH]... [--web] [--worktree]
-        [--effort low|high|max] "brief"
+        [--effort low|high|max] [--max-turns N] [--profile NAME] ("brief" | --brief FILE)
 ```
 
 - **Brief:** two to five lines saying what to produce and what done looks like. Structure goes in the flags; project facts go in `DSK.md`. Name files and functions by path: the worker asks when a task cannot be done as written, but when a name fits two things it picks the likelier one without saying so.
-- **`--allow`:** the only paths the worker may change. Make it as narrow as the task permits. `*` stays inside one directory, `**` crosses them. Without `--allow` the run is read-only.
+- **`--allow`:** the paths the worker may change. Make it as narrow as the task permits. `*` stays inside one directory, `**` crosses them. Without `--allow` the run is read-only. This stops a mistaken worker, not a hostile one: `write()` and `edit()` refuse other paths, and `dsk` undoes changes to any other file git does not ignore, but the worker's shell commands can still change git-ignored files (`.env`, `node_modules`) and paths outside the repository. Outside a git repository nothing is undone.
 - **`--check`:** give at least one for any change. `dsk` runs it itself and reaches `review` only when it passes.
 - **`--file`:** attach what the worker must read (`-` is stdin), so it spends no turn fetching it. A file of up to 4,000 characters stays attached for the whole run; a larger one is dropped if a long run is compacted, so keep instructions in the brief or in a small file.
 - **`--web`:** search and fetch, for research. Leave it off for tasks that also run commands in a repository with secrets.
 - **Owner:** `dsk` takes your session from `CLAUDE_CODE_SESSION_ID`, which Claude Code sets for every command, so the Stop hook knows whose run it is. Pass `--owner` only to say otherwise.
 - **`--effort`:** only for briefs that need judgment. The default is no thinking.
-- Paths, globs and checks are relative to the repository root, wherever you call `dsk` from.
-- **Short tasks:** run in the foreground with a Bash timeout of 600000 ms, and do not touch the tree until it returns. If the timeout passes, the run is moved to the background and keeps going: wait for its completion notice. While one of the worker's shell commands is running, any change outside `--allow` is undone (a copy is kept in the session directory), whoever made it.
-- **Long or parallel tasks:** add `--worktree` and start it as a background Bash command. Keep working in the main tree and review when it reports. A worktree has no git-ignored files, so a check that needs `node_modules` or a virtualenv must create them.
+- **`--max-turns`:** 12 by default. A run that uses them up stops as `limit`, and so does one past the time or token limit in the config.
+- Globs and checks are relative to the repository root, wherever you call `dsk` from. `--file` and `--brief` paths are relative to the current directory.
+- **Short tasks:** run in the foreground with a Bash timeout of 600000 ms. If the timeout passes, the run is moved to the background and keeps going: wait for its completion notice.
+- **Hands off the tree until an in-place run stops.** This holds for every run without `--worktree` in a git repository, read-only runs included. Each worker script that starts a shell command is charged with every change made from its start to its end, and so are the checks: a change outside `--allow` is undone (a copy is kept in the session directory) and a change inside it counts as the worker's, whoever made it. Without `--allow` that is every change. You cannot tell when those windows are open, so make no edits until the run reports.
+- **Long, parallel or background tasks, read-only ones included:** add `--worktree` and start it as a background Bash command. Keep working in the main tree and review when it reports. A worktree has no git-ignored files, so a check that needs `node_modules` or a virtualenv must create them.
 - **One in-place run per tree.** A second run without `--worktree` is refused while the first is working, and so is `dsk accept` of a worktree session. Wait, or use `--worktree`.
+- **`dsk answer` and `dsk reject ID "..."`** start the worker again and can take as long as a run. Call them as you called the run: the same Bash timeout, in the background for a worktree session, and hands off the tree for an in-place one.
 
 ## What to do with each status
 
@@ -48,7 +51,7 @@ The last line of every report names the commands that are valid next.
 | `question` | 2 | Answer from your own context with `dsk answer ID "..."`. Ask the user only if you cannot. |
 | `review` | 0 | Read `dsk show ID --review`. Then `dsk accept ID`, or `dsk reject ID "1. ... 2. ..."` with a numbered defect list. |
 | `stuck`, `limit` | 3 | Take over from the notes and partial diff in the report, or re-brief. `dsk accept ID` keeps the partial work, `dsk reject ID "guidance"` lets the worker continue, `dsk reject ID --drop` discards it. |
-| `done` | 0 | A read-only answer. Treat it as claims: check the `sources:` line and open the source for any fact you will build on. |
+| `done` | 0 | The worker changed no files: a read-only answer, or a writable run that found nothing to change. The report's `answer:` stops at 1,500 characters; `dsk show ID --answer` prints all of it. Treat it as claims: open the source for any fact you will build on, and after a `--web` run check the `sources:` line. |
 | `error` | 1 | Read the `error:` line. `dsk reject ID --drop` cleans up. |
 
 **Reviewing.** In a report, `summary`, `answer`, `notes` and `question` are the worker's claims; every other line is measured by `dsk`. Judge the diff against the brief yourself when it is under about 150 changed lines. Above that, hand the packet to the `dsk:reviewer` subagent, unless your instructions forbid subagents, in which case review it yourself. After a rejected round, `dsk show ID --review` shows only what changed since your last review. After two rejected rounds, take the task over.
@@ -57,11 +60,11 @@ The last line of every report names the commands that are valid next.
 
 ## DSK.md
 
-If the repository root has no `DSK.md`, write one once: at most 40 lines covering the layout, how to run tests and linters, and conventions. Then leave it alone. It opens every run's first message, so a stable `DSK.md` is a cached prefix.
+If the repository root has no `DSK.md`, write one once and tell the user you added it: at most 40 lines covering the layout, how to run tests and linters, and conventions. Then leave it alone. It opens every run's first message, so a stable `DSK.md` is a cached prefix.
 
 ## Closing message to the user
 
-Say what was delegated, the verdict, the turns, the cached share and the tokens. All of them are on the first line of the report.
+Say what was delegated and your verdict (accepted, rejected or dropped), then the turns, the cached share and the tokens from the first line of the report. The cached share is missing there when the provider does not report it.
 
 ## Other commands
 

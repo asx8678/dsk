@@ -11,7 +11,7 @@ You are given a dsk session ID. `dsk` is on PATH while the plugin is enabled; if
 
 ## Steps
 
-1. Run `dsk show ID --review` for the packet and `dsk show ID --diff` if the diff was cut. The packet's `brief:` is what was asked. Its `summary:` and `notes:` are the worker's claims: trust none of them.
+1. Run `dsk show ID --review` for the packet, then `dsk show ID --diff` for the whole change: after a rejected round the packet's diff shows only what changed since the last review, and a long diff is cut. The packet's `brief:` is what was asked. Its `summary:` and `notes:` are the worker's claims: trust none of them.
 2. Find the code. If the packet has a `where:` line, the change lives in that worktree; otherwise it is already in the working tree.
 3. Re-run every command on the `checks:` line yourself, in that directory, and read the output. A check that passes proves only what it tests.
 4. Read the whole diff against the brief:

@@ -50,7 +50,7 @@ The plugin needs Python 3.13 or newer on `PATH`, as `python3` or as `python3.13`
 
    The `official` profile, the `search` block and a default `sh_deny` list are built in, so the file may hold only what differs. `extra` is merged into the request body; a `null` value removes a key the provider rejects. Optional keys: `backoff` (retry waits in seconds, default `[2, 6, 18]`) and `limits` (`turn_seconds` 600, `run_seconds` 3600, `run_tokens` 2000000). A profile may set `max_sessions`, the number of runs the provider serves at once (see **Providers**), and `price`, dollars per million tokens as `{"in": 0.005, "cached": 0.003, "out": 0.57}`, from which `status --json` reports each job's cost. `headers` adds request headers; in a value, `{session}` becomes an ID that stays the same for the whole run, across `answer`, `reject` and failover. OpenCode Go needs `"headers": {"x-opencode-session": "{session}"}`. `pause_hours` (default 1) is how long a profile is skipped after it reports its credit used up, when the error names no reset time (see **Providers**).
 3. **Check it.** `dsk doctor` tests each profile: the key, the model ID, that thinking-off is honoured, five replies over a three-turn exchange, and whether and where cached tokens are reported.
-4. **Permissions.** The skill pre-approves `dsk` only for the turn that invokes it. For later turns and background runs, add `"Bash(dsk *)"` to `permissions.allow` in `~/.claude/settings.json`.
+4. **Permissions.** The skill pre-approves `dsk` only for the turn that invokes it. For later turns and background runs, add `"Bash(dsk *)"` to `permissions.allow` in `~/.claude/settings.json`. That rule also covers every `--check` command and every shell command the worker runs: none of them reaches a permission prompt, and only the guards in **Guardrails, stated honestly** stand in the way.
 5. **Display.** In a session that was already open, run `/reload-plugins` once. `/dsk-jobs on` loads the live display and `/dsk-jobs off` unloads it; see **The plugin**.
 
 ## Commands
@@ -86,7 +86,7 @@ next:    dsk show 7f3a --review | dsk accept 7f3a | dsk reject 7f3a "defects"
 | Status | Meaning | Exit code |
 |---|---|---|
 | `review` | files changed, checks passed, waiting for accept or reject | 0 |
-| `done` | read-only task finished; the answer is in the report | 0 |
+| `done` | no file changed: a read-only answer, or a writable run that found nothing to change; the answer is in the report | 0 |
 | `question` | the worker called `ask()` | 2 |
 | `stuck` | same reply twice, or three failing turns in a row | 3 |
 | `limit` | turn, time or token limit reached | 3 |
