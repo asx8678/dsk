@@ -90,6 +90,11 @@ class Fail(Exception):
     """Ends the command with status `error`."""
 
 
+# Resolved once, at startup: every later turn starts a child from this file. The path dsk was started through can be
+# a link or a launcher that an install replaces during a run, and a child started from that would be another program.
+SELF = os.path.realpath(__file__)
+
+
 def xdg(var, default):
     return os.path.join(os.environ.get(var) or os.path.expanduser(default), "dsk")
 
@@ -386,12 +391,20 @@ def replayable(message, effort):
     return reply
 
 
+def later_profiles(s):
+    """The profiles a session may still move to: the rest of its route. None when the lead chose its profile with
+    --profile on reject, answer or continue: like `dsk run --profile`, that holds the session there."""
+    route, moved = s.head["route"], next((r for r in reversed(s.of("series")) if r["why"] == "failover"), None)
+    if s.profile not in route or (moved and moved.get("status") == "chosen"):
+        return []
+    return route[route.index(s.profile) + 1:]
+
+
 def chat(s, cfg):
     """Send the current series and return (assistant message, finish_reason). Fails over along the route."""
     while True:
         name, profile = s.profile, cfg["profiles"][s.profile]
-        route = s.head["route"]
-        later = route[route.index(name) + 1:]
+        later = later_profiles(s)
         if later and paused(name):  # its credit ran out (see pause): skip it, but always try the last profile
             release(cfg, name)
             s.add("series", why="failover", profile=later[0], status="paused")
@@ -567,7 +580,12 @@ TRUNCATED = ("Your reply reached the output limit and was cut off, so nothing wa
 ONE_CALL = "not run: send exactly one run_code call per reply"
 REPEAT = ("not run: this reply is identical to your previous one. If the work is finished, call done() with the "
           "result; otherwise send a different script.")
+ALTERNATING = ("not run: your last four replies alternate between the same two scripts and nothing changes. "
+               "Do something different, or call done() or ask().")
 CUT_OFF = {"role": "assistant", "content": "(my reply was cut off at the output limit and was not kept)"}
+SCRATCH = ('scratch: write("@scratch/name", text) and $DSK_SCRATCH in sh() are for throwaway files; '
+           'nothing there is part of your change')
+OUTSIDE = '{} is outside the working directory; for throwaway files use "@scratch/name", or $DSK_SCRATCH in sh()'
 BANNED = {"open": "read() or write()", "exec": "plain code", "eval": "plain code", "compile": "plain code",
           "__import__": "an import statement", "input": "ask()"}
 HINTS = {"os": "sh(), glob() and read()", "sys": "print() and done()", "subprocess": "sh()", "shutil": "sh()",
@@ -638,11 +656,13 @@ def clean_env(cfg, sdir):
     """The environment for scripts, sh() and checks: mine, minus everything that looks like a credential."""
     keys = {block["key_env"] for block in (*cfg["profiles"].values(), cfg["search"])}
     env = {k: v for k, v in os.environ.items() if k not in keys and (k in cfg["env_pass"] or not SECRET.search(k))}
-    empty = os.path.join(sdir, "empty")
+    empty, scratch = os.path.join(sdir, "empty"), os.path.join(sdir, "scratch")
     os.makedirs(empty, exist_ok=True)
+    os.makedirs(scratch, exist_ok=True)
     env.update(KUBECONFIG=os.devnull, AWS_SHARED_CREDENTIALS_FILE=os.devnull, AWS_CONFIG_FILE=os.devnull,
                AWS_EC2_METADATA_DISABLED="true", CLOUDSDK_CONFIG=empty, AZURE_CONFIG_DIR=empty, DOCKER_CONFIG=empty,
-               GIT_TERMINAL_PROMPT="0", PYTHONHASHSEED="0", LC_ALL="C.UTF-8", LANG="C.UTF-8", TZ="UTC")
+               GIT_TERMINAL_PROMPT="0", PYTHONHASHSEED="0", LC_ALL="C.UTF-8", LANG="C.UTF-8", TZ="UTC",
+               DSK_SCRATCH=scratch)
     return env
 
 
@@ -676,6 +696,13 @@ def child(fd):
     chan = socket.socket(fileno=fd).makefile("rw", encoding="utf-8")
     job = json.loads(chan.readline())
     cwd, allowed = os.path.realpath(os.getcwd()), matcher(job["allow"])
+    # The worker's own folder for probes and other throwaway files. It comes from job["dir"], which every parent
+    # sends, so a child started by an older dsk process finds it too.
+    scratch = os.path.realpath(os.path.join(job["dir"], "scratch"))
+
+    def scratch_name(path):
+        """Whether a path names the scratch folder the short way, as "@scratch" or "@scratch/<rel>"."""
+        return path == "@scratch" or path.startswith("@scratch/")
 
     def tell(**record):
         chan.write(json.dumps(record) + "\n")
@@ -687,10 +714,14 @@ def child(fd):
             return os.path.join(job["dir"], path[1:])
         if not change and re.fullmatch(r"@\d+", path):
             return os.path.join(job["dir"], "out", path[1:])
-        real = os.path.realpath(path)
+        real = os.path.realpath(os.path.join(scratch, path[len("@scratch/"):]) if scratch_name(path) else path)
+        if real == scratch or real.startswith(scratch + os.sep):
+            return real  # the scratch folder is the worker's to read and to change, whatever --allow says
+        if scratch_name(path):
+            raise PermissionError(f"{path} leaves the scratch folder")
         rel = os.path.relpath(real, cwd)
         if rel == ".." or rel.startswith("../"):
-            raise PermissionError(f"{path} is outside the working directory")
+            raise PermissionError(OUTSIDE.format(path))
         if change and not allowed(rel):
             scope = ", ".join(job["allow"]) or "none, this run is read-only"
             raise PermissionError(f"{path} does not match the allow patterns ({scope})")
@@ -720,6 +751,14 @@ def child(fd):
         write(path, text.replace(old, new))
 
     def find(pattern):
+        patterns = [pattern] if isinstance(pattern, str) else list(pattern)
+        if any(scratch_name(p) for p in patterns):  # "@scratch/**": the files of the scratch folder, by their short names
+            inside = [os.path.relpath(os.path.join(d, f), scratch) for d, _, fs in os.walk(scratch) for f in fs]
+            match = matcher([p[len("@scratch/"):] or "**" for p in patterns if scratch_name(p)])
+            return sorted("@scratch/" + n for n in inside if match(n))
+        for p in patterns:  # an empty list here would read as "no such files", and the worker would keep looking
+            if os.path.isabs(p) or p == ".." or p.startswith("../"):
+                raise PermissionError(OUTSIDE.format(p))
         listing = subprocess.run(["git", "ls-files", "-co", "--exclude-standard", "-z"], capture_output=True,
                                  encoding="utf-8", errors="replace")
         if listing.returncode == 0:
@@ -733,7 +772,7 @@ def child(fd):
         regex, hits = re.compile(pattern), []
         for path in find(glob):
             try:
-                with open(path, encoding="utf-8") as f:
+                with open(locate(path), encoding="utf-8") as f:  # locate(): a "@scratch/..." name is not a path
                     hits += [(path, n, line.rstrip("\n")) for n, line in enumerate(f, 1) if regex.search(line)]
             except (UnicodeDecodeError, OSError):
                 pass  # binary or unreadable
@@ -839,7 +878,7 @@ def run_script(s, cfg, env, turn, script):
     limit, out_path = cfg["limits"]["turn_seconds"], os.path.join(s.dir, "out", str(turn))
     ours, theirs = socket.socketpair()
     with open(out_path, "wb") as out:
-        proc = subprocess.Popen([sys.executable, "-I", os.path.abspath(__file__), "_exec", str(theirs.fileno())],
+        proc = subprocess.Popen([sys.executable, "-I", SELF, "_exec", str(theirs.fileno())],
                                 cwd=s.head["workdir"], env=env, stdin=subprocess.DEVNULL, stdout=out, stderr=out,
                                 pass_fds=[theirs.fileno()], start_new_session=True)
     theirs.close()
@@ -1071,7 +1110,8 @@ def run_header(terms, web, date):
         if "output_chars" in terms and "read_chars" in terms else ""  # a session started before these keys has no line
     return "\n".join(filter(None, ["## Run", "allow: " + (", ".join(terms["allow"]) or "(none: this run is read-only)"),
                        *[f"check: {cmd}" for cmd in terms["checks"]], f"web: {'on' if web else 'off'}", shown,
-                       f"turn limit: {terms['max_turns']}", f"date: {date}"]))
+                       f"turn limit: {terms['max_turns']}", f"date: {date}",
+                       SCRATCH if terms.get("scratch") else ""]))  # a session started before the folder has no line
 
 
 def first_message(head, digest=""):
@@ -1123,8 +1163,16 @@ def said(message):
 
 def loop(s, cfg, extra=""):
     """Drive the session to its next stop. `extra` is the lead's text, appended to the pending turn result."""
-    limits, started, failures, repeats = cfg["limits"], time.time(), 0, 0
-    env = clean_env(cfg, s.dir)
+    limits, started, failures, repeats, reads = cfg["limits"], time.time(), 0, 0, 0
+    env, writing, said_here = clean_env(cfg, s.dir), bool(scope(s)["allow"]), []
+
+    def bad(status, **info):
+        """Halt at a bad stop, with the checks run first when the worker changed files and they are configured."""
+        run = bool(changes(s)[1]) and bool(scope(s)["checks"])
+        if run:
+            gates(s, cfg, env)  # its result is no use to a worker that is being stopped: only the record matters
+        return halt(s, status, checked=run, **info)
+
     while True:
         pending = s.last("result", "msg")
         if pending["t"] == "result":  # sent only now, so an answer, defect list or failed check rides in the same message
@@ -1142,9 +1190,13 @@ def loop(s, cfg, extra=""):
         # The worker still hears that its reply was cut off, in the message that carries this turn's result.
         s.add("msg", turn=turn, m=CUT_OFF if finish == "length" else reply)
         left = max(0, scope(s)["max_turns"] - len(s.since("round", "result")) - 1)
-        repeats = repeats + 1 if said(reply) == previous else 0
+        now = said(reply)
+        # Alternating between two scripts gets a worker no further than repeating one, so both count the same way.
+        alternates = len(said_here) >= 3 and now == said_here[-2] and said_here[-1] == said_here[-3] and said_here[-1] != now
+        said_here.append(now)
+        repeats = repeats + 1 if now == previous or alternates else 0
         if repeats:  # a worker that has its answer and only forgot to call done() gets one warning, not a stop
-            body, failed, stop = REPEAT, "repeat", None
+            body, failed, stop = (ALTERNATING if alternates else REPEAT), "repeat", None
         else:
             body, failed, stop = take_turn(s, cfg, env, turn, reply, finish)
         failures = failures + 1 if failed else 0
@@ -1152,6 +1204,11 @@ def loop(s, cfg, extra=""):
         if stop and stop["fn"] == "done":
             problem = gates(s, cfg, env)
             text, finished = text + ("\n\n" + problem if problem else ""), not problem
+        kind = turn_kind({"turn": turn, "fail": failed}, [a for a in s.of("ledger") if a["turn"] == turn])
+        reads = reads + 1 if writing and kind == "read" else 0  # a run that only reads never gets its work done
+        if reads and not reads % 12:
+            text += (f"\n\nnote: the last {reads} turns only read files. {left} turns are left: start writing now, "
+                     "or call ask() if the task cannot be done as written.")
         s.add("result", turn=turn, text=text, fail=failed)
         if VERBOSE:
             print(turn_line(s, turn), file=sys.stderr)
@@ -1159,15 +1216,21 @@ def loop(s, cfg, extra=""):
             return halt(s, summary=stop["arg"], open=stop["open"])
         if stop and stop["fn"] == "ask":
             return halt(s, "question", question=stop["arg"])
-        if repeats >= 2:
-            return halt(s, "stuck", why="same reply three times in a row")
+        if repeats >= 2:  # another provider may break the loop, so it is tried before the run gives up
+            later = later_profiles(s)
+            if later:
+                release(cfg, s.profile)
+                s.add("series", why="failover", profile=later[0], status="repeat")
+                repeats = failures = 0  # the next provider starts with a clean count, or its first failure would stop the run
+            else:
+                return bad("stuck", why="the same two replies, alternating" if alternates else "same reply three times in a row")
         if failures >= 3:
-            return halt(s, "stuck", why="three failing turns in a row")
+            return bad("stuck", why="three failing turns in a row")
         spent = sum(u["prompt"] + u["out"] for u in s.since("round", "usage"))
         over = "turn" if not left else "time" if time.time() - started > limits["run_seconds"] else \
             "token" if spent > limits["run_tokens"] else ""
         if over:
-            return halt(s, "limit", why=f"{over} limit reached")
+            return bad("limit", why=f"{over} limit reached")
 
 
 # ---------------------------------------------------------------- reports
@@ -1214,7 +1277,9 @@ def report(s, review=False, cfg=None):
     `notes` are the worker's words; every other line is measured."""
     st, usage, ledger, checks = s.last("state"), s.of("usage"), s.of("ledger"), s.last("checks") or {"results": []}
     status, turns, cached = s.status(), s.turn, cached_share(usage)
-    top = [f"dsk {s.id}", status, s.profile, f"{turns} turn{'' if turns == 1 else 's'}",
+    earlier = [p for p in dict.fromkeys(r.get("profile") for r in s.of("series")) if p and p != s.profile]
+    shown = s.profile + (" after " + ", ".join(earlier) if earlier else "")  # a failover says which profile came before
+    top = [f"dsk {s.id}", status, shown, f"{turns} turn{'' if turns == 1 else 's'}",
            f"in {kilo(sum(u['prompt'] for u in usage))}" + ("" if cached is None else f" ({cached:.0%} cached)"),
            f"out {kilo(sum(u['out'] for u in usage))}"]
     top += [f"{fn} {n}" for fn in ("search", "fetch") if (n := sum(r["fn"] == fn and not r.get("cached") for r in ledger))]
@@ -1233,7 +1298,9 @@ def report(s, review=False, cfg=None):
     line("notes", partial and " | ".join(r["arg"] for r in ledger if r["fn"] == "note"))
     line("answer" if status == "done" else "summary", (answer_text(s) if status == "done" else st.get("summary", ""))[:1500])
     line("open", st.get("open"))
-    line("checks", "; ".join(f"{cmd} → {code}" for cmd, code in checks["results"]))
+    ran = st.get("checked")  # a bad stop leaves the checks unrun when the worker changed no files
+    line("checks", "not run: the worker changed no files" if status in ("stuck", "limit") and ran is False
+                    and scope(s)["checks"] else "; ".join(f"{cmd} → {code}" for cmd, code in checks["results"]))
     reverted = list(dict.fromkeys(path for g in s.of("gate") for path in g["reverted"]))
     line("scope", reverted and f"reverted {', '.join(reverted)} (copies in {os.path.join(s.dir, 'reverted')})")
     line("changed", ", ".join(f"{path} ({'binary' if a == '-' else f'+{a}' + (f' -{d}' if d != '0' else '')})"
@@ -1278,6 +1345,7 @@ def report(s, review=False, cfg=None):
 
 def drive(s, cfg, extra=""):
     """Run the loop to its next stop, print the report, return the exit code. Any failure becomes `error`."""
+    print(f"dsk {s.id} · running · {s.profile}", file=sys.stderr)
     s.add("state", status="running")
     try:
         loop(s, cfg, extra)
@@ -1314,6 +1382,7 @@ def resume(sid, *states):
 
 def close(s, status):
     """End a session as accepted or dropped, keeping what its last stop measured."""
+    shutil.rmtree(os.path.join(s.dir, "scratch"), ignore_errors=True)  # throwaway files, of no use after this
     s.add("state", **{**{k: v for k, v in s.last("state").items() if k != "t"}, "status": status})
 
 
@@ -1338,6 +1407,9 @@ def project_root():
 
 def make_worktree(s, root, workdir):
     """A worktree at `workdir`, on branch dsk/<id>, holding the main tree as it is now, uncommitted state and all."""
+    if subprocess.run(["git", "-C", root, "rev-parse", "--verify", "-q", "HEAD"], capture_output=True).returncode:
+        raise Fail("--worktree needs a commit to start from, and this repository has none: "
+                   "make a first commit (git add -A && git commit -m start), or run without --worktree")
     seed = git(root, "diff", "--binary", "HEAD", snapshot(root, os.path.join(s.dir, "index.main")))
     git(root, "worktree", "add", "-q", "-b", f"dsk/{s.id}", workdir, "HEAD")
     if seed:
@@ -1401,7 +1473,9 @@ def cmd_run(args, cfg):
         shutil.rmtree(s.dir, ignore_errors=True)
         raise
     head = s.add("head", id=s.id, root=root or workdir, workdir=workdir, worktree=args.worktree, start=start,
-                 allow=args.allow, checks=args.check, web=args.web, effort=args.effort, max_turns=args.max_turns,
+                 allow=args.allow, checks=args.check, web=args.web, effort=args.effort,
+                 max_turns=args.max_turns or (30 if args.allow else 12),  # leads gave writing runs 25 to 40
+                 scratch=True,
                  output_chars=cfg["limits"]["output_chars"], read_chars=cfg["limits"]["read_chars"],
                  owner=args.owner, route=route, brief=brief.strip(), files=files, dsk_md=dsk_md.strip(),
                  date=str(datetime.date.today()), created=time.time())
@@ -1416,11 +1490,23 @@ def cmd_run(args, cfg):
     return drive(s, cfg)
 
 
+def choose_profile(s, cfg, name):
+    """Run a session's next round on the profile the lead named with --profile, and hold it there (see
+    later_profiles). It is logged as a failover, because that is the one kind of series record that keeps the messages."""
+    if not name:
+        return
+    if name not in cfg["profiles"]:
+        raise Fail(f"unknown profile {name}")
+    api_key(cfg["profiles"][name])
+    s.add("series", why="failover", profile=name, status="chosen")  # also when it is there already: this holds it there
+
+
 def cmd_answer(args, cfg):
     if bool(args.text) == bool(args.brief):
         raise Fail('give the answer as "text" or with --brief FILE, not both')
     text = args.text or slurp(args.brief)
     s = resume(args.id, "question")
+    choose_profile(s, cfg, args.profile)
     s.add("answer", text=text)
     return drive(s, cfg, "\n\nlead's answer: " + text)
 
@@ -1446,6 +1532,7 @@ def cmd_continue(args, cfg):
         raise Fail('give the task as "text" or with --brief FILE, not both')
     text = args.text or slurp(args.brief)
     s = resume(args.id, "done", "accepted")
+    choose_profile(s, cfg, args.profile)
     head = s.head
     if args.allow and head["start"] is None:
         raise Fail("--allow needs a git repository")
@@ -1467,7 +1554,7 @@ def cmd_continue(args, cfg):
     s.add("round")
     extra = ("\n\nthe lead has the next task for this session. What you did before stands.\n\n"
              + run_header({"allow": allow, "checks": checks, "max_turns": turns,
-                           **{key: head[key] for key in ("output_chars", "read_chars") if key in head}},
+                           **{key: head[key] for key in ("output_chars", "read_chars", "scratch") if key in head}},
                           head["web"], str(datetime.date.today()))
              + "\n\n## Task\n" + text)
     return drive(s, cfg, extra)
@@ -1475,17 +1562,48 @@ def cmd_continue(args, cfg):
 
 def cmd_accept(args, cfg):
     s = resume(args.id, "review", "stuck", "limit")
-    head, count = s.head, len(s.last("state")["changed"])
+    st, head = s.last("state"), s.head
+    count, now, applied, saved, late = len(st["changed"]), None, None, "", []
     if head["worktree"]:
         s._tree, patch = tree_lock(head["root"]), worker_diff(s, "--binary")
+        if os.path.isdir(head["workdir"]) and st.get("end"):
+            # The lead can edit the worktree, with a gofmt or a one-line fix: apply the worktree as it stands.
+            allowed, now, start = matcher(scope(s)["allow"]), tree(s), scope(s)["start"]
+            worker = [path for _, _, path in st["changed"]]
+
+            def differ(a, b):
+                return [p for p in git(head["root"], "diff", "--name-only", "--no-renames", "-z", a, b).split("\0") if p]
+
+            # The lead's edits are what moved after the last stop, and what differs from the start without being the
+            # worker's: an edit made between two rounds is already in the tree of the last stop.
+            after = list(dict.fromkeys(differ(st["end"], now) + [p for p in differ(start, now) if p not in worker]))
+            inside, outside = [p for p in after if allowed(p)], [p for p in after if not allowed(p)]
+            if outside:  # not mine to apply, but it must not die with the worktree either
+                kept = os.path.join(s.dir, "late.patch")
+                saved = git(head["root"], "diff", "--binary", start, now, "--", *[":(literal)" + p for p in outside])
+                late.append(f"late:    not applied, outside --allow: {', '.join(outside)} (kept as {kept})")
+            if inside:
+                files = list(dict.fromkeys([path for _, _, path in st["changed"]] + inside))
+                paths = [":(literal)" + path for path in files]
+                patch = git(head["root"], "diff", "--binary", start, now, "--", *paths)
+                applied = [entry.split("\t") for entry in git(head["root"], "diff", "--numstat", "--no-renames", "-z", start, now, "--", *paths).split("\0") if entry]
+                late.insert(0, f"late:    included your edits in the worktree: {', '.join(inside)}")
         try:
             git(head["root"], "apply", stdin=patch) if patch else None
         except Fail as e:  # git apply is all-or-nothing, so the main tree is untouched
             raise Fail(f"conflict, nothing was applied and the session is still open ({e})") from None
+        if saved:  # written only once nothing can fail any more, just before the worktree goes
+            with open(os.path.join(s.dir, "late.patch"), "w", encoding="utf-8") as f:
+                f.write(saved)
         remove_worktree(head)
+    if applied is not None:  # close() copies the last state, which must say what was applied, not what the worker left
+        st.update(end=now, changed=applied)
+        count = len(applied)
     close(s, "accepted")
     where = "applied to your working tree, uncommitted" if head["worktree"] else "already in your working tree"
     print(f"dsk {s.id} · accepted · {count} file{'' if count == 1 else 's'} {where}")
+    for line in late:
+        print(line)
     return 0
 
 
@@ -1493,8 +1611,11 @@ def cmd_reject(args, cfg):
     if sum((bool(args.text), bool(args.brief), args.drop)) != 1:
         raise Fail('give the defects as "text" or with --brief FILE, or --drop to discard the work, not two of them')
     text = args.text or (slurp(args.brief) if args.brief else "")
+    if args.drop and args.profile:
+        raise Fail("--profile chooses the provider of the next round, and --drop has none")
     if not args.drop:
         s = resume(args.id, "review", "stuck", "limit")
+        choose_profile(s, cfg, args.profile)
         s.add("reject", text=text)
         s.add("round")
         return drive(s, cfg, "\n\nthe lead reviewed this and rejected it. Fix these defects:\n" + text)
@@ -1511,6 +1632,51 @@ def cmd_reject(args, cfg):
     close(s, "dropped")
     print(f"dsk {s.id} · dropped · the worker's changes were discarded")
     return 0
+
+
+def cmd_wait(args, cfg):
+    """Block until the named sessions, or this project's running ones, have stopped, printing each report as it
+    comes. Runs started together from one shell command give no notice of their own; this is the notice."""
+    started, seen, waiting, reported = time.time(), time.time(), list(dict.fromkeys(args.id)), 0
+    for sid in waiting:
+        Session(sid)  # fails now for an ID that does not exist, not after the others have been waited for
+    root, owner, known = project_root() or os.getcwd(), os.environ.get("CLAUDE_CODE_SESSION_ID", ""), set(waiting)
+    deadline = started + args.timeout if args.timeout is not None else None
+
+    def driven(sid):
+        """Whether a dsk process is running the session: it holds the lock. Asked without reading the log, which is long."""
+        try:
+            flock(os.path.join(STATE, sid, "lock"), "").close()
+            return False
+        except Fail:
+            return True
+
+    def mine(head):
+        """Without IDs: this lead's sessions in this project that run, or that were started with this very command.
+        `dsk run ... & dsk run ... & dsk wait`: a run started a moment ago may be over already."""
+        return (head["root"] == root and (not owner or head.get("owner") == owner) and head["id"] not in known
+                and (head.get("created", 0) >= started - 5 or driven(head["id"])))
+
+    while True:
+        for s in sessions(mine) if not args.id else []:
+            known.add(s.id)
+            waiting.append(s.id)
+        for sid in [sid for sid in waiting if not driven(sid)]:
+            s = Session(sid)
+            if s.last("state") and s.status() != "running":
+                print(report(s, cfg=cfg).rstrip("\n") + "\n", flush=True)
+                waiting.remove(sid)
+                reported += 1
+        if waiting:
+            seen = time.time()
+        elif args.id or time.time() - seen >= (4 if reported else 10):  # a run of the same command may still be starting
+            if not reported:
+                print("dsk · nothing is running")
+            return 0
+        if deadline is not None and time.time() >= deadline:
+            print(f"dsk · still running: {' '.join(waiting)}")
+            return 124
+        time.sleep(2)
 
 
 def cmd_bench(args, cfg):
@@ -1555,7 +1721,7 @@ def job(s, cfg):
     return {"id": s.id, "status": status, "phase": phase if status == "running" else "", "profile": s.profile,
             "doing": " ".join(last["arg"].split())[:80] if last["t"] == "doing" and status == "running" else "",
             "failover": next((f"{a['profile']} {b['status'] or 'network'}" for a, b in reversed(list(zip(series, series[1:])))
-                              if b["why"] == "failover"), ""), "cost": cost,
+                              if b["why"] == "failover" and b.get("status") != "chosen"), ""), "cost": cost,
             "turn": len(s.since("round", "result")), "max_turns": scope(s)["max_turns"], "turns": s.turn,
             "in": sum(u["prompt"] for u in usage), "out": sum(u["out"] for u in usage), "cached": cached_share(usage),
             "act": " ".join(f"{acts[-1]['fn']} {acts[-1]['arg']}".split())[:80] if acts else "",
@@ -1632,7 +1798,7 @@ def metrics(s, cfg):
             "rejects": len(s.of("reject")), "continues": len(s.of("base")),
             "compactions": sum(r["why"] == "compact" for r in series),
             "failovers": [f"{a['profile']} {b['status'] or 'network'}"
-                          for a, b in zip(series, series[1:]) if b["why"] == "failover"],
+                          for a, b in zip(series, series[1:]) if b["why"] == "failover" and b.get("status") != "chosen"],
             "turns": len(results), "kinds": kinds,
             "lead_in": next((n for n, kind in enumerate(kinds_list) if kind != "read"), len(kinds_list)),
             "cut": sum("characters cut here" in r["text"] for r in results),
@@ -1700,7 +1866,7 @@ def stats_summary(pairs):
             p = totals.setdefault(name, dict(blank))
             p["seconds"], p["timed"] = p["seconds"] + seconds, p["timed"] + timed
         for a, b in zip(s.of("series"), s.of("series")[1:]):
-            if b["why"] == "failover":  # also from a profile no session shown so far has a turn on
+            if b["why"] == "failover" and b.get("status") != "chosen":  # also from a profile no session shown so far has a turn on
                 totals.setdefault(a["profile"], dict(blank))["away"] += 1
     for name, p in sorted(totals.items(), key=lambda kv: (-kv[1]["turns"], kv[0])):
         row = f"profile {name}: {p['turns']} turns · in {kilo(p['in'])} ({share(p['hit'], p['in'])}% cached) · " \
@@ -1946,12 +2112,13 @@ def main():
     run.add_argument("--worktree", action="store_true", help="work in a fresh git worktree")
     run.add_argument("--effort", choices=list(MAX_TOKENS), default="off", help="thinking effort")
     run.add_argument("--profile", help="use this provider profile only")
-    run.add_argument("--max-turns", type=int, default=12)
+    run.add_argument("--max-turns", type=int, help="turns the run may take (default: 30 with --allow, 12 without)")
     run.add_argument("--owner", default=os.environ.get("CLAUDE_CODE_SESSION_ID", ""),
                      help="the Claude Code session that started the run (default: $CLAUDE_CODE_SESSION_ID)")
     answer = command("answer", "answer the worker's question", "id")
     answer.add_argument("text", nargs="?", help="the answer")
     answer.add_argument("--brief", metavar="FILE", help="read the answer from a file (- is stdin)")
+    answer.add_argument("--profile", metavar="NAME", help="continue on this provider profile")
     view = command("show", "print a session's report", "id").add_mutually_exclusive_group()
     for flag, text in (("review", "the review packet"), ("diff", "the worker's whole diff"),
                        ("log", "tokens and actions per turn"), ("answer", "the whole answer")):
@@ -1962,11 +2129,16 @@ def main():
     cont.add_argument("--allow", action="append", default=[], metavar="GLOB", help="paths the worker may change")
     cont.add_argument("--check", action="append", default=[], metavar="CMD", help="acceptance test, run by dsk")
     cont.add_argument("--max-turns", type=int, help="turns this round may take")
+    cont.add_argument("--profile", metavar="NAME", help="run this round on this provider profile")
     command("accept", "mark as reviewed; after --worktree, apply the changes", "id")
     reject = command("reject", "send defects back, or --drop the work", "id")
     reject.add_argument("text", nargs="?", help="the defects, as a numbered list")
     reject.add_argument("--brief", metavar="FILE", help="read the defects from a file (- is stdin)")
     reject.add_argument("--drop", action="store_true", help="discard the work")
+    reject.add_argument("--profile", metavar="NAME", help="run the next round on this provider profile")
+    wait = command("wait", "block until sessions have stopped, printing each report")
+    wait.add_argument("id", nargs="*", help="sessions to wait for (default: this project's running ones)")
+    wait.add_argument("--timeout", type=float, metavar="SECONDS", help="give up after this long, with exit code 124")
     status = command("status", "this project's sessions")
     status.add_argument("--hook", action="store_true", help="act as a Stop hook")
     status.add_argument("--json", action="store_true", help="the last day's sessions on any project, as JSON")
@@ -1988,7 +2160,7 @@ def main():
     configure.add_argument("--data", metavar="DIR", help="with --hook: the plugin's data folder")
     commands = {"run": cmd_run, "answer": cmd_answer, "show": cmd_show, "continue": cmd_continue,
                 "accept": cmd_accept, "reject": cmd_reject,
-                "status": cmd_status, "stats": cmd_stats, "search": cmd_web, "fetch": cmd_web,
+                "status": cmd_status, "wait": cmd_wait, "stats": cmd_stats, "search": cmd_web, "fetch": cmd_web,
                 "doctor": cmd_doctor, "configure": cmd_configure, "bench": cmd_bench}
     args = parser.parse_args()
     VERBOSE = args.verbose

@@ -868,6 +868,8 @@ done("tried everything")"""
         self.assertIn("answer:  carried on", out)
 
     def test_three_identical_replies_are_stuck_at_the_third(self):
+        self.config["route"] = ["a"]  # a run with a later profile in its route fails over instead of stopping
+        self.write_config()
         self.api.replies = [script('print("once")')] * 3
         out, sid = self.run_ok("repeat", code=3)
         self.assertIn("why:     same reply three times in a row", out)
@@ -986,7 +988,7 @@ class Gates(Cli):
         self.api.replies = [script('write("tests/t.sh", "echo broken; exit 3\\n")\ndone("first try")'),
                             script('write("tests/t.sh", "echo fine\\n")\ndone("Fixed the script.", "none")')]
         out, sid = self.run_ok("--allow", "tests/**", "--check", "sh tests/t.sh", "--check", "true", "fix it", cwd=repo)
-        self.assertEqual(self.back(1), "turn 1 · 11 left\nwrote: tests/t.sh\noutput: (none)\n\n"
+        self.assertEqual(self.back(1), "turn 1 · 29 left\nwrote: tests/t.sh\noutput: (none)\n\n"
                                        "check failed: sh tests/t.sh → 3\nbroken")
         self.assertEqual(out.splitlines()[1:], [
             "summary: Fixed the script.", "open:    none", "checks:  sh tests/t.sh → 0; true → 0",
@@ -996,7 +998,7 @@ class Gates(Cli):
         header = self.api.bodies()[0]["messages"][1]["content"]
         self.assertIn("## Run\nallow: tests/**\ncheck: sh tests/t.sh\ncheck: true\nweb: off\n"
                       "output: a turn shows at most 6,000 characters of what you print, 24,000 when it only reads files\n"
-                      "turn limit: 12\ndate: ", header)
+                      "turn limit: 30\ndate: ", header)
 
     def test_the_first_message_says_how_much_a_turn_shows(self):
         self.api.replies = [script('done("x")')]
@@ -1097,6 +1099,8 @@ class Gates(Cli):
 
     def test_stuck_report_carries_notes_and_the_scoped_partial_change(self):
         repo = self.repo({"src/a.py": "a = 1\n", "tests/t.py": "t = 1\n"})
+        self.config["route"] = ["a"]  # a run with a later profile in its route fails over instead of stopping
+        self.write_config()
         self.api.replies = [script('note("config lives in src/a.py")\nedit("tests/t.py", "t = 1", "t = 2")\n'
                                    'sh("echo hacked > src/a.py")')] * 3
         out, _ = self.run_ok("--allow", "tests/**", "edit", cwd=repo, code=3)
@@ -1172,7 +1176,7 @@ class Compaction(Cli):
         self.assertEqual([m["role"] for m in after], ["system", "user", "assistant", "tool", "assistant", "tool", "user"])
         self.assertEqual(after[0], before[0])
         self.assertEqual(after[2:4], before[4:])
-        self.assertEqual(after[5]["content"], "turn 3 · 9 left\noutput:\nthree")
+        self.assertEqual(after[5]["content"], "turn 3 · 27 left\noutput:\nthree")
         self.assertEqual(after[6]["content"], "Older turns were dropped to save space, and so were the attached copies of: big.txt. "
                                               "Read a file again before you rely on what it said.")
         first = after[1]["content"]
@@ -1223,7 +1227,7 @@ class Review(Cli):
         packet = self.dsk("show", sid, "--review", cwd=repo)[1].splitlines()
         self.assertEqual(packet[1:9], ["brief:   bump t", "allow:   tests/**", "notes:   t.py holds the constant",
                                        "summary: Bumped t and added new.py.", "checks:  true → 0",
-                                       "changed: tests/new.py (+1), tests/t.py (+1 -1)", "context: 1.1k of 32.0k",
+                                       "changed: tests/new.py (+1), tests/t.py (+1 -1)", "context: 1.2k of 32.0k",
                                        "diff --git a/tests/new.py b/tests/new.py"])
         self.assertTrue({"+n = 1", "-t = 1", "+t = 2"} <= set(packet))
         self.assertEqual(packet[-1], f'next:    dsk show {sid} --review | dsk accept {sid} | dsk reject {sid} "defects"')
@@ -1251,7 +1255,7 @@ class Review(Cli):
         first, second = (json.dumps(b["messages"], ensure_ascii=False, separators=(",", ":")) for b in self.api.bodies())
         self.assertTrue(second.startswith(first[:-1]))
         self.assertTrue(self.back(1).endswith("the lead reviewed this and rejected it. Fix these defects:\n1. t must be 3"))
-        self.assertTrue(dsk.Session(sid).last("result")["text"].startswith("turn 2 · 11 left"))
+        self.assertTrue(dsk.Session(sid).last("result")["text"].startswith("turn 2 · 29 left"))
         self.assertEqual(self.cat(repo, "tests/t.py"), "t = 3\n")
         packet = self.dsk("show", sid, "--review", cwd=repo)[1]
         self.assertIn(f"diff since your last review (the whole diff: dsk show {sid} --diff)\n", packet)
@@ -1321,6 +1325,57 @@ class Review(Cli):
         self.assertEqual(self.dsk("reject", sid, "--drop", cwd=repo)[0], 0)
         self.assertEqual((self.git(repo, "branch", "--list", f"dsk/{sid}"), os.path.exists(f"{self.tmp}/state/dsk/{sid}/wt")), ("", False))
         self.assertEqual(self.cat(repo, "tests/t.py"), "t = 7  # I changed the same line\n")
+
+    def test_accept_brings_the_edits_the_lead_made_in_the_worktree_after_the_worker_stopped(self):
+        repo, sid = self.delegated("--worktree")
+        wt = f"{self.tmp}/state/dsk/{sid}/wt"
+        self.put(wt, {"tests/t.py": "t = 2  # fixed by me after the run\n", "tests/extra.py": "e = 1\n"})
+        code, out, err = self.dsk("accept", sid, cwd=repo)
+        self.assertEqual(code, 0, out + err)
+        self.assertEqual(out.splitlines(), [f"dsk {sid} · accepted · 3 files applied to your working tree, uncommitted",
+                                            "late:    included your edits in the worktree: tests/extra.py, tests/t.py"])
+        self.assertEqual((self.cat(repo, "tests/t.py"), self.cat(repo, "tests/new.py"), self.cat(repo, "tests/extra.py")),
+                         ("t = 2  # fixed by me after the run\n", "n = 1\n", "e = 1\n"))
+        self.assertFalse(os.path.exists(wt))
+        self.assertIn("changed: tests/extra.py (+1), tests/new.py (+1), tests/t.py (+1 -1)\n", self.dsk("show", sid, cwd=repo)[1])
+        accepted = dsk.Session(sid).last("state")
+        self.assertEqual((accepted["status"], sorted(accepted["changed"])),
+                         ("accepted", [["1", "0", "tests/extra.py"], ["1", "0", "tests/new.py"], ["1", "1", "tests/t.py"]]))
+        # the record's end is the tree the diff was applied to, so it holds the late edit too
+        self.assertEqual([self.git(repo, "show", f"{accepted['end']}:{path}") for path in ("tests/t.py", "tests/extra.py")],
+                         ["t = 2  # fixed by me after the run\n", "e = 1\n"])
+
+    def test_accept_brings_an_edit_the_lead_made_in_the_worktree_between_two_rounds(self):
+        repo, sid = self.delegated("--worktree")
+        self.put(f"{self.tmp}/state/dsk/{sid}/wt", {"tests/extra.py": "e = 1\n", "src/late.txt": "mine\n"})
+        self.api.replies = [script('edit("tests/t.py", "t = 2", "t = 3")\ndone("Now it is 3.")')]
+        code, out, _ = self.dsk("reject", sid, "1. t must be 3", cwd=repo)
+        self.assertEqual(code, 0, out)
+        code, out, err = self.dsk("accept", sid, cwd=repo)
+        self.assertEqual(code, 0, out + err)
+        patch = f"{self.tmp}/state/dsk/{sid}/late.patch"
+        self.assertEqual(out.splitlines(), [f"dsk {sid} · accepted · 3 files applied to your working tree, uncommitted",
+                                            "late:    included your edits in the worktree: tests/extra.py",
+                                            f"late:    not applied, outside --allow: src/late.txt (kept as {patch})"])
+        self.assertEqual((self.cat(repo, "tests/t.py"), self.cat(repo, "tests/extra.py"), os.path.exists(f"{repo}/src/late.txt")),
+                         ("t = 3\n", "e = 1\n", False))
+        self.assertIn("+mine", self.cat(patch))
+
+    def test_accept_keeps_a_late_edit_outside_allow_in_a_patch_and_does_not_apply_it(self):
+        repo, sid = self.delegated("--worktree")
+        wt, patch = f"{self.tmp}/state/dsk/{sid}/wt", f"{self.tmp}/state/dsk/{sid}/late.patch"
+        self.put(wt, {"src/late.txt": "mine\n"})
+        code, out, err = self.dsk("accept", sid, cwd=repo)
+        self.assertEqual(code, 0, out + err)
+        self.assertEqual(out.splitlines(), [f"dsk {sid} · accepted · 2 files applied to your working tree, uncommitted",
+                                            f"late:    not applied, outside --allow: src/late.txt (kept as {patch})"])
+        self.assertEqual((self.cat(repo, "tests/t.py"), self.cat(repo, "tests/new.py"), os.path.exists(f"{repo}/src/late.txt")),
+                         ("t = 2\n", "n = 1\n", False))
+        self.assertFalse(os.path.exists(wt))  # what is left of the worktree is kept in the patch
+        self.assertEqual([line for line in self.cat(patch).splitlines() if line.startswith(("+++", "+mine"))],
+                         ["+++ b/src/late.txt", "+mine"])
+        self.assertEqual(self.git(repo, "apply", patch), "")
+        self.assertEqual(self.cat(repo, "src/late.txt"), "mine\n")
 
     def test_a_worktree_run_that_ends_done_removes_its_worktree_and_its_branch(self):
         repo = self.repo({"src/a.py": "a = 1\n"})
@@ -1616,7 +1671,7 @@ class Protocol(Cli):
     def test_failover_on_402_during_a_run(self):
         self.api.replies = [{"status": 402}, script('done("served by b")')]
         out, sid = self.run_ok("fail over")
-        self.assertIn("· done · b · 1 turn ·", out)
+        self.assertIn("· done · b after a · 1 turn ·", out)
         self.assertIn("-- new series: failover on b\n", self.dsk("show", sid, "--log")[1])
 
     def test_web_calls_run_in_the_parent_and_unseen_urls_are_flagged(self):
