@@ -39,6 +39,7 @@ class FakeAPI:
         api = self
         self.requests, self.replies, self.seen = [], [], []
         self.search_results, self.pages, self.between_turns = [], {}, {}
+        self.delays = {}  # first path segment -> seconds to wait before answering: a slow provider
 
         class Handler(BaseHTTPRequestHandler):
             def log_message(self, *args):
@@ -89,6 +90,7 @@ class FakeAPI:
         return "the list must end with a user or tool message" if owed or last == "assistant" else None
 
     def answer(self, path, body):
+        time.sleep(self.delays.get(path.split("/")[1], 0))
         if path.endswith("/tools/search"):
             return 200, {"results": self.search_results[:body.get("count", 10)]}, 0
         if path.endswith("/tools/fetch"):
@@ -541,6 +543,129 @@ class Plugin(Cli):
             ast.parse(f.read(), feature_version=(3, 9))
 
 
+class Speed(Cli):
+    """The provider speed benchmark, and the fastest-first route order it feeds."""
+
+    def measured(self, seconds, at=None):
+        """Write a speed.json as an earlier benchmark would have, {name: seconds} with `at` for each entry."""
+        os.makedirs(f"{self.tmp}/state/dsk", exist_ok=True)
+        found = {name: {"seconds": value, "why": "", "at": at or time.time()} for name, value in seconds.items()}
+        with open(f"{self.tmp}/state/dsk/speed.json", "w") as f:
+            json.dump(found, f)
+        return found
+
+    def test_probe_times_a_profile_and_says_why_it_cannot(self):
+        self.api.delays["a"] = 0.3
+        self.api.replies = ["ok", "ok"]
+        result = dsk.probe(dsk.config(), "a")
+        self.assertEqual((result["why"], len(self.api.chats())), ("", 2))
+        self.assertGreaterEqual(result["seconds"], 0.3)
+        with mock.patch.dict(os.environ, {"KEY_B": ""}):
+            self.assertEqual(dsk.probe(dsk.config(), "b"), {"seconds": None, "why": "no key"})
+        self.config["profiles"]["b"]["max_sessions"] = 1
+        self.write_config()
+        os.makedirs(f"{self.tmp}/state/dsk/slots", exist_ok=True)
+        other = dsk.flock(f"{self.tmp}/state/dsk/slots/b.0", "")  # another run holds b's only slot
+        self.addCleanup(other.close)
+        self.assertEqual(dsk.probe(dsk.config(), "b"), {"seconds": None, "why": "busy"})
+        self.assertEqual(len(self.api.chats()), 2)  # a busy profile is not asked anything
+
+    def test_bench_prints_the_faster_profile_first_and_writes_both_to_speed_json(self):
+        self.api.delays.update({"a": 0.3, "b": 0.0})
+        self.api.replies = ["ok"] * 4  # two test requests per profile
+        code, out, err = self.dsk("bench")
+        self.assertEqual(code, 0, out + err)
+        found = json.loads(self.cat(self.tmp, "state/dsk/speed.json"))
+        self.assertEqual(sorted(found), ["a", "b"])
+        self.assertEqual(out.splitlines(), ["dsk bench · 2 profiles", f"{'b':<12} {found['b']['seconds']:.2f}s",
+                                           f"{'a':<12} {found['a']['seconds']:.2f}s"])
+        self.assertGreater(found["a"]["seconds"], found["b"]["seconds"])
+        self.assertEqual({found["a"]["why"], found["b"]["why"]}, {""})
+
+    def test_bench_json_prints_the_measurements(self):
+        self.api.replies = ["ok"] * 4
+        code, out, _ = self.dsk("bench", "--json")
+        self.assertEqual(code, 0)
+        found = json.loads(out)
+        self.assertEqual(sorted(found), ["a", "b"])
+        self.assertEqual(found, json.loads(self.cat(self.tmp, "state/dsk/speed.json")))
+
+    def test_bench_exits_1_when_no_profile_can_be_measured(self):
+        self.config["profiles"]["a"]["base_url"] = "http://127.0.0.1:1"
+        self.config["profiles"]["b"]["key_env"] = "KEY_GONE"
+        self.write_config()
+        code, out, err = self.dsk("bench")
+        self.assertEqual(code, 1, out + err)
+        self.assertEqual(out.splitlines(), ["dsk bench · 2 profiles", f"{'a':<12} no answer", f"{'b':<12} no key"])
+
+    def test_a_fast_route_already_measured_goes_straight_to_the_faster_profile(self):
+        self.config["route_order"] = "fastest"
+        self.write_config()
+        self.measured({"a": 2.0, "b": 1.0})
+        self.api.replies = [script('done("x")')]
+        _, sid = self.run_ok("task")
+        self.assertEqual([r["path"] for r in self.api.chats()], ["/b/chat/completions"])
+        self.assertEqual(dsk.Session(sid).head["route"], ["b", "a"])
+
+    def test_a_stale_or_missing_measurement_is_redone_before_the_run(self):
+        self.config["route_order"] = "fastest"
+        self.write_config()
+        without = f"{self.tmp}/state/dsk/speed.json"
+        for before in (time.time() - 3600, None):
+            with self.subTest(speed_json="stale" if before else "missing"):
+                if before:
+                    self.measured({"a": 2.0, "b": 1.0}, at=before)
+                elif os.path.exists(without):
+                    os.remove(without)
+                self.api.requests.clear()
+                self.api.delays.update({"a": 0.3, "b": 0.0})
+                self.api.replies = ["ok"] * 4 + [script('done("x")')]
+                code, out, err = self.dsk("run", "task")
+                self.assertEqual(code, 0, out + err)
+                paths = [r["path"] for r in self.api.chats()]
+                self.assertEqual(sorted(paths[:4]), ["/a/chat/completions"] * 2 + ["/b/chat/completions"] * 2)
+                self.assertEqual(paths[4], "/b/chat/completions")
+                self.assertRegex(err, r"bench:   a \d+\.\d\ds · b \d+\.\d\ds\n")
+
+    def test_a_listed_route_is_not_measured_or_reordered(self):
+        self.measured({"a": 2.0, "b": 1.0})
+        self.api.replies = [script('done("x")')]
+        self.run_ok("task")
+        self.assertEqual([r["path"] for r in self.api.chats()], ["/a/chat/completions"])
+
+    def test_a_profile_named_on_the_command_line_is_not_reordered(self):
+        self.config["route_order"] = "fastest"
+        self.write_config()
+        self.measured({"a": 2.0, "b": 1.0})
+        self.api.replies = [script('done("x")')]
+        self.run_ok("--profile", "a", "task")
+        self.assertEqual([r["path"] for r in self.api.chats()], ["/a/chat/completions"])
+
+    def test_a_busy_profile_keeps_its_earlier_seconds(self):
+        old = self.measured({"a": 1.25, "b": 3.0})["a"]["at"]
+        self.config["profiles"]["a"]["max_sessions"] = 1
+        self.write_config()
+        os.makedirs(f"{self.tmp}/state/dsk/slots", exist_ok=True)
+        other = dsk.flock(f"{self.tmp}/state/dsk/slots/a.0", "")  # another run holds a's only slot
+        self.addCleanup(other.close)
+        self.api.replies = ["ok", "ok"]
+        found = dsk.bench(dsk.config(), ["a", "b"])
+        self.assertEqual(found["a"], {"seconds": 1.25, "why": "busy", "at": old})
+        self.assertEqual(json.loads(self.cat(self.tmp, "state/dsk/speed.json"))["a"],
+                         {"seconds": 1.25, "why": "busy", "at": old})
+        self.assertLess(found["b"]["seconds"], 3.0)
+
+    def test_configure_shows_the_order_only_when_the_route_is_fastest(self):
+        self.measured({"a": 1.42, "b": 2.1})
+        self.assertNotIn("order:", self.dsk("configure")[1])
+        self.config["route_order"] = "fastest"
+        self.config["route"].append("c")
+        self.config["profiles"]["c"] = {"base_url": self.api.url + "/c", "key_env": "KEY_A", "model": "model-c"}
+        self.write_config()
+        code, out, _ = self.dsk("configure")
+        self.assertIn("\norder:    fastest first: a 1.42s, b 2.10s, c (not measured)\n", out)
+
+
 class Parser(unittest.TestCase):
     def call(self, arguments, name="run_code"):
         return {"id": "c1", "type": "function", "function": {"name": name, "arguments": arguments}}
@@ -691,9 +816,23 @@ done("tried everything")"""
                             script('print(len(read("@1")), read("@1", 1, 1)[:3])\ndone("x")')]
         _, sid = self.run_ok("print a lot")
         capped = self.back(1)
-        self.assertLess(len(capped), 6200)
-        self.assertIn('AAA\n[... 14001 characters cut here; read("@1") returns all of it ...]\nBBB', capped)
+        self.assertLess(len(capped), 6300)
+        self.assertIn('AAA\n[... 14001 characters cut here: a turn that only reads shows at most 24,000 characters, '
+                      'any other turn 6,000; read("@1") returns all of it ...]\nBBB', capped)
         self.assertEqual(self.output(sid, 2), "20001 AAA\n")
+
+    def test_a_turn_that_only_reads_shows_more_and_the_limits_are_settings(self):
+        repo = self.repo({"big.txt": "A" * 9000 + "B" * 11000 + "\n"})
+        self.api.replies = [script('print(read("big.txt"))'), script('done("read it")')]
+        self.run_ok("read the big file", cwd=repo)
+        self.assertIn("A" * 9000 + "B" * 11000, self.back(1))  # 20,001 characters, under the 24,000 of a reading turn
+        self.config["limits"] = {"read_chars": 8000}
+        self.write_config()
+        self.api.replies = [script('print(read("big.txt"))'), script('done("read it")')]
+        self.run_ok("read the big file again", cwd=repo)
+        cut = self.api.bodies()[-1]["messages"][-1]["content"]  # the second run's request that carried its first turn
+        self.assertLess(len(cut), 8400)
+        self.assertIn("12002 characters cut here: a turn that only reads shows at most 8,000 characters", cut)
 
     def test_malformed_refused_and_truncated_replies_get_fixed_messages_then_stuck(self):
         self.api.replies = ["I think the answer is 4.", script("import os\nprint(os.getcwd())"),
@@ -719,12 +858,73 @@ done("tried everything")"""
         self.assertEqual([m["content"] for m in answers], [dsk.ONE_CALL, "turn 1 · 11 left\n" + dsk.NUDGE])
         self.assertFalse(os.path.exists(f"{self.tmp}/state/dsk/{sid}/out/1"))
 
-    def test_same_reply_twice_is_stuck_and_not_run_again(self):
-        self.api.replies = [script('print("once")')] * 2
-        out, sid = self.run_ok("repeat", code=3)
-        self.assertIn("why:     same reply twice in a row", out)
+    def test_one_identical_reply_is_only_warned_and_a_different_one_goes_on(self):
+        self.api.replies = [script('print("once")'), script('print("once")'), script('done("carried on")')]
+        out, sid = self.run_ok("repeat")
         self.assertEqual(self.output(sid, 1), "once\n")
         self.assertFalse(os.path.exists(f"{self.tmp}/state/dsk/{sid}/out/2"))
+        self.assertEqual(self.api.bodies()[2]["messages"][-1],
+                         {"role": "tool", "tool_call_id": "call_1_0", "content": "turn 2 · 10 left\n" + dsk.REPEAT})
+        self.assertIn("answer:  carried on", out)
+
+    def test_three_identical_replies_are_stuck_at_the_third(self):
+        self.api.replies = [script('print("once")')] * 3
+        out, sid = self.run_ok("repeat", code=3)
+        self.assertIn("why:     same reply three times in a row", out)
+        self.assertEqual(self.output(sid, 1), "once\n")
+        self.assertFalse(os.path.exists(f"{self.tmp}/state/dsk/{sid}/out/2"))
+        self.assertFalse(os.path.exists(f"{self.tmp}/state/dsk/{sid}/out/3"))
+
+    def test_re_and_json_work_without_an_import_and_an_import_still_works(self):
+        self.api.replies = [script('print(json.dumps(re.findall("[0-9]+", "a1b22")))\n'
+                                   'import re, json\nprint(json.dumps(re.findall("[a-z]", "abc")))\ndone("ran")')]
+        _, sid = self.run_ok("modules")
+        self.assertEqual(self.output(sid, 1), '["1", "22"]\n["a", "b", "c"]\n')
+
+    def test_import_glob_gives_our_glob_both_ways(self):
+        repo = self.repo({"b.txt": "b\n", "a.txt": "a\n", "c.md": "c\n"})
+        self.api.replies = [script('import glob\nprint(glob.glob("*.txt"))\nprint(glob("*.txt"))\n'
+                                   'from glob import glob as g\nprint(g("*.txt"))\ndone("sorted")')]
+        _, sid = self.run_ok("glob", cwd=repo)
+        self.assertEqual(self.output(sid, 1), "['a.txt', 'b.txt']\n['a.txt', 'b.txt']\n['a.txt', 'b.txt']\n")
+
+    def test_a_cut_off_reply_is_not_kept_and_comes_back_as_a_user_message(self):
+        cut = 'x' * 200 + ' print("half a script")'
+        self.api.replies = [{"content": cut, "finish": "length"}, script('done("carried on")')]
+        out, _ = self.run_ok("cut off")
+        self.assertIn("answer:  carried on", out)
+        first, second = self.api.bodies()
+        self.assertEqual(second["messages"][:2], first["messages"])
+        self.assertEqual(second["messages"][2:], [dsk.CUT_OFF,
+                                                   {"role": "user", "content": "turn 1 · 11 left\n" + dsk.TRUNCATED}])
+        self.assertNotIn("half a script", json.dumps(second["messages"], ensure_ascii=False))
+
+    def test_a_limit_report_says_where_the_turns_went(self):
+        repo = self.repo({"a.txt": "one\n"})
+        self.api.replies = [script('print(read("a.txt"))'), script('print(len(read("a.txt")))')]
+        out, _ = self.run_ok("--max-turns", "2", "read a.txt", cwd=repo, code=3)
+        self.assertIn("why:     turn limit reached\n", out)
+        self.assertIn("spent:   read 2\nlast:    4\n", out)
+
+    def test_a_stuck_report_in_a_clean_tree_ends_with_what_the_worker_last_saw(self):
+        self.api.replies = [script(f'print("the answer is 42")\nraise ValueError("{n}")') for n in range(3)]
+        out, _ = self.run_ok("guess", code=3)
+        self.assertIn("why:     three failing turns in a row\n", out)
+        self.assertIn("last:    the answer is 42\n", out)
+
+    def test_answer_and_continue_take_the_lead_text_from_a_file(self):
+        self.put(self.tmp, {"answer.txt": "use a.txt\n", "next.txt": "count the lines\n"})
+        self.api.replies = [script('print("start")\nask("Which file?")'), script('done("used a.txt")'),
+                            script('done("counted")')]
+        _, sid = self.run_ok("which file?", code=2)
+        code, out, _ = self.dsk("answer", sid, "--brief", "answer.txt")
+        self.assertEqual(code, 0, out)
+        self.assertTrue(self.back(1).endswith("lead's answer: use a.txt\n"), self.back(1))
+        code, out, _ = self.dsk("continue", sid, "--brief", "next.txt")
+        self.assertEqual(code, 0, out)
+        self.assertEqual(dsk.Session(sid).last("base")["task"], "count the lines\n")
+        code, out, _ = self.dsk("continue", sid, "text", "--brief", "next.txt")
+        self.assertEqual((code, "not both" in out), (1, True), out)
 
     def test_turn_limit(self):
         self.api.replies = [script(f'print({n})') for n in range(3)]
@@ -759,6 +959,19 @@ done("tried everything")"""
         self.assertEqual(self.dsk("reject", sid, "--drop", cwd=repo)[0], 0)
         self.assertFalse(os.path.exists(f"{repo}/sub dir/out put.txt"))
 
+    def test_a_file_range_attaches_only_those_lines_under_its_own_name(self):
+        repo = self.repo({"notes.txt": "one\ntwo\nthree\nfour\n"})
+        self.api.replies = [script('done("x")')]
+        self.run_ok("--file", "notes.txt:2-3", "--file", "notes.txt:1-1", "read", cwd=repo)
+        first = self.api.bodies()[0]["messages"][1]["content"]
+        self.assertIn('<attached path="notes.txt:2-3">\ntwo\nthree\n\n</attached>', first)
+        self.assertIn('<attached path="notes.txt:1-1">\none\n\n</attached>', first)
+        self.assertNotIn("four", first)
+        for bad in ("notes.txt:3-2", "notes.txt:1-9"):
+            code, out, err = self.dsk("run", "--file", bad, "read", cwd=repo)
+            self.assertEqual(code, 1, out + err)
+            self.assertIn(bad, out)
+
     def test_usage_errors_exit_1_not_2(self):
         for args in (["run"], ["run", "--effort", "extreme", "x"], ["bogus"], ["answer", "zzzz", "text"],
                      ["run", "--allow", "x", "outside a repository"], ["run", "--profile", "nope", "x"]):
@@ -781,7 +994,16 @@ class Gates(Cli):
             f'next:    dsk show {sid} --review | dsk accept {sid} | dsk reject {sid} "defects"'])
         self.assertIn("· review · a · 2 turns ·", out)
         header = self.api.bodies()[0]["messages"][1]["content"]
-        self.assertIn("## Run\nallow: tests/**\ncheck: sh tests/t.sh\ncheck: true\nweb: off\nturn limit: 12\ndate: ", header)
+        self.assertIn("## Run\nallow: tests/**\ncheck: sh tests/t.sh\ncheck: true\nweb: off\n"
+                      "output: a turn shows at most 6,000 characters of what you print, 24,000 when it only reads files\n"
+                      "turn limit: 12\ndate: ", header)
+
+    def test_the_first_message_says_how_much_a_turn_shows(self):
+        self.api.replies = [script('done("x")')]
+        self.run_ok("task")
+        first = self.api.bodies()[0]["messages"][1]["content"]
+        self.assertIn("\nweb: off\noutput: a turn shows at most 6,000 characters of what you print, "
+                      "24,000 when it only reads files\nturn limit: 12\n", first)
 
     def test_out_of_scope_changes_are_reverted_and_reported(self):
         repo = self.repo({"src/a.py": "a = 1\n", "src/gone.py": "x\n", "tests/t.py": "t = 1\n"})
@@ -876,7 +1098,7 @@ class Gates(Cli):
     def test_stuck_report_carries_notes_and_the_scoped_partial_change(self):
         repo = self.repo({"src/a.py": "a = 1\n", "tests/t.py": "t = 1\n"})
         self.api.replies = [script('note("config lives in src/a.py")\nedit("tests/t.py", "t = 1", "t = 2")\n'
-                                   'sh("echo hacked > src/a.py")')] * 2
+                                   'sh("echo hacked > src/a.py")')] * 3
         out, _ = self.run_ok("--allow", "tests/**", "edit", cwd=repo, code=3)
         self.assertIn("notes:   config lives in src/a.py\n", out)
         self.assertIn("scope:   reverted src/a.py (copies in ", out)
@@ -1036,6 +1258,19 @@ class Review(Cli):
         self.assertTrue({"-t = 2", "+t = 3"} <= set(packet.splitlines()))
         self.assertNotIn("+n = 1", packet)
         self.assertTrue({"-t = 1", "+t = 3", "+n = 1"} <= set(self.dsk("show", sid, "--diff", cwd=repo)[1].splitlines()))
+
+    def test_reject_takes_the_defects_from_a_file_and_refuses_two_sources(self):
+        repo, sid = self.delegated()
+        self.put(repo, {"defects.md": "1. t must be 3\n2. add a test\n"})
+        self.api.replies = [script('edit("tests/t.py", "t = 2", "t = 3")\ndone("Now it is 3.")')]
+        code, out, _ = self.dsk("reject", sid, "--brief", "defects.md", cwd=repo)
+        self.assertEqual(code, 0, out)
+        self.assertTrue(self.back(1).endswith("Fix these defects:\n1. t must be 3\n2. add a test\n"), self.back(1))
+        self.assertEqual(self.cat(repo, "tests/t.py"), "t = 3\n")
+        code, out, _ = self.dsk("reject", sid, "1. x", "--brief", "defects.md", cwd=repo)
+        self.assertEqual(code, 1, out)
+        self.assertIn("not two of them", out)
+        self.assertEqual(self.state(sid), "review")
 
     def test_drop_in_place_restores_the_tree(self):
         repo, sid = self.delegated()
@@ -1505,6 +1740,156 @@ class Protocol(Cli):
         self.assertEqual((code, out.splitlines()[1]), (0, "slots:    all 1 in use by running jobs, so it was not "
                                                           "checked; run dsk doctor --profile a when they finish"))
         self.assertEqual(self.api.chats(), [])
+
+
+class Stats(Cli):
+    """Timestamps in every record, and `dsk stats`: what a set of sessions measured, read back from their logs."""
+
+    def test_every_record_a_run_writes_is_stamped_and_accept_is_later_than_the_review(self):
+        repo = self.repo({"t.py": "t = 1\n"})
+        self.api.replies = [script('edit("t.py", "t = 1", "t = 2")\ndone("bumped t")')]
+        out, sid = self.run_ok("--allow", "t.py", "bump t", cwd=repo)
+        s = dsk.Session(sid)
+        for r in s.recs:  # last, so that it replaces the `at` a close() copies over from the old state
+            self.assertIsInstance(r["at"], float, r)
+            self.assertEqual(list(r)[-1], "at", r)
+        review = s.last("state")["at"]
+        time.sleep(0.02)
+        self.assertEqual(self.dsk("accept", sid, cwd=repo)[0], 0)
+        s = dsk.Session(sid)
+        self.assertEqual((s.of("state")[-2]["status"], s.of("state")[-1]["status"]), ("review", "accepted"))
+        self.assertGreater(s.last("state")["at"], review)
+
+    def test_metrics_counts_the_kinds_and_rounds_of_a_scripted_session(self):
+        repo = self.repo({"t.py": "t = 1\n"})
+        self.api.replies = [script('print(read("t.py"))'), script('edit("t.py", "t = 1", "t = 2")\ndone("bumped t")')]
+        out, sid = self.run_ok("--allow", "t.py", "bump t", cwd=repo)
+        self.api.replies = [script('sh("true")\ndone("bumped t again")')]
+        self.assertEqual(self.dsk("reject", sid, "1. make it 3", cwd=repo)[0], 0)
+        time.sleep(0.02)
+        s = dsk.Session(sid)
+        m = dsk.metrics(s, dsk.config())
+        usage = s.of("usage")
+        self.assertEqual(m["id"], sid)
+        self.assertEqual(m["kinds"], {"read": 1, "write": 1, "run": 1})
+        self.assertEqual((m["turns"], m["lead_in"], m["cut"]), (3, 1, 0))
+        self.assertEqual((m["in"], m["out"]), (sum(u["prompt"] for u in usage), sum(u["out"] for u in usage)))
+        self.assertEqual((m["rounds"], m["rejects"], m["continues"]), (2, 1, 0))
+        self.assertEqual((m["compactions"], m["failovers"], m["profiles"]), (0, [], ["a"]))
+        self.assertEqual((m["status"], m["root"], m["effort"], m["web"]), ("review", repo, "off", False))
+        self.assertGreater(m["seconds"], 0)
+        self.assertIsNotNone(m["model_seconds"])
+        self.assertEqual(sorted(m["speed"]), ["a"])
+        self.assertEqual(m["speed"]["a"][1], len(usage))
+        self.assertGreater(m["speed"]["a"][0], 0)
+        self.assertIsNone(m["cost"])  # no profile of this config has a price
+
+    def test_a_log_without_timestamps_gives_no_durations_and_raises_nothing(self):
+        s = self.session(root=self.tmp, owner="", worktree=False, web=False, created=time.time())
+        s.add("req", n=0)
+        s.add("usage", turn=1, profile="a", prompt=100, hit=None, out=10)
+        s.add("result", turn=1, text="turn 1 · 11 left\noutput:\nhi", fail="")
+        s.add("state", status="done", end=None, changed=[], summary="nothing to change")
+        for r in s.recs:  # a log written before records carried `at`
+            r.pop("at")
+        m = dsk.metrics(s, dsk.config())
+        self.assertEqual((m["seconds"], m["model_seconds"], m["lead_seconds"]), (None, None, None))
+        self.assertEqual((m["turns"], m["kinds"], m["lead_in"]), (1, {"stop": 1}, 0))
+        self.assertEqual((m["in"], m["out"], m["hit"], m["max_out"]), (100, 10, 0, 10))
+        self.assertEqual(m["speed"], {})
+        s.add("state", status="accepted")  # closed after timestamps arrived: only this record is stamped
+        m = dsk.metrics(s, dsk.config())
+        self.assertEqual((m["seconds"], m["lead_seconds"]), (None, None))  # unknown, not a measured zero
+
+    def test_the_summary_counts_failovers_in_any_order_and_the_median_over_every_reply(self):
+        def log(profile, outs, left=None):
+            s = self.session(root=self.tmp, owner="", worktree=False, web=False, created=time.time())
+            if left:  # the run started on `left` and moved on without a turn there
+                s.add("series", why="start", profile=left)
+                s.add("series", why="failover", profile=profile, status="full")
+            for turn, out in enumerate(outs, 1):
+                s.add("usage", turn=turn, profile=profile, prompt=100, hit=0, out=out)
+                s.add("result", turn=turn, text="", fail="")
+            s.add("state", status="done", end=None, changed=[])
+            return s
+        pairs = [(s, dsk.metrics(s, dsk.config())) for s in (log("b", [10, 20, 900], left="a"), log("a", [30]))]
+        lines = dsk.stats_summary(pairs)
+        self.assertIn("replies:   median 20 tokens · largest 900", "\n".join(lines))  # of 10, 20, 30 and 900
+        away = [line for line in lines if line.startswith("profile a:")][0]
+        self.assertIn("· 1 failovers away", away)  # though the session that left `a` comes before the one that used it
+
+    def test_stats_json_sessions_newest_first_and_the_summary_lines_exactly(self):
+        repo = self.repo({"a.py": "a = 1\n"})
+        self.api.replies = [script('done("nothing to change")')]
+        out, first = self.run_ok("look around", cwd=repo)
+        time.sleep(0.01)
+        self.api.replies = [script('edit("a.py", "a = 1", "a = 2")\ndone("bumped a")')]
+        out, second = self.run_ok("--allow", "a.py", "bump a", cwd=repo)
+        code, out, err = self.dsk("stats", "--json", cwd=repo)
+        self.assertEqual(code, 0, err)
+        got = json.loads(out)["sessions"]
+        self.assertEqual([m["id"] for m in got], [second, first])
+        self.assertEqual(set(got[0]), {"id", "root", "owner", "worktree", "effort", "web", "created", "status",
+                                       "profiles", "rounds", "rejects", "continues", "compactions", "failovers",
+                                       "turns", "kinds", "lead_in", "cut", "in", "out", "hit", "cached", "max_out",
+                                       "speed", "cost", "seconds", "model_seconds", "lead_seconds"})
+        self.assertEqual((got[0]["status"], got[0]["kinds"], got[1]["status"], got[1]["kinds"]),
+                         ("review", {"write": 1}, "done", {"stop": 1}))
+        code, out, err = self.dsk("stats", cwd=repo)
+        self.assertEqual(code, 0, err)
+        lines = {row.split(":")[0]: row for row in out.splitlines() if ":" in row}
+        self.assertEqual(lines["sessions"], "sessions:  2 · done 1 · review 1")
+        self.assertEqual(lines["turns"], f"turns:     2 · median 1 per session · most 1 ({second})")
+        self.assertEqual(lines["kinds"], "kinds:     stop 50% · write 50%")
+        usage = [u for sid in (first, second) for u in dsk.Session(sid).of("usage")]
+        total_in, total_out = sum(u["prompt"] for u in usage), sum(u["out"] for u in usage)
+        hit = sum(u["hit"] or 0 for u in usage)
+        self.assertEqual(lines["tokens"], f"tokens:    in {dsk.kilo(total_in)} ({round(hit * 100 / total_in)}% cached)"
+                                          f" · out {dsk.kilo(total_out)}")
+        timed = sum(m["speed"].get("a", [0, 0])[1] for m in got)
+        secs = sum(m["speed"].get("a", [0, 0])[0] for m in got)
+        self.assertGreater(timed, 0)
+        self.assertEqual(lines["profile a"], f"profile a: {len(usage)} turns · in {dsk.kilo(total_in)} "
+                                             f"({round(hit * 100 / total_in)}% cached) · out {dsk.kilo(total_out)} · "
+                                             f"0 failovers away · {secs / timed:.1f} s per turn")
+        code, out, err = self.dsk("stats", "--sessions", cwd=repo)
+        tail = out.split("\n\n")[1].splitlines()
+        mine = dsk.Session(second).of("usage")
+        mine_in, mine_hit = sum(u["prompt"] for u in mine), sum(u["hit"] or 0 for u in mine)
+        self.assertEqual(tail, [f"{second} · review · 1 turns (0 r, 1 w, 0 x, 0 f) · in {dsk.kilo(mine_in)} "
+                                f"({round(mine_hit * 100 / mine_in)}% cached) · out {dsk.kilo(sum(u['out'] for u in mine))}"
+                                f" · {os.path.basename(repo)}",
+                                f"{first} · done · 1 turns (0 r, 0 w, 0 x, 0 f) · in "
+                                f"{dsk.kilo(sum(u['prompt'] for u in dsk.Session(first).of('usage')))} "
+                                f"({round(sum(u['hit'] or 0 for u in dsk.Session(first).of('usage')) * 100 / sum(u['prompt'] for u in dsk.Session(first).of('usage')))}% cached)"
+                                f" · out {dsk.kilo(sum(u['out'] for u in dsk.Session(first).of('usage')))} · "
+                                f"{os.path.basename(repo)}"])
+        self.assertEqual(self.dsk("stats", "--days", "0", cwd=repo)[:2], (0, "no sessions in the last 0 days\n"))
+
+    def test_stats_project_leaves_out_a_session_of_another_root(self):
+        repo = self.repo({"a.py": "a = 1\n"})
+        self.api.replies = [script('done("nothing to change")')]
+        out, here = self.run_ok("look around", cwd=repo)
+        self.api.replies = [script('done("nothing to change")')]
+        out, there = self.run_ok("look around")  # nothing to find in self.tmp, so its root is the directory
+        self.assertEqual(dsk.Session(there).head["root"], self.tmp)
+        code, out, _ = self.dsk("stats", "--project", "--json", cwd=repo)
+        self.assertEqual((code, [m["id"] for m in json.loads(out)["sessions"]]), (0, [here]))
+        code, out, _ = self.dsk("stats", "--json", cwd=repo)
+        self.assertEqual([m["id"] for m in json.loads(out)["sessions"]], [there, here])
+        code, out, _ = self.dsk("stats", "--project", cwd=repo)
+        self.assertEqual((code, out.splitlines()[0]), (0, "sessions:  1 · done 1"))
+
+    def test_stats_with_one_id_shows_only_that_session(self):
+        repo = self.repo({"a.py": "a = 1\n"})
+        self.api.replies = [script('done("nothing to change")')]
+        out, first = self.run_ok("look around", cwd=repo)
+        self.api.replies = [script('done("nothing to change")')]
+        out, second = self.run_ok("look around", cwd=repo)
+        code, out, _ = self.dsk("stats", "--json", first, cwd=repo)
+        self.assertEqual((code, [m["id"] for m in json.loads(out)["sessions"]]), (0, [first]))
+        code, out, _ = self.dsk("stats", first, cwd=repo)
+        self.assertEqual((code, out.splitlines()[0]), (0, "sessions:  1 · done 1"))
 
 
 if __name__ == "__main__":
