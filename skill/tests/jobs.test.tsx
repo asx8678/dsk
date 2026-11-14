@@ -296,7 +296,9 @@ test('a job says what it runs now, when it is quiet, and where it failed over fr
     { ...RUNNING, id: 'a001', doing: 'pytest -q', brief: 'Job one' },
     { ...RUNNING, id: 'a002', phase: 'model', act: '', active: 90, brief: 'Job two' },
     { ...RUNNING, id: 'a003', phase: 'checks', act: '', failover: 'coralbricks 429', profile: 'thirdparty', brief: 'Job three' },
-    ...['a004', 'a005', 'a006'].map(id => ({ ...RUNNING, id, act: '', brief: `Job ${id}` })),
+    // Its first profile was busy, so it started on the next without asking the first.
+    { ...RUNNING, id: 'a004', act: '', failover: 'coralbricks full', profile: 'opencode', brief: 'Job a004' },
+    ...['a005', 'a006'].map(id => ({ ...RUNNING, id, act: '', brief: `Job ${id}` })),
   ]
 
   await start($, on, jobs)
@@ -310,7 +312,7 @@ test('a job says what it runs now, when it is quiet, and where it failed over fr
     '  │  ⎿  Thinking… ██       3/12 · ↑ 5.3k · ↓ 2.9k · 60% cached · quiet 1m10s',
     '  ├─ Job three · a003 · ↯ coralbricks 429 → thirdparty',
     '  │  ⎿  Checking… ██       3/12 · ↑ 5.3k · ↓ 2.9k · 60% cached',
-    '  └─ Job a004 · a004',
+    '  └─ Job a004 · a004 · coralbricks busy → opencode',
     '     ⎿  Working… ██       3/12 · ↑ 5.3k · ↓ 2.9k · 60% cached',
     '  … and 2 more running · /dsk-jobs',
   ])
