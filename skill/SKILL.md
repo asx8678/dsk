@@ -26,7 +26,16 @@ If a command fails with `... is not set`, dsk has no provider yet. Do not ask fo
 1. **Scout** with read-only runs, one question each, until you can plan without guessing.
 2. **Plan.** Give each step its files (`--allow`), a check (`--check`) and what done looks like.
 3. **Write**, one run per step. Steps that touch different files run side by side with `--worktree`.
-4. **Verify.** Review each diff against its brief, then `dsk accept` or `dsk reject`. After the last step, run the whole test suite yourself.
+4. **Verify.** Read each diff against its brief, then `dsk accept` or `dsk reject`.
+
+## How much to check: fast by default
+
+Most of a change's time goes to waiting for the provider, turn after turn, and to review rounds. So the default is fast:
+
+- **Fast (the default).** The brief asks for the code, not for tests. Give one quick `--check`: the fastest command that shows the code runs (a compile, an import, a lint, or an existing test command that takes under a minute). Read the diff yourself. No reviewer subagent.
+- **Careful.** Only when a mistake could lose, revert or delete the user's data or files (migrations, installers, anything that removes or overwrites), or when the user asks: the brief also asks for tests that fail without the change, the check runs them, and the `dsk:reviewer` subagent reads any diff above about 150 changed lines.
+
+Say in your closing message which of the two you used.
 
 ## How
 
@@ -37,9 +46,9 @@ dsk run [--allow GLOB]... [--check CMD]... [--file PATH]... [--web] [--worktree]
 
 - **Brief:** two to five lines saying what to produce and what done looks like. Structure goes in the flags; project facts go in `DSK.md`. Name files and functions by path: the worker asks when a task cannot be done as written, but when a name fits two things it picks the likelier one without saying so.
 - **Scouting brief:** one question, the directories or files to look in, and the form of the answer (`file:line` and one line per finding, at most 40 lines). A narrow question is one the worker can answer by searching: one that makes it print everything is cut off at the output limit.
-- **Long files:** a turn hands the worker at most about 6,000 characters of what its script printed, so telling it not to page through a long file does not help. Attach with `--file` a file it must know whole, and raise `--max-turns` for work across a long file: otherwise it spends most of its turns reading.
+- **Long files:** over half of all worker turns only read. A turn that only reads shows the worker up to 24,000 characters, any other turn 6,000, and each turn costs seconds of waiting. So attach what the worker must know instead of letting it look: a whole file with `--file PATH`, or just the lines that matter with `--file PATH:A-B` (find them with grep first).
 - **`--allow`:** the paths the worker may change. Make it as narrow as the task permits. `*` stays inside one directory, `**` crosses them. Without `--allow` the run is read-only. This stops a mistaken worker, not a hostile one: `write()` and `edit()` refuse other paths, and `dsk` undoes changes to any other file git does not ignore, but the worker's shell commands can still change git-ignored files (`.env`, `node_modules`) and paths outside the repository. Outside a git repository nothing is undone.
-- **`--check`:** give at least one for any change. `dsk` runs it itself and reaches `review` only when it passes.
+- **`--check`:** give one for any change. `dsk` runs it itself and reaches `review` only when it passes.
 - **`--file`:** attach what the worker must read (`-` is stdin), so it spends no turn fetching it. A file of up to 4,000 characters stays attached for the whole run; a larger one is dropped if a long run is compacted, so keep instructions in the brief or in a small file.
 - **`--web`:** search and fetch, for research. Leave it off for tasks that also run commands in a repository with secrets.
 - **Owner:** `dsk` takes your session from `CLAUDE_CODE_SESSION_ID`, which Claude Code sets for every command, so the Stop hook knows whose run it is. Pass `--owner` only to say otherwise.
@@ -59,12 +68,12 @@ The last line of every report names the commands that are valid next.
 | Status | Exit | What you do |
 |---|---|---|
 | `question` | 2 | Answer from your own context with `dsk answer ID "..."`. Ask the user only if you cannot. |
-| `review` | 0 | Read `dsk show ID --review`. Then `dsk accept ID`, or `dsk reject ID "1. ... 2. ..."` with a numbered defect list. |
-| `stuck`, `limit` | 3 | Take over from the notes and partial diff in the report, or re-brief. `dsk accept ID` keeps the partial work, `dsk reject ID "guidance"` lets the worker continue, `dsk reject ID --drop` discards it. |
+| `review` | 0 | Read `dsk show ID --review`. Then `dsk accept ID`, or `dsk reject ID "1. ... 2. ..."` with a numbered defect list (`--brief FILE` for a long one). |
+| `stuck`, `limit` | 3 | The report's `spent:` line says where the turns went and `last:` what the worker last printed. Take over from those and the partial diff, or re-brief. `dsk accept ID` keeps the partial work, `dsk reject ID "guidance"` lets the worker continue, `dsk reject ID --drop` discards it. |
 | `done` | 0 | The worker changed no files: a read-only answer, or a writable run that found nothing to change. The report's `answer:` stops at 1,500 characters; `dsk show ID --answer` prints all of it. Treat it as claims: open the source for any fact you will build on, and after a `--web` run check the `sources:` line. |
 | `error` | 1 | Read the `error:` line. `dsk reject ID --drop` cleans up. |
 
-**Reviewing.** In a report, `summary`, `answer`, `notes` and `question` are the worker's claims; every other line is measured by `dsk`. Judge the diff against the brief yourself when it is under about 150 changed lines. Above that, hand the packet to the `dsk:reviewer` subagent, unless your instructions forbid subagents, in which case review it yourself. After a rejected round, `dsk show ID --review` shows only what changed since your last review. After two rejected rounds, take the task over.
+**Reviewing.** In a report, `summary`, `answer`, `notes` and `question` are the worker's claims; every other line is measured by `dsk`. Judge the diff against the brief yourself. For a careful change above about 150 changed lines, hand the packet to the `dsk:reviewer` subagent, unless your instructions forbid subagents. After a rejected round, `dsk show ID --review` shows only what changed since your last review. After two rejected rounds, take the task over.
 
 **Never tell the user that delegated work is finished before `dsk accept`.**
 
@@ -90,6 +99,8 @@ Say what was delegated and your verdict (accepted, rejected or dropped), then th
 ## Other commands
 
 - `dsk status`: this project's open sessions.
+- `dsk bench`: time each provider now, fastest first. With `route_order` set to `fastest` in the config, runs do this by themselves and start on the fastest provider that has a free place.
+- `dsk stats [ID ...]`: what sessions measured: where the turns went, tokens, seconds per turn and per provider. Look here when runs feel slow.
 - `dsk show ID [--diff | --log | --answer]`: the whole diff, tokens and actions per turn, or the whole answer.
 - `dsk search "query"` and `dsk fetch URL`: raw web search and page fetch, with no model.
 - `dsk doctor`: check each provider profile.
