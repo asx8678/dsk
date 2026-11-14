@@ -32,7 +32,7 @@ If a command fails with `... is not set`, dsk has no provider yet. Do not ask fo
 
 Most of a change's time goes to waiting for the provider, turn after turn, and to review rounds. So the default is fast:
 
-- **Fast (the default).** The brief asks for the code, not for tests. Give one quick `--check`: the fastest command that shows the code runs (a compile, an import, a lint, or an existing test command that takes under a minute). Read the diff yourself. No reviewer subagent.
+- **Fast (the default).** The brief asks for the code, not for tests. Give one quick `--check`: the fastest command that shows the code runs (a compile, an import, a lint, or an existing test command that takes under a minute). Read the diff yourself. No reviewer subagent. A compile check does not start the program: for UI wiring or lifecycle code, put a launch or smoke command in the check, or try the result yourself before `dsk accept`.
 - **Careful.** Only when a mistake could lose, revert or delete the user's data or files (migrations, installers, anything that removes or overwrites), or when the user asks: the brief also asks for tests that fail without the change, the check runs them, and the `dsk:reviewer` subagent reads any diff above about 150 changed lines.
 
 Say in your closing message which of the two you used.
@@ -53,11 +53,14 @@ dsk run [--allow GLOB]... [--check CMD]... [--file PATH]... [--web] [--worktree]
 - **`--web`:** search and fetch, for research. Leave it off for tasks that also run commands in a repository with secrets.
 - **Owner:** `dsk` takes your session from `CLAUDE_CODE_SESSION_ID`, which Claude Code sets for every command, so the Stop hook knows whose run it is. Pass `--owner` only to say otherwise.
 - **`--effort`:** only for briefs that need judgment. The default is no thinking.
-- **`--max-turns`:** 12 by default. A run that uses them up stops as `limit`, and so does one past the time or token limit in the config.
+- **`--max-turns`:** 30 by default for a run with `--allow`, 12 for a read-only one. A run that uses them up stops as `limit`, and so does one past the time or token limit in the config. A reject or a continue starts a fresh turn and token budget; an answer does not.
+- **Provider:** without `--profile`, a run starts on the fastest provider that has a free place, and it can move to another one mid-run. The first line of the report then reads `zro after coralbricks`. `dsk reject`, `dsk answer` and `dsk continue` take `--profile NAME` to move the session to a particular one; like `dsk run --profile`, that holds it there, with no failover.
+- **What the worker can read:** its `read()`, `glob()` and `grep()` see only the working directory, plus a scratch folder of its own for throwaway files. Attach anything outside it with `--file`, or copy it into the tree first.
 - Globs and checks are relative to the repository root, wherever you call `dsk` from. `--file` and `--brief` paths are relative to the current directory.
+- **Run dsk bare.** Put no `| head`, `| tail` or other pipe after a dsk command: the pipe's exit code replaces dsk's, so a stuck or failed run looks like exit code 0, also in a background notice. The reports are short already.
 - **Short tasks:** run in the foreground with a Bash timeout of 600000 ms. If the timeout passes, the run is moved to the background and keeps going: wait for its completion notice.
 - **Hands off the tree until an in-place run stops.** This holds for every run without `--worktree` in a git repository, read-only runs included. Each worker script that starts a shell command is charged with every change made from its start to its end, and so are the checks: a change outside `--allow` is undone (a copy is kept in the session directory) and a change inside it counts as the worker's, whoever made it. Without `--allow` that is every change. You cannot tell when those windows are open, so make no edits until the run reports.
-- **Long, parallel or background tasks, read-only ones included:** add `--worktree` and start it as a background Bash command. Keep working in the main tree and review when it reports. A worktree has no git-ignored files, so a check that needs `node_modules` or a virtualenv must create them, and a scout of logs or build output runs in place. A worktree run that ends `done` removes its worktree itself; one that ends `stuck`, `limit` or `error` keeps it until `dsk reject ID --drop`.
+- **Long, parallel or background tasks, read-only ones included:** add `--worktree` and start it as a background Bash command. Keep working in the main tree and review when it reports. Start each run as its own background command, so that each gives its completion notice; for runs started together from one command, end that command with `dsk wait`: it blocks until they have stopped and prints each report. `--worktree` needs a repository with at least one commit. A worktree has no git-ignored files, so a check that needs `node_modules` or a virtualenv must create them, and a scout of logs or build output runs in place. A worktree run that ends `done` removes its worktree itself; one that ends `stuck`, `limit` or `error` keeps it until `dsk reject ID --drop`. `dsk accept` applies the worktree as it stands: an edit you made there inside `--allow` is included, and one outside `--allow` is kept as a patch and not applied.
 - **One in-place run per tree.** A second run without `--worktree` is refused while the first is working, and so is `dsk accept` of a worktree session. Wait, or use `--worktree`.
 - **`dsk answer` and `dsk reject ID "..."`** start the worker again and can take as long as a run. Call them as you called the run: the same Bash timeout, in the background for a worktree session, and hands off the tree for an in-place one.
 
@@ -69,11 +72,11 @@ The last line of every report names the commands that are valid next.
 |---|---|---|
 | `question` | 2 | Answer from your own context with `dsk answer ID "..."`. Ask the user only if you cannot. |
 | `review` | 0 | Read `dsk show ID --review`. Then `dsk accept ID`, or `dsk reject ID "1. ... 2. ..."` with a numbered defect list (`--brief FILE` for a long one). |
-| `stuck`, `limit` | 3 | The report's `spent:` line says where the turns went and `last:` what the worker last printed. Take over from those and the partial diff, or re-brief. `dsk accept ID` keeps the partial work, `dsk reject ID "guidance"` lets the worker continue, `dsk reject ID --drop` discards it. |
+| `stuck`, `limit` | 3 | When the worker changed files, `dsk` ran the checks at the stop, and the `checks:` line shows whether the partial work passes them. The report's `spent:` line says where the turns went and `last:` what the worker last printed. Take over from those and the partial diff, or re-brief. `dsk accept ID` keeps the partial work, `dsk reject ID "guidance"` lets the worker continue, `dsk reject ID --drop` discards it. |
 | `done` | 0 | The worker changed no files: a read-only answer, or a writable run that found nothing to change. The report's `answer:` stops at 1,500 characters; `dsk show ID --answer` prints all of it. Treat it as claims: open the source for any fact you will build on, and after a `--web` run check the `sources:` line. |
 | `error` | 1 | Read the `error:` line. `dsk reject ID --drop` cleans up. |
 
-**Reviewing.** In a report, `summary`, `answer`, `notes` and `question` are the worker's claims; every other line is measured by `dsk`. Judge the diff against the brief yourself. For a careful change above about 150 changed lines, hand the packet to the `dsk:reviewer` subagent, unless your instructions forbid subagents. After a rejected round, `dsk show ID --review` shows only what changed since your last review. After two rejected rounds, take the task over.
+**Reviewing.** In a report, `summary`, `answer`, `notes` and `question` are the worker's claims; every other line is measured by `dsk`. Judge the diff against the brief yourself. For a careful change above about 150 changed lines, hand the packet to the `dsk:reviewer` subagent, unless your instructions forbid subagents. After a rejected round, `dsk show ID --review` shows only what changed since your last review. After two rejected rounds, take the task over. When two runs of a parallel batch come back with the same defect, add the rule to the briefs of the runs still to start.
 
 **Never tell the user that delegated work is finished before `dsk accept`.**
 
@@ -99,6 +102,7 @@ Say what was delegated and your verdict (accepted, rejected or dropped), then th
 ## Other commands
 
 - `dsk status`: this project's open sessions.
+- `dsk wait [ID ...] [--timeout SECONDS]`: block until those sessions have stopped, printing each report as it comes. Without IDs: your sessions in this project that are running or were started in the last seconds.
 - `dsk bench`: time each provider now, fastest first. With `route_order` set to `fastest` in the config, runs do this by themselves and start on the fastest provider that has a free place.
 - `dsk stats [ID ...]`: what sessions measured: where the turns went, tokens, seconds per turn and per provider. Look here when runs feel slow.
 - `dsk show ID [--diff | --log | --answer]`: the whole diff, tokens and actions per turn, or the whole answer.
