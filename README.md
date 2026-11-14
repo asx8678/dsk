@@ -48,7 +48,7 @@ The plugin needs Python 3.13 or newer on `PATH`, as `python3` or as `python3.13`
    }
    ```
 
-   The `official` profile, the `search` block and a default `sh_deny` list are built in, so the file may hold only what differs. `extra` is merged into the request body; a `null` value removes a key the provider rejects. Optional keys: `backoff` (retry waits in seconds, default `[2, 6, 18]`) and `limits` (`turn_seconds` 600, `run_seconds` 3600, `run_tokens` 2000000). A profile may set `max_sessions`, the number of runs the provider serves at once (see **Providers**), and `price`, dollars per million tokens as `{"in": 0.005, "cached": 0.003, "out": 0.57}`, from which `status --json` reports each job's cost.
+   The `official` profile, the `search` block and a default `sh_deny` list are built in, so the file may hold only what differs. `extra` is merged into the request body; a `null` value removes a key the provider rejects. Optional keys: `backoff` (retry waits in seconds, default `[2, 6, 18]`) and `limits` (`turn_seconds` 600, `run_seconds` 3600, `run_tokens` 2000000). A profile may set `max_sessions`, the number of runs the provider serves at once (see **Providers**), and `price`, dollars per million tokens as `{"in": 0.005, "cached": 0.003, "out": 0.57}`, from which `status --json` reports each job's cost. `headers` adds request headers; in a value, `{session}` becomes an ID that stays the same for the whole run, across `answer`, `reject` and failover. OpenCode Go needs `"headers": {"x-opencode-session": "{session}"}`.
 3. **Check it.** `dsk doctor` tests each profile: the key, the model ID, that thinking-off is honoured, five replies over a three-turn exchange, and whether and where cached tokens are reported.
 4. **Permissions.** The skill pre-approves `dsk` only for the turn that invokes it. For later turns and background runs, add `"Bash(dsk *)"` to `permissions.allow` in `~/.claude/settings.json`.
 5. **Display.** In a session that was already open, run `/reload-plugins` once. `/dsk-jobs on` loads the live display and `/dsk-jobs off` unloads it; see **The plugin**.
@@ -180,7 +180,7 @@ Measured on 2026-11-11 with `deepseek-flash` on the official API and `deepseek-v
 - **A 429 that survives the retries also fails over,** like a repeated 5xx. So does a network failure.
 - **`python3 -I` discards `PYTHONHASHSEED`,** so the seed is pinned for `sh()` and checks but not for the script process itself.
 - **In a git repository the working directory is the repository root.**
-- **Size:** `dsk.py` has 1,463 lines, over the 1,000-line target and, since the key file, `max_sessions`, `status --json` and `configure` were added, over the 1,300-line limit too (49 lines are longer than 120 characters). By your rule the next step is to cut a feature: the candidates are `doctor` (about 55 lines), the raw `search` and `fetch` commands (12), and the time and token limits (6).
+- **Size:** `dsk.py` has 1,472 lines, over the 1,000-line target and, since the key file, `max_sessions`, `status --json`, `configure` and profile `headers` were added, over the 1,300-line limit too (49 lines are longer than 120 characters). By your rule the next step is to cut a feature: the candidates are `doctor` (about 55 lines), the raw `search` and `fetch` commands (12), and the time and token limits (6).
 
 ## Tests
 

@@ -288,9 +288,10 @@ def request_body(profile, effort, msgs):
     return dumps({k: v for k, v in body.items() if v is not None})
 
 
-def send(url, key, payload):
+def send(url, key, payload, extra=None):
     """One POST. Returns (status, parsed JSON) on success, else (status, error text); status 0 is a network failure."""
-    headers = {"Authorization": "Bearer " + key, "Content-Type": "application/json", "User-Agent": "dsk"}
+    headers = {"Authorization": "Bearer " + key, "Content-Type": "application/json", "User-Agent": "dsk",
+               **(extra or {})}
     req = urllib.request.Request(url, payload.encode(), headers)
     try:
         with urllib.request.urlopen(req, timeout=600) as r:
@@ -302,10 +303,10 @@ def send(url, key, payload):
         return 0, f"{type(e).__name__}: {e}"
 
 
-def post(url, key, payload, backoff):
+def post(url, key, payload, backoff, headers=None):
     """POST with backoff on transient failures. Every retry sends the identical bytes."""
     for wait in [*backoff, None]:
-        status, data = send(url, key, payload)
+        status, data = send(url, key, payload, headers)
         if status == 200 and "choices" in data and data["choices"][0].get("finish_reason") in (
                 "insufficient_system_resource", "aborted"):
             status, data = 503, "generation interrupted by the server"
@@ -318,6 +319,11 @@ def post(url, key, payload, backoff):
 
 def fingerprint(wire):
     return {"n": len(wire), "sha": hashlib.sha256(wire.encode()).hexdigest()}
+
+
+def headers(profile, session):
+    """The profile's `headers`, with {session} replaced by a value that stays the same for the whole run."""
+    return {k: v.replace("{session}", session) for k, v in profile.get("headers", {}).items()}
 
 
 def replayable(message, effort):
@@ -352,7 +358,9 @@ def chat(s, cfg):
         body = request_body(profile, s.head["effort"], msgs)
         key = api_key(profile)
         s.add("req", **fingerprint(wire))
-        status, data = post(profile["base_url"].rstrip("/") + "/chat/completions", key, body, cfg["backoff"])
+        session = f"dsk-{s.id}-{fingerprint(dumps(s.head))['sha'][:8]}"  # from the log, so every process agrees
+        status, data = post(profile["base_url"].rstrip("/") + "/chat/completions", key, body, cfg["backoff"],
+                            headers(profile, session))
         if status == 200:
             try:
                 choice, usage = data["choices"][0], data.get("usage") or {}
@@ -1350,10 +1358,11 @@ def cmd_doctor(args, cfg):
             print(f"key:      {profile['key_env']} is not set")
             continue
         url, key = profile["base_url"].rstrip("/") + "/chat/completions", api_key(profile)
+        sent = headers(profile, "dsk-doctor-" + secrets.token_hex(4))  # one value for all five requests
         msgs = [{"role": "system", "content": SYSTEM}, {"role": "user", "content": task}]
         good, thought, field, hits = 0, 0, "not reported", []
         for step in range(5):  # the same request three times a few seconds apart, then two that extend it
-            status, data = post(url, key, request_body(profile, "off", msgs), cfg["backoff"])
+            status, data = post(url, key, request_body(profile, "off", msgs), cfg["backoff"], sent)
             if status != 200:
                 healthy = False
                 print(f"model:    HTTP {status} {data}")

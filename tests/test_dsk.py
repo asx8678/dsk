@@ -46,7 +46,8 @@ class FakeAPI:
 
             def do_POST(self):
                 raw = self.rfile.read(int(self.headers["Content-Length"]))
-                api.requests.append({"path": self.path, "raw": raw, "key": self.headers["Authorization"]})
+                api.requests.append({"path": self.path, "raw": raw, "key": self.headers["Authorization"],
+                                     "headers": {k.lower(): v for k, v in self.headers.items()}})
                 status, payload, blank = api.answer(self.path, json.loads(raw))
                 self.send_response(status)
                 self.send_header("Content-Type", "application/json")
@@ -210,6 +211,26 @@ class Wire(Case):
         self.assertEqual(len(raws), 3)
         self.assertEqual(len(set(raws)), 1)
         self.assertEqual(len(s.of("req")), 1)
+
+    def test_profile_headers_hold_one_session_value_for_the_whole_run(self):
+        self.config["profiles"]["a"]["headers"] = {"x-opencode-session": "{session}", "x-fixed": "1"}
+        self.write_config()
+        self.api.replies = ["one", "two", "another run", {"status": 503}, {"status": 503}, {"status": 503}, "from b"]
+        s = self.session()
+        dsk.chat(s, dsk.config())
+        dsk.chat(dsk.Session(s.id), dsk.config())  # a later process, as after `dsk reject` or `dsk answer`
+        dsk.chat(self.session(), dsk.config())
+        moved = self.session()
+        dsk.chat(moved, dsk.config())
+        sent = [r["headers"] for r in self.api.chats()]
+        first, again, other = (h["x-opencode-session"] for h in sent[:3])
+        self.assertTrue(first.startswith(f"dsk-{s.id}-"))
+        self.assertEqual(first, again)
+        self.assertNotEqual(first, other)
+        self.assertEqual(sent[0]["x-fixed"], "1")
+        self.assertEqual(moved.profile, "b")  # a profile without `headers` sends only the usual three
+        self.assertNotIn("x-opencode-session", sent[-1])
+        self.assertEqual(sent[-1]["user-agent"], "dsk")
 
     def test_interrupted_generation_is_retried(self):
         self.api.replies = [{"content": "half", "finish": "aborted"}, "whole"]
