@@ -1,0 +1,40 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="880" height="360" viewBox="0 0 880 360" role="img" aria-label="Claude Code sends a brief to dsk; dsk talks to a DeepSeek worker, fails over to the next provider, and lets each script change only the allowed paths of your repository">
+<style>.d{font-family:ui-sans-serif,system-ui,-apple-system,'Segoe UI',Helvetica,Arial,sans-serif}.t{font-family:ui-sans-serif,system-ui,-apple-system,'Segoe UI',Helvetica,Arial,sans-serif}.m{font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,'Liberation Mono',monospace}.ink{fill:#f4f7f7}.t2{fill:#c0caca}.mu{fill:#94a0a0}.ac{fill:#2dd4bf}.wa{fill:#e0a64a}@media (prefers-reduced-motion: reduce){*{animation:none!important}}</style>
+<rect x="0.5" y="0.5" width="879" height="359" rx="14" fill="#0b0f0f" stroke="#283030"/>
+<path id="p-brief" d="M200 180 L262 180" fill="none" stroke="#2dd4bf" stroke-width="1.5"/>
+<path id="p-worker" d="M462 150 C512 150 512 80 560 80" fill="none" stroke="#2dd4bf" stroke-width="1.5"/>
+<path id="p-next" d="M462 181 L560 181" fill="none" stroke="#465050" stroke-width="1.5" stroke-dasharray="4 5"/>
+<path id="p-repo" d="M462 212 C512 212 512 290 560 290" fill="none" stroke="#2dd4bf" stroke-width="1.5"/>
+<rect x="30.5" y="140.5" width="170" height="80" rx="10" fill="#161c1c" stroke="#283030"/>
+<text class="d ink" x="46" y="168" font-size="17" font-weight="600">Claude Code</text>
+<text class="m mu" x="46" y="189" font-size="11.5">plans · briefs</text>
+<text class="m mu" x="46" y="206" font-size="11.5">reviews · decides</text>
+<rect x="262.5" y="110.5" width="200" height="140" rx="10" fill="#0d2a27" stroke="#2dd4bf" stroke-width="1.5"/>
+<text class="d ink" x="278" y="138" font-size="17" font-weight="600">dsk</text>
+<text class="m mu" x="278" y="159" font-size="11.5">one Python file</text>
+<text class="m mu" x="278" y="176" font-size="11.5">runs each script</text>
+<text class="m mu" x="278" y="193" font-size="11.5">scope gate · checks</text>
+<text class="m mu" x="278" y="210" font-size="11.5">review gate</text>
+<rect x="560.5" y="34.5" width="290" height="92" rx="10" fill="#161c1c" stroke="#283030"/>
+<text class="d ink" x="576" y="62" font-size="17" font-weight="600">DeepSeek worker</text>
+<text class="m mu" x="576" y="83" font-size="11.5">the first provider in the route</text>
+<text class="m mu" x="576" y="100" font-size="11.5">one run_code script per turn</text>
+<rect x="560.5" y="144.5" width="290" height="84" rx="10" fill="#161c1c" stroke="#283030"/>
+<text class="d ink" x="576" y="172" font-size="17" font-weight="600">next provider</text>
+<text class="m mu" x="576" y="193" font-size="11.5">after a 402, used-up retries</text>
+<text class="m mu" x="576" y="210" font-size="11.5">or a worker stuck in a loop</text>
+<rect x="560.5" y="250.5" width="290" height="80" rx="10" fill="#161c1c" stroke="#283030"/>
+<text class="d ink" x="576" y="278" font-size="17" font-weight="600">your repository</text>
+<text class="m mu" x="576" y="299" font-size="11.5">only --allow paths change</text>
+<text class="m mu" x="576" y="316" font-size="11.5">the rest is undone</text>
+<text class="m mu" x="231" y="170" text-anchor="middle" font-size="10.5">brief</text>
+<text class="m mu" x="30" y="268" font-size="11.5">the report comes back:</text>
+<text class="m mu" x="30" y="285" font-size="11.5">dsk accept · dsk reject</text>
+<circle r="3.6" fill="#2dd4bf" opacity="0"><set attributeName="opacity" to="1" begin="0s"/><animateMotion dur="2.4s" begin="0s" repeatCount="indefinite"><mpath href="#p-brief"/></animateMotion></circle>
+<circle r="3.6" fill="#2dd4bf" opacity="0"><set attributeName="opacity" to="1" begin="0s"/><animateMotion dur="2.4s" begin="-1.2s" repeatCount="indefinite"><mpath href="#p-brief"/></animateMotion></circle>
+<circle r="3.6" fill="#2dd4bf" opacity="0"><set attributeName="opacity" to="1" begin="0s"/><animateMotion dur="2s" begin="0s" repeatCount="indefinite"><mpath href="#p-worker"/></animateMotion></circle>
+<circle r="3.6" fill="#2dd4bf" opacity="0"><set attributeName="opacity" to="1" begin="0s"/><animateMotion dur="2s" begin="-0.666667s" repeatCount="indefinite"><mpath href="#p-worker"/></animateMotion></circle>
+<circle r="3.6" fill="#2dd4bf" opacity="0"><set attributeName="opacity" to="1" begin="0s"/><animateMotion dur="2s" begin="-1.33333s" repeatCount="indefinite"><mpath href="#p-worker"/></animateMotion></circle>
+<circle r="3.6" fill="#94a0a0" opacity="0"><animate attributeName="opacity" values="0;0;1;1;0" keyTimes="0;.62;.66;.95;1" dur="9s" begin="0s" repeatCount="indefinite"/><animateMotion dur="9s" begin="0s" repeatCount="indefinite"><mpath href="#p-next"/></animateMotion></circle>
+<circle r="3.6" fill="#2dd4bf" opacity="0"><set attributeName="opacity" to="1" begin="0s"/><animateMotion dur="2.6s" begin="0s" repeatCount="indefinite"><mpath href="#p-repo"/></animateMotion></circle>
+<circle r="3.6" fill="#2dd4bf" opacity="0"><set attributeName="opacity" to="1" begin="0s"/><animateMotion dur="2.6s" begin="-1.3s" repeatCount="indefinite"><mpath href="#p-repo"/></animateMotion></circle></svg>

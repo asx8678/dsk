@@ -1,0 +1,12 @@
+# Known limits
+
+- The worker asks when a brief cannot be done as written (51 of 51 trial runs), but when a name fits two things it takes the likelier one without asking (38 of 38). Name files and functions by path in the brief.
+- An interrupted run can only be dropped, not resumed. What it changed is still attributed to it. Claude Code 2.1.322 does not kill a command whose Bash timeout passes; it moves it to the background, and stopping the task sends SIGTERM and then kills the whole process tree. If `dsk` alone is killed with SIGKILL, a script in the middle of a shell command runs on until that command returns, and may write after a `--drop`.
+- A snapshot writes a blob for every untracked file that is not git-ignored into the repository's object store, and the first snapshot of a session hashes them all (6.5 s for 300 MB; 0.04 s for later ones). `git gc` removes those objects later. Ignore large data directories.
+- The Stop hook runs at every turn end once it is loaded: in one real session it ran 16 times in a row, each in under 0.1 s. Every one of those runs found nothing to review, so its blocking path (exit 2) is covered by the tests but has not yet been seen live. As part of the plugin it has not run in a real session yet.
+- The display has been tested as a drawn tree, not as painted pixels: nobody has yet checked a screenshot of it.
+- The plugin's install has been run from the shell in a scratch home (marketplace add, install, `--config`, `configure`), and its hooks by hand with the variables Claude Code documents, against the real official API and a real custom endpoint. It has not yet been installed from GitHub into a live session, so the form itself and the hooks as Claude Code fires them are unseen.
+
+## Later, not now
+
+`dsk map` (one read-only brief over many items in parallel), a container mode.
