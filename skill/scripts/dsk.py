@@ -312,7 +312,7 @@ def post(url, key, payload, backoff, headers=None):
             status, data = 503, "generation interrupted by the server"
         if status == 400 and "limit" in str(data).lower():  # some gateways report a rate or concurrency limit this way
             status = 429
-        if status not in RETRY or wait is None:
+        if status not in RETRY or wait is None or spent(status, data):  # used-up credit does not come back in seconds
             return status, data
         time.sleep(wait)
 
@@ -324,6 +324,39 @@ def fingerprint(wire):
 def headers(profile, session):
     """The profile's `headers`, with {session} replaced by a value that stays the same for the whole run."""
     return {k: v.replace("{session}", session) for k, v in profile.get("headers", {}).items()}
+
+
+SPENT = re.compile(r"quota|credit|balance|billing|payment|allowance|usage.limit|limit (reached|exceeded)", re.I)
+NOT_SPENT = re.compile(r"concurren|at a time|rate.limit|too many requests"  # busy for the moment
+                       r"|context|too (long|large)|max_tokens|request size", re.I)  # or this one request is too big
+
+
+def spent(status, data):
+    """Whether an error says the provider's credit or quota is used up: not busy, not a request that is too big."""
+    text = str(data)
+    return status == 402 or status in (400, 403, 429) and bool(SPENT.search(text)) and not NOT_SPENT.search(text)
+
+
+def paused(name):
+    """Until when (epoch seconds) every run skips profile `name` because its credit ran out; 0 when it does not."""
+    try:
+        with open(os.path.join(STATE, "paused", name), encoding="utf-8") as f:
+            until = float(json.load(f)["until"])
+    except (OSError, ValueError, KeyError, TypeError):
+        return 0
+    return until if until > time.time() else 0
+
+
+def pause(cfg, name, data):
+    """Pause `name` until the reset time its error names, if within a week, else for its `pause_hours` (default 1)."""
+    now, named = time.time(), re.search(r"\d{4}-\d\d-\d\dT\d\d:\d\d(:\d\d)?Z", str(data))
+    reset = datetime.datetime.fromisoformat(named.group()[:-1] + "+00:00").timestamp() if named else 0
+    until = reset if now < reset < now + 7 * 86400 else now + 3600 * float(cfg["profiles"][name].get("pause_hours", 1))
+    path = os.path.join(STATE, "paused", name)
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    with open(f"{path}.{os.getpid()}", "w", encoding="utf-8") as f:
+        json.dump({"until": until, "why": str(data)[:300]}, f)
+    os.replace(f"{path}.{os.getpid()}", path)
 
 
 def replayable(message, effort):
@@ -344,6 +377,10 @@ def chat(s, cfg):
         name, profile = s.profile, cfg["profiles"][s.profile]
         route = s.head["route"]
         later = route[route.index(name) + 1:]
+        if later and paused(name):  # its credit ran out (see pause): skip it, but always try the last profile
+            release(name)
+            s.add("series", why="failover", profile=later[0], status="paused")
+            continue
         if not claim_slot(cfg, name):
             if later:  # other runs hold all of its max_sessions slots: move on instead of collecting 429s
                 s.add("series", why="failover", profile=later[0], status="full")
@@ -372,13 +409,24 @@ def chat(s, cfg):
             hit = usage.get("prompt_cache_hit_tokens", (usage.get("prompt_tokens_details") or {}).get("cached_tokens"))
             s.add("usage", turn=s.turn + 1, profile=name, prompt=usage.get("prompt_tokens") or len(body) // 4,
                   hit=hit, out=usage.get("completion_tokens") or 0)
-            return reply, choice.get("finish_reason")
-        if not later or (status != 402 and status not in RETRY):
+            finish = choice.get("finish_reason")
+            cap = profile.get("extra", {}).get("max_tokens") or MAX_TOKENS[s.head["effort"]]
+            if finish is None and (usage.get("completion_tokens") or 0) >= cap:  # a gateway that leaves it empty
+                finish = "length"
+            return reply, finish
+        if spent(status, data):
+            pause(cfg, name, data)
+        if not later or (status not in RETRY and not spent(status, data)):
             raise Fail(f"{name}: HTTP {status} {data}")
-        held = slots.pop(os.path.join(STATE, "slots", name), None)
-        if held:
-            held.close()
+        release(name)
         s.add("series", why="failover", profile=later[0], status=status)
+
+
+def release(name):
+    """Give back this process's max_sessions slot on profile `name`, if it holds one."""
+    held = slots.pop(os.path.join(STATE, "slots", name), None)
+    if held:
+        held.close()
 
 
 # ---------------------------------------------------------------- reply parser and AST gate
@@ -1324,7 +1372,9 @@ def cmd_configure(args, cfg):
     print(f"dsk · {'ready' if ready else 'not set up'} · {state}")
     for name in cfg["route"]:
         profile = cfg["profiles"].get(name, {})
-        print(f"{name + ':':<8} {profile.get('base_url')} · {profile.get('model')} · key {'set' if secret(profile.get('key_env', '')) else 'missing'}")
+        key, until = "set" if secret(profile.get("key_env", "")) else "missing", paused(name)
+        until = f" · paused until {time.strftime('%a %H:%M', time.localtime(until))}, credit used up" if until else ""
+        print(f"{name + ':':<8} {profile.get('base_url')} · {profile.get('model')} · key {key}{until}")
     if not ready:
         print(f"next:    in Claude Code, /plugin configure {plugin('id')}: {SETUP}; then restart Claude Code. "
               f"Or export the key in ~/.config/dsk/env.")
