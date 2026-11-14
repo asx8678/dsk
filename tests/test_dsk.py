@@ -360,6 +360,20 @@ class Wire(Case):
         with self.assertRaises(dsk.Fail):  # this process now holds the slot
             dsk.flock(f"{self.tmp}/state/dsk/slots/a.0", "")
 
+    def test_profiles_with_one_endpoint_and_key_share_the_smallest_limit(self):
+        self.config["profiles"]["a"]["max_sessions"] = 3
+        self.config["profiles"]["c"] = {**self.config["profiles"]["a"], "model": "model-c", "max_sessions": 1}
+        self.write_config()
+        cfg = dsk.config()
+        self.assertEqual(dsk.pool(cfg, "c"), (f"{self.tmp}/state/dsk/slots/a", 1))
+        self.assertEqual(dsk.pool(cfg, "b"), (f"{self.tmp}/state/dsk/slots/b", None))
+        os.makedirs(f"{self.tmp}/state/dsk/slots")
+        other = dsk.flock(f"{self.tmp}/state/dsk/slots/a.0", "")  # a run on profile a holds the one slot they share
+        self.addCleanup(other.close)
+        self.assertFalse(dsk.claim_slot(cfg, "c"))
+        self.assertFalse(dsk.claim_slot(cfg, "a"))
+        self.assertEqual(dsk.slots, {})
+
     def test_series_guard_rejects_a_rewritten_prefix(self):
         self.api.replies = ["one", "two"]
         s, cfg = self.session(), dsk.config()
@@ -1318,6 +1332,18 @@ class Protocol(Cli):
         self.env["KEY_B"] = ""
         code, out, _ = self.dsk("doctor", "--profile", "b")
         self.assertEqual((code, out.splitlines()[1]), (1, "key:      KEY_B is not set"))
+
+    def test_doctor_sends_nothing_to_a_profile_whose_slots_are_all_held(self):
+        self.config["profiles"]["a"]["max_sessions"] = 1
+        self.write_config()
+        os.makedirs(f"{self.tmp}/state/dsk/slots")
+        other = dsk.flock(f"{self.tmp}/state/dsk/slots/a.0", "")  # a running job holds a's only slot
+        self.addCleanup(other.close)
+        self.api.search_results = [{"title": "T", "url": "https://ok.example/a", "date": None, "summary": "S"}]
+        code, out, _ = self.dsk("doctor", "--profile", "a")
+        self.assertEqual((code, out.splitlines()[1]), (0, "slots:    all 1 in use by running jobs, so it was not "
+                                                          "checked; run dsk doctor --profile a when they finish"))
+        self.assertEqual(self.api.chats(), [])
 
 
 if __name__ == "__main__":
