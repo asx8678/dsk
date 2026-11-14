@@ -6,9 +6,18 @@
 </p>
 
 <p align="center">
-  <a href="#install"><img alt="Claude Code plugin" src="https://img.shields.io/badge/claude%20code-plugin-0f766e?style=flat-square"></a>
-  <img alt="Python 3.13+" src="https://img.shields.io/badge/python-3.13%2B-0f766e?style=flat-square">
-  <img alt="standard library only" src="https://img.shields.io/badge/dependencies-none-0f766e?style=flat-square">
+  <a href="#install"><img alt="Claude Code plugin" src="https://img.shields.io/badge/claude%20code-plugin-4f46e5?style=flat-square"></a>
+  <img alt="Python 3.13+" src="https://img.shields.io/badge/python-3.13%2B-4f46e5?style=flat-square">
+  <img alt="standard library only" src="https://img.shields.io/badge/dependencies-none-4f46e5?style=flat-square">
+</p>
+
+<p align="center">
+  <a href="#install">Install</a> ·
+  <a href="#hand-over-a-task">Hand over a task</a> ·
+  <a href="#how-it-works">How it works</a> ·
+  <a href="#measured-not-claimed">Measured</a> ·
+  <a href="#commands">Commands</a> ·
+  <a href="#more">Docs</a>
 </p>
 
 Your best model shouldn't spend its turns reading files and typing out boilerplate. **dsk** is a small headless CLI that Claude Code calls through Bash to hand that work to DeepSeek V4.1 Flash: Claude plans, reviews and decides; the worker scouts the code and writes it, tests, docs and web research included. One Python file, standard library only, shipped as a Claude Code plugin: the skill, a reviewer agent, the review gate and a display of the jobs.
@@ -20,7 +29,7 @@ Your best model shouldn't spend its turns reading files and typing out boilerpla
 
 ## Install
 
-In Claude Code:
+In Claude Code, straight from this repository. It is its own marketplace, so nothing has to be published or added first:
 
 ```
 /plugin install dsk --marketplace asx8678/dsk
@@ -33,11 +42,15 @@ Claude Code then asks which provider runs the worker, and for what that provider
 | `official` | your DeepSeek API key |
 | `custom` | the endpoint URL of any OpenAI-compatible API that serves a DeepSeek model, the model name, and that endpoint's API key. A DeepSeek API key is optional here: with one, the official API is the fallback and web search (`--web`) is available |
 
-Keys are masked as you type and kept in Claude Code's secure store. `/plugin configure dsk@asx8678` opens the same form again; restart Claude Code after changing it. From a shell, `claude plugin install dsk --marketplace asx8678/dsk` installs without asking, and each `--config KEY=VALUE` sets one option (`provider`, `deepseek_api_key`, `custom_base_url`, `custom_model`, `custom_api_key`). Until a provider is set, each session starts by saying what is missing, and `dsk configure` shows how dsk is set up. `dsk doctor` checks the key and the model against the provider.
+- **Keys** are masked as you type and kept in Claude Code's secure store.
+- **To change an answer,** `/plugin configure dsk@asx8678` opens the same form again; restart Claude Code after changing it.
+- **To check it,** `dsk doctor` tests the key and the model against the provider, and `dsk configure` shows how dsk is set up. Until a provider is set, each session starts by saying what is missing.
+- **It needs** Python 3.13 or newer on `PATH`, as `python3` or as `python3.13`, `python3.14` or `python3.15`.
 
-The plugin needs Python 3.13 or newer on `PATH`, as `python3` or as `python3.13`, `python3.14` or `python3.15`.
+<details>
+<summary>From a shell, or to work on dsk itself</summary>
 
-From a shell, or to work on dsk itself:
+`claude plugin install dsk --marketplace asx8678/dsk` installs without asking, and each `--config KEY=VALUE` sets one option (`provider`, `deepseek_api_key`, `custom_base_url`, `custom_model`, `custom_api_key`).
 
 ```
 ./install.sh              # installs dsk from GitHub as dsk@asx8678, or updates it when it is installed
@@ -47,6 +60,8 @@ From a shell, or to work on dsk itself:
 ```
 
 Keys in `~/.config/dsk/env` and profiles in `~/.config/dsk/config.json` work too, and win over the form. [docs/configuration.md](docs/configuration.md) says what each `install.sh` mode does and how to set dsk up by hand, with more than one provider.
+
+</details>
 
 ## Hand over a task
 
@@ -59,11 +74,11 @@ dsk run --allow 'test_*.py' --check 'python3 -m unittest' "Add unit tests for du
 <p>
 <picture>
   <source media="(prefers-color-scheme: dark)" srcset="assets/run-dark.svg">
-  <img alt="dsk run in a terminal: review after 4 turns, the check passed, test_durations.py (+70)" src="assets/run-light.svg" width="100%">
+  <img alt="dsk run in a terminal: review after 4 turns, the check passed, test_durations.py (+70); then dsk accept" src="assets/run-light.svg" width="100%">
 </picture>
 </p>
 
-That's a real run against a 24-line module: 4 turns, 70 lines of tests, and the check run by `dsk` itself. The fastest provider was full, so the run moved to the next one in the route (`thirdparty after coralbricks`). A `cache:` line appears when less than 80% of the input after turn 3 came from the cache; here that is turn 4 alone, and what misses is what turn 3 appended.
+That's a real run against a 24-line module: 4 turns, 70 lines of tests, and the check run by `dsk` itself. The fastest provider was full, so the run moved to the next one in the route (`thirdparty after coralbricks`). A `cache:` line appears when less than 80% of the input after turn 3 came from the cache; here that is turn 4 alone, and what misses is what turn 3 appended. Once the diff is read, `dsk accept` marks the work as reviewed.
 
 Every command prints a short plain-text report on stdout. `--verbose` adds one line per turn on stderr. The last line of a report names the commands that are valid next.
 
@@ -87,7 +102,7 @@ Every flag, an example report as text and the report as JSON (`--json`): [docs/c
 <p>
 <picture>
   <source media="(prefers-color-scheme: dark)" srcset="assets/flow-dark.svg">
-  <img alt="Claude Code sends a brief to dsk, which talks to a DeepSeek worker, fails over to the next provider, and lets each script change only the allowed paths of your repository" src="assets/flow-light.svg" width="100%">
+  <img alt="Claude Code sends a brief to dsk; dsk and a DeepSeek worker trade a request for a script each turn; each script changes only the allowed paths of your repository; dsk runs the check and reports back for review" src="assets/flow-light.svg" width="100%">
 </picture>
 </p>
 
@@ -104,6 +119,46 @@ Every flag, an example report as text and the report as JSON (`--json`): [docs/c
 **Providers.** A session starts on the first profile in `route`, or with `"route_order": "fastest"` on the fastest one that has a free slot. On 402, or when retries of a network failure, 408, 429 or any 5xx are used up, it continues on the next profile in a new series, and so does a worker that keeps sending the same reply. A profile that reports its credit used up is paused: runs skip it until the pause ends, unless it is the last one in the route.
 
 The protocol in full is in [docs/internals.md](docs/internals.md); routing, failover, slots and pauses are in [docs/configuration.md](docs/configuration.md#providers).
+
+## Measured, not claimed
+
+<p>
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="assets/stats-dark.svg">
+  <img alt="3 turns per task at the bench's median; 85 to 92% of a code task's input read from the cache; 132 tests; no dependencies" src="assets/stats-light.svg" width="100%">
+</picture>
+</p>
+
+The figures on this page were measured. Three turns is the median task on the bench, and 85 to 92% is the share of a code task's input that came from the cache from turn 3 on, on the official API. [docs/build-notes.md](docs/build-notes.md) has how each was measured, and what fell short of its target.
+
+The cache carries that much because every request extends the one before it byte for byte: the provider reads the old part from its cache, and only what the last turn appended is new. The chart is one real session, on a third-party gateway and with its cold first turn counted: 76% of its input came from the cache, and 82% from turn 3 on.
+
+<p>
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="assets/cache-dark.svg">
+  <img alt="Input tokens per turn of a real session of 7 turns, split into read from the cache and new: 76% of the input came from the cache" src="assets/cache-light.svg" width="100%">
+</picture>
+</p>
+
+It is the session that wrote the first generator of this page's images: 7 turns and 55,961 input tokens, 42,752 of them read from the cache. Turn 1 starts cold, and turn 7 carries the long script that turn 6 wrote.
+
+<details>
+<summary>The numbers behind the chart</summary>
+
+| Turn | Input tokens | Read from the cache | New | Cached share |
+|---|---|---|---|---|
+| 1 | 5,798 | 1,024 | 4,774 | 18% |
+| 2 | 6,297 | 5,632 | 665 | 89% |
+| 3 | 6,545 | 6,144 | 401 | 94% |
+| 4 | 6,716 | 6,400 | 316 | 95% |
+| 5 | 8,216 | 6,656 | 1,560 | 81% |
+| 6 | 8,957 | 8,192 | 765 | 91% |
+| 7 | 13,432 | 8,704 | 4,728 | 65% |
+| all | 55,961 | 42,752 | 13,209 | 76% |
+
+`dsk show ID --log` prints these columns for any session.
+
+</details>
 
 ## The plugin
 
@@ -175,3 +230,4 @@ sh tests/install_test.sh                  # install.sh against a throwaway home 
 - [docs/plugin.md](docs/plugin.md): how the form's answers reach `dsk`, and what the display draws.
 - [docs/build-notes.md](docs/build-notes.md): what differs from the build prompt, and what was measured on the way.
 - [docs/limits.md](docs/limits.md): known limits, and what is left for later.
+- [assets/build.py](assets/build.py): writes this page's images, in a light and a dark theme. From a checkout, open `assets/preview.html` in a browser to see them all move, on both backgrounds.
