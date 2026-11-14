@@ -266,12 +266,16 @@ write_command() {   # write ~/.local/bin/dsk, a small script that runs the plugi
     fi
     target="$bin/dsk"
     if [ -L "$target" ] || { [ -f "$target" ] && grep -q "Written by dsk's install.sh" "$target"; }; then
-        rm -f "$target"
+        :   # ours: replaced below in one step, so that a dsk run going on never finds half a file here
     elif [ -e "$target" ]; then
         echo "dsk:    left $target alone, because install.sh did not write it."
         return 0
     fi
-    cat > "$target" <<'EOF'
+    if [ -L "$target" ] && [ -d "$target" ]; then
+        rm -f "$target"   # mv would move the new file into a linked folder instead of replacing the link
+    fi
+    fresh="$target.new.$$"
+    cat > "$fresh" <<'EOF'
 #!/bin/sh
 # Written by dsk's install.sh: runs the dsk plugin that Claude Code has installed.
 set -eu
@@ -296,7 +300,8 @@ fi
 echo "dsk: the plugin is not installed. Run install.sh again." >&2
 exit 1
 EOF
-    chmod 755 "$target"
+    chmod 755 "$fresh"
+    mv -f "$fresh" "$target"
     dsk_command=yes
     echo "dsk:    $target"
 }
