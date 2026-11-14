@@ -48,14 +48,15 @@ dsk run [--allow GLOB]... [--check CMD]... [--file PATH]... [--web] [--worktree]
 - **Scouting brief:** one question, the directories or files to look in, and the form of the answer (`file:line` and one line per finding, at most 40 lines). A narrow question is one the worker can answer by searching: one that makes it print everything is cut off at the output limit.
 - **Long files:** over half of all worker turns only read. A turn that only reads shows the worker up to 24,000 characters, any other turn 6,000, and each turn costs seconds of waiting. So attach what the worker must know instead of letting it look: a whole file with `--file PATH`, or just the lines that matter with `--file PATH:A-B` (find them with grep first).
 - **`--allow`:** the paths the worker may change. Make it as narrow as the task permits. `*` stays inside one directory, `**` crosses them. Without `--allow` the run is read-only. This stops a mistaken worker, not a hostile one: `write()` and `edit()` refuse other paths, and `dsk` undoes changes to any other file git does not ignore, but the worker's shell commands can still change git-ignored files (`.env`, `node_modules`) and paths outside the repository. Outside a git repository nothing is undone.
-- **`--check`:** give one for any change. `dsk` runs it itself and reaches `review` only when it passes.
+- **`--check`:** give one for any change. `dsk` runs it itself and reaches `review` only when it passes. A `caution:` line in the report means the worker saw that check pass before it changed anything, so it cannot show that the task was done: verify the change another way.
 - **`--file`:** attach what the worker must read (`-` is stdin), so it spends no turn fetching it. A file of up to 4,000 characters stays attached for the whole run; a larger one is dropped if a long run is compacted, so keep instructions in the brief or in a small file.
 - **`--web`:** search and fetch, for research. Leave it off for tasks that also run commands in a repository with secrets.
 - **Owner:** `dsk` takes your session from `CLAUDE_CODE_SESSION_ID`, which Claude Code sets for every command, so the Stop hook knows whose run it is. Pass `--owner` only to say otherwise.
 - **`--effort`:** only for briefs that need judgment. The default is no thinking.
-- **`--max-turns`:** 30 by default for a run with `--allow`, 12 for a read-only one. A run that uses them up stops as `limit`, and so does one past the time or token limit in the config. A reject or a continue starts a fresh turn and token budget; an answer does not.
+- **`--max-turns`:** 30 by default for a run with `--allow`, 12 for a read-only one. A run that uses them up stops as `limit`, and so does one past the time or token limit in the config. A reject or a continue starts a fresh turn and token budget; an answer does not. Leave the default unless you want a short probe: of 25 runs capped at 18 turns, 6 used every one.
 - **Provider:** without `--profile`, a run starts on the fastest provider that has a free place, and it can move to another one mid-run. The first line of the report then reads `zro after coralbricks`. `dsk reject`, `dsk answer` and `dsk continue` take `--profile NAME` to move the session to a particular one; like `dsk run --profile`, that holds it there, with no failover.
-- **What the worker can read:** its `read()`, `glob()` and `grep()` see only the working directory, plus a scratch folder of its own for throwaway files. Attach anything outside it with `--file`, or copy it into the tree first.
+- **What the worker can read:** its `read()`, `glob()` and `grep()` see only the working directory, plus a scratch folder of its own for throwaway files. Attach anything outside it with `--file`, or copy it into the tree first. `glob()` lists a file git ignores only when the pattern names its folder, as in `shots/*.png`.
+- **What the worker cannot see:** images. It reads text only, so a screenshot tells it nothing. For visual work (layout, charts, anything judged by eye) give it a script that prints measurements, such as element boxes and overlaps, and name that script in the brief.
 - Globs and checks are relative to the repository root, wherever you call `dsk` from. `--file` and `--brief` paths are relative to the current directory.
 - **Run dsk bare.** Put no `| head`, `| tail` or other pipe after a dsk command: the pipe's exit code replaces dsk's, so a stuck or failed run looks like exit code 0, also in a background notice. The reports are short already.
 - **Short tasks:** run in the foreground with a Bash timeout of 600000 ms. If the timeout passes, the run is moved to the background and keeps going: wait for its completion notice.
@@ -80,6 +81,12 @@ The last line of every report names the commands that are valid next.
 
 **Never tell the user that delegated work is finished before `dsk accept`.**
 
+## Many runs of one kind
+
+- **Pilot one run first.** Read its `dsk show ID --log`. What it had to find out (how the check works, how to run a probe, where the tools live) will cost every later run the same turns: in one batch of 48 runs, 28 turns read the same check script and 64 wrote the same probe. Put those facts in `DSK.md`, or attach the file, and only then start the rest.
+- **Scripts read `--json`, not the text.** With `--json`, `dsk run`, `answer`, `reject`, `continue`, `show` and `wait` print each report as one JSON object on one line: `id`, `status`, `checks` (each `cmd` with its exit `code`), `passed_before`, `files`, `why`, `summary`. The wording of the text report can change; these keys do not.
+- **Every diff is still read.** `review` says that the check passed and nothing more. A script may sort a batch by status, but accept only what you have read with `dsk show ID --review`.
+
 ## Keep a session while the work is related
 
 ```
@@ -102,9 +109,9 @@ Say what was delegated and your verdict (accepted, rejected or dropped), then th
 ## Other commands
 
 - `dsk status`: this project's open sessions.
-- `dsk wait [ID ...] [--timeout SECONDS]`: block until those sessions have stopped, printing each report as it comes. Without IDs: your sessions in this project that are running or were started in the last seconds.
+- `dsk wait [ID ...] [--timeout SECONDS] [--json]`: block until those sessions have stopped, printing each report as it comes. Without IDs: your sessions in this project that are running or were started in the last seconds.
 - `dsk bench`: time each provider now, fastest first. With `route_order` set to `fastest` in the config, runs do this by themselves and start on the fastest provider that has a free place.
 - `dsk stats [ID ...]`: what sessions measured: where the turns went, tokens, seconds per turn and per provider. Look here when runs feel slow.
-- `dsk show ID [--diff | --log | --answer]`: the whole diff, tokens and actions per turn, or the whole answer.
+- `dsk show ID [--diff | --log | --answer | --json]`: the whole diff, tokens and actions per turn, the whole answer, or the report as JSON.
 - `dsk search "query"` and `dsk fetch URL`: raw web search and page fetch, with no model.
 - `dsk doctor`: check each provider profile.

@@ -722,7 +722,7 @@ class Loop(Cli):
                             script('print(read("a.txt"))\ndone("It says one.")')]
         out, sid = self.run_ok("look at the file", cwd=repo, code=2)
         self.assertRegex(out, r"^dsk \w{4} · question · a · 1 turn · in \d+\.\dk \(0% cached\) · out \d+\.\dk\n")
-        self.assertEqual(out.splitlines()[1:], ["question: Which file?", "context: 1.1k of 32.0k",
+        self.assertEqual(out.splitlines()[1:], ["question: Which file?", "context: 1.2k of 32.0k",
                                                 f'next:    dsk answer {sid} "..."'])
         code, out, _ = self.dsk("answer", sid, "a.txt please", cwd=repo)
         self.assertEqual(code, 0, out)
@@ -992,7 +992,7 @@ class Gates(Cli):
                                        "check failed: sh tests/t.sh → 3\nbroken")
         self.assertEqual(out.splitlines()[1:], [
             "summary: Fixed the script.", "open:    none", "checks:  sh tests/t.sh → 0; true → 0",
-            "changed: tests/t.sh (+1 -1)", "context: 1.2k of 32.0k",
+            "changed: tests/t.sh (+1 -1)", "context: 1.3k of 32.0k",
             f'next:    dsk show {sid} --review | dsk accept {sid} | dsk reject {sid} "defects"'])
         self.assertIn("· review · a · 2 turns ·", out)
         header = self.api.bodies()[0]["messages"][1]["content"]
@@ -1094,7 +1094,7 @@ class Gates(Cli):
         self.assertEqual((self.cat(repo, "a.txt"), os.path.exists(f"{repo}/b.txt")), ("one\n", False))
         self.assertEqual(out.splitlines()[1:], ["answer:  The file says one.",
                                                f"scope:   reverted a.txt, b.txt (copies in {self.tmp}/state/dsk/{sid}/reverted)",
-                                               "context: 1.1k of 32.0k",
+                                               "context: 1.2k of 32.0k",
                                                f'next:    dsk show {sid} --answer | dsk continue {sid} "next task"'])
 
     def test_stuck_report_carries_notes_and_the_scoped_partial_change(self):

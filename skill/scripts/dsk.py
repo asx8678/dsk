@@ -66,7 +66,9 @@ TOOLS = [{"type": "function", "function": {
     "parameters": {"type": "object", "properties": {"code": {"type": "string", "description": "The Python script to run."}},
                    "required": ["code"]}}}]
 MAX_TOKENS = {"off": 16000, "low": 32000, "high": 64000, "max": 128000}  # thinking spends from the same budget
-RETRY = (0, 408, 429, 500, 502, 503, 504)  # 0 is a network failure
+RETRY = (0, 408, 429)  # 0 is a network failure. Every 5xx is tried again as well: see transient()
+SLOW = 30  # seconds. A failure that took longer to arrive (a gateway timeout such as HTTP 524) is not sent to the
+# same profile again while another one can take over: each further try would hang as long.
 DEFAULTS = {
     "route": ["official"],
     "profiles": {"official": {"base_url": "https://api.deepseek.com", "key_env": "DEEPSEEK_API_KEY",
@@ -295,13 +297,14 @@ def messages(recs):
     return [r["m"] for r in series_msgs(recs)]
 
 
-def request_body(profile, effort, msgs):
-    """The only place a chat request is serialized: fixed key order, one static tool, nothing volatile."""
+def request_body(profile, effort, msgs, heat=0):
+    """The only place a chat request is serialized: fixed key order, one static tool, nothing volatile. `heat` is
+    the temperature of a run without thinking: 0, except right after a reply that repeated itself (see HEAT)."""
     body = {"model": profile["model"], "messages": msgs, "tools": TOOLS, "max_tokens": MAX_TOKENS[effort],
             "stream": False}
     if effort == "off":  # both spellings of "no thinking": some gateways honour only `reasoning_effort`
         body |= {"tool_choice": "required", "thinking": {"type": "disabled"}, "reasoning_effort": "none",
-                 "temperature": 0}
+                 "temperature": heat}
     else:  # thinking mode rejects a forced tool call
         body |= {"tool_choice": "auto", "thinking": {"type": "enabled"}, "reasoning_effort": effort}
     body |= profile.get("extra", {})  # a null in `extra` removes a key the provider rejects
@@ -323,16 +326,24 @@ def send(url, key, payload, extra=None, timeout=600):
         return 0, f"{type(e).__name__}: {e}"
 
 
-def post(url, key, payload, backoff, headers=None):
-    """POST with backoff on transient failures. Every retry sends the identical bytes."""
+def transient(status):
+    """A failure worth another try, here or on the next profile: the network, a timeout, a rate limit, any 5xx."""
+    return status in RETRY or 500 <= status <= 599
+
+
+def post(url, key, payload, backoff, headers=None, patient=True):
+    """POST with backoff on transient failures. Every retry sends the identical bytes. When not `patient`, a
+    failure that took more than SLOW seconds to arrive is returned at once, for the caller to try another profile."""
     for wait in [*backoff, None]:
+        began = time.time()
         status, data = send(url, key, payload, headers)
         if status == 200 and "choices" in data and data["choices"][0].get("finish_reason") in (
                 "insufficient_system_resource", "aborted"):
             status, data = 503, "generation interrupted by the server"
         if status == 400 and "limit" in str(data).lower():  # some gateways report a rate or concurrency limit this way
             status = 429
-        if status not in RETRY or wait is None or spent(status, data):  # used-up credit does not come back in seconds
+        if (not transient(status) or wait is None or spent(status, data)  # used-up credit does not come back in seconds
+                or not patient and time.time() - began > SLOW):
             return status, data
         time.sleep(wait)
 
@@ -400,7 +411,7 @@ def later_profiles(s):
     return route[route.index(s.profile) + 1:]
 
 
-def chat(s, cfg):
+def chat(s, cfg, heat=0):
     """Send the current series and return (assistant message, finish_reason). Fails over along the route."""
     while True:
         name, profile = s.profile, cfg["profiles"][s.profile]
@@ -420,12 +431,12 @@ def chat(s, cfg):
         prev = s.last("req", "series")
         if prev["t"] == "req" and fingerprint(wire[:prev["n"]]) != {"n": prev["n"], "sha": prev["sha"]}:
             raise Fail("bug: this request does not extend the previous one in its series")
-        body = request_body(profile, s.head["effort"], msgs)
+        body = request_body(profile, s.head["effort"], msgs, heat)
         key = api_key(profile)
         s.add("req", **fingerprint(wire))
         session = f"dsk-{s.id}-{fingerprint(dumps(s.head))['sha'][:8]}"  # from the log, so every process agrees
         status, data = post(profile["base_url"].rstrip("/") + "/chat/completions", key, body, cfg["backoff"],
-                            headers(profile, session))
+                            headers(profile, session), patient=not later)
         if status == 200:
             try:
                 choice, usage = data["choices"][0], data.get("usage") or {}
@@ -444,7 +455,7 @@ def chat(s, cfg):
             return reply, finish
         if spent(status, data):
             pause(cfg, name, data)
-        if not later or (status not in RETRY and not spent(status, data)):
+        if not later or (not transient(status) and not spent(status, data)):
             raise Fail(f"{name}: HTTP {status} {data}")
         release(cfg, name)
         s.add("series", why="failover", profile=later[0], status=status)
@@ -582,9 +593,20 @@ REPEAT = ("not run: this reply is identical to your previous one. If the work is
           "result; otherwise send a different script.")
 ALTERNATING = ("not run: your last four replies alternate between the same two scripts and nothing changes. "
                "Do something different, or call done() or ask().")
+STALE = ("note: this is your previous script with only a number changed, and it printed nothing you have not seen "
+         "already. Use what you have: make the next change, call done(), or look somewhere else.")
+SAME_FAILURE = ("note: `{cmd}` has failed the same way {n} times in a row, so your last changes did not touch what it "
+                "tests. Read the code of that check to see exactly what it looks at, or undo your last changes and "
+                "go another way.")
+# The temperature of the request after 0, 1, and 2 or more replies in a row that got the worker nowhere. Three logged
+# loops of identical replies were sent to their provider again, four times each at each setting: the same script
+# came back 11 times of 12 at 0, twice at 0.7 and never at 1.0. So a repeat is answered warm, and warmer if that
+# did not help.
+HEAT = (0, 0.7, 1.0)
 CUT_OFF = {"role": "assistant", "content": "(my reply was cut off at the output limit and was not kept)"}
 SCRATCH = ('scratch: write("@scratch/name", text) and $DSK_SCRATCH in sh() are for throwaway files; '
-           'nothing there is part of your change')
+           'nothing there is part of your change. A script kept there resolves its imports from that folder, not '
+           'from the project: give it the project\'s path, or keep the import absolute')
 OUTSIDE = '{} is outside the working directory; for throwaway files use "@scratch/name", or $DSK_SCRATCH in sh()'
 BANNED = {"open": "read() or write()", "exec": "plain code", "eval": "plain code", "compile": "plain code",
           "__import__": "an import statement", "input": "ask()"}
@@ -633,6 +655,7 @@ SECRET = re.compile(r"KEY|TOKEN|SECRET|PASSWORD|CREDENTIAL|^(AWS_|ARM_|AZURE_|GO
                     r"|^SSH_AUTH_SOCK$", re.I)
 KEEP = 4000  # an attached file up to this many characters stays in the first message through compaction
 VERBOSE = False
+JSON = False  # main() sets it for the six commands whose `--json` prints the report as one JSON object
 
 
 def matcher(globs):
@@ -765,8 +788,16 @@ def child(fd):
             names = listing.stdout.split("\0")
         else:  # not a git repository
             names = [os.path.relpath(os.path.join(d, f)) for d, _, fs in os.walk(".") for f in fs]
-        match = matcher([pattern] if isinstance(pattern, str) else pattern)
-        return sorted(n for n in names if match(n) and os.path.isfile(n) and not n.startswith(".git/"))
+        match = matcher(patterns)
+        found = sorted(n for n in names if match(n) and os.path.isfile(n) and not n.startswith(".git/"))
+        if not found and listing.returncode == 0:
+            # Git lists no file it ignores, so build output and screenshots came back as []: in one batch 16 workers
+            # then spent a turn on `ls`. A pattern that names such a folder is looked up on disk, in that folder only.
+            tops = {p.split("/", 1)[0] for p in patterns if "/" in p}
+            walked = [os.path.relpath(os.path.join(d, f)) for top in sorted(tops) if top != ".git" and os.path.isdir(top)
+                      and not set(top) & set("*?[") for d, _, fs in os.walk(top) for f in fs]
+            found = sorted(n for n in {*walked, *patterns} if match(n) and os.path.isfile(n) and not n.startswith(".git/"))
+        return found
 
     def grep(pattern, glob="**/*"):
         regex, hits = re.compile(pattern), []
@@ -1149,6 +1180,10 @@ def take_turn(s, cfg, env, turn, reply, finish):
                   f'{limits["read_chars"]:,} characters, any other turn {limits["output_chars"]:,}; '
                   f'read("@{turn}") returns all of it ...]')
         output = f"{output[:cap // 2]}\n{marker}\n{output[-cap // 2:]}"
+    # For the loop: what the worker is shown of its output, and whether the turn may have changed a file. Outside
+    # a git repository nobody can tell what a shell command changed, so such a turn counts as one that did.
+    touched = s.last("gate")["touched"] if before else []
+    s.printed, s.moved = output, bool(wrote or reverted or touched or (not before and "sh" in fns))
     parts = ["wrote: " + ", ".join(wrote) if wrote else "",
              "output:\n" + output.rstrip("\n") if output.strip() else "output: (none)",
              "error:\n" + error if error else "",
@@ -1161,10 +1196,16 @@ def said(message):
     return message["content"], [call["function"] for call in message.get("tool_calls", [])]
 
 
+def shape(message):
+    """A reply with every number blanked: two scripts that differ only in a line number or a slice bound share it."""
+    return re.sub(r"\d+", "0", json.dumps(said(message), sort_keys=True))
+
+
 def loop(s, cfg, extra=""):
     """Drive the session to its next stop. `extra` is the lead's text, appended to the pending turn result."""
     limits, started, failures, repeats, reads = cfg["limits"], time.time(), 0, 0, 0
     env, writing, said_here = clean_env(cfg, s.dir), bool(scope(s)["allow"]), []
+    idle, shown, failing = 0, [], [None, 0]  # replies in a row that got nowhere; recent outputs; a failure and its run
 
     def bad(status, **info):
         """Halt at a bad stop, with the checks run first when the worker changed files and they are configured."""
@@ -1183,8 +1224,9 @@ def loop(s, cfg, extra=""):
             s.add("msg", turn=pending["turn"], m={**target, "content": pending["text"] + extra})
             extra = ""
             compact(s, cfg)
-        previous = next((said(r["m"]) for r in reversed(s.of("msg")) if r["m"]["role"] == "assistant"), None)
-        reply, finish = chat(s, cfg)
+        before = next((r["m"] for r in reversed(s.of("msg")) if r["m"]["role"] == "assistant"), None)
+        previous = before and said(before)
+        reply, finish = chat(s, cfg, HEAT[min(idle, 2)])
         turn = s.turn + 1
         # A cut-off reply is not kept: resent with every later request, three of them cost one session 48,000 tokens.
         # The worker still hears that its reply was cut off, in the message that carries this turn's result.
@@ -1195,16 +1237,35 @@ def loop(s, cfg, extra=""):
         alternates = len(said_here) >= 3 and now == said_here[-2] and said_here[-1] == said_here[-3] and said_here[-1] != now
         said_here.append(now)
         repeats = repeats + 1 if now == previous or alternates else 0
+        stale = False
         if repeats:  # a worker that has its answer and only forgot to call done() gets one warning, not a stop
             body, failed, stop = (ALTERNATING if alternates else REPEAT), "repeat", None
         else:
             body, failed, stop = take_turn(s, cfg, env, turn, reply, finish)
+        acts = [a for a in s.of("ledger") if a["turn"] == turn]
+        if not repeats and not failed:
+            seen = " ".join(s.printed.split())
+            # The repeat check above misses a script sent again with one number changed. One worker spent its last
+            # 15 turns printing ever shorter slices of the same lines; so a turn that is the previous script but for
+            # its numbers, changes nothing and prints nothing new counts as a reply that got nowhere, like a repeat.
+            stale = (not stop and not s.moved and before is not None and shape(reply) == shape(before)
+                     and bool({a["fn"] for a in acts} - {"note"}) and any(seen in old for old in shown[-4:]))
+            shown.append(seen)
+            body += "\n\n" + STALE if stale else ""
+            # A check that fails the same way after every change: one worker ran 13 such turns to its limit.
+            broken = [a for a in acts if a["fn"] == "sh" and a.get("code")]
+            if any(a["fn"] == "sh" for a in acts):
+                mark = broken and ([(a["arg"], a["code"]) for a in broken], re.sub(r"\d+", "0", seen))
+                failing = [mark, failing[1] + 1 if mark and mark == failing[0] else 1 if mark else 0]
+                if mark and not failing[1] % 3:
+                    body += "\n\n" + SAME_FAILURE.format(cmd=" ".join(broken[-1]["arg"].split())[:80], n=failing[1])
+        idle = idle + 1 if repeats or stale else 0
         failures = failures + 1 if failed else 0
         text, finished = f"turn {turn} · {left} left\n{body}", False
         if stop and stop["fn"] == "done":
             problem = gates(s, cfg, env)
             text, finished = text + ("\n\n" + problem if problem else ""), not problem
-        kind = turn_kind({"turn": turn, "fail": failed}, [a for a in s.of("ledger") if a["turn"] == turn])
+        kind = turn_kind({"turn": turn, "fail": failed}, acts)
         reads = reads + 1 if writing and kind == "read" else 0  # a run that only reads never gets its work done
         if reads and not reads % 12:
             text += (f"\n\nnote: the last {reads} turns only read files. {left} turns are left: start writing now, "
@@ -1216,14 +1277,18 @@ def loop(s, cfg, extra=""):
             return halt(s, summary=stop["arg"], open=stop["open"])
         if stop and stop["fn"] == "ask":
             return halt(s, "question", question=stop["arg"])
-        if repeats >= 2:  # another provider may break the loop, so it is tried before the run gives up
+        if repeats >= 2 or idle >= 3:  # another provider may break the loop, so it is tried before the run gives up
             later = later_profiles(s)
             if later:
                 release(cfg, s.profile)
                 s.add("series", why="failover", profile=later[0], status="repeat")
-                repeats = failures = 0  # the next provider starts with a clean count, or its first failure would stop the run
+                # The next provider starts with a clean count, or its first failure would stop the run. It reads
+                # the same repeated replies, though, so its first request is still sent warm.
+                repeats, failures, idle = 0, 0, 1
             else:
-                return bad("stuck", why="the same two replies, alternating" if alternates else "same reply three times in a row")
+                return bad("stuck", why="the same two replies, alternating" if alternates else
+                           "same reply three times in a row" if repeats >= 2 else
+                           "three replies in a row that showed nothing new")
         if failures >= 3:
             return bad("stuck", why="three failing turns in a row")
         spent = sum(u["prompt"] + u["out"] for u in s.since("round", "usage"))
@@ -1272,6 +1337,22 @@ def worker_diff(s, *flags, since=None):
     return git(s.head["root"], "diff", *flags, since or scope(s)["start"], st["end"], "--", *paths) if paths else ""
 
 
+def passed_before(s):
+    """The checks the worker ran itself, and saw pass, in a turn before the first one that changed a file: a check
+    that passes on the untouched tree cannot show that the task was done. Only what the log holds: a worker that
+    never ran the check first leaves this empty, which says nothing about the check."""
+    checks = {cmd[:200]: cmd for cmd in scope(s)["checks"]}  # the ledger keeps the first 200 characters of a command
+    start, passed, turn = max((i for i, r in enumerate(s.recs) if r["t"] == "base"), default=0), [], []
+    for r in s.recs[start:]:
+        if r["t"] == "ledger" and r["fn"] in ("write", "edit") and "err" not in r or r["t"] == "gate" and r.get("touched"):
+            break
+        if r["t"] == "ledger" and r["fn"] == "sh" and r.get("code") == 0 and r["arg"] in checks:
+            turn.append(checks[r["arg"]])
+        elif r["t"] == "result":  # only now is it known that the turn changed nothing
+            passed, turn = passed + turn, []
+    return list(dict.fromkeys(passed))
+
+
 def report(s, review=False, cfg=None):
     """The short report for the session's last stop, or the review packet. `summary`, `answer`, `question` and
     `notes` are the worker's words; every other line is measured."""
@@ -1301,6 +1382,10 @@ def report(s, review=False, cfg=None):
     ran = st.get("checked")  # a bad stop leaves the checks unrun when the worker changed no files
     line("checks", "not run: the worker changed no files" if status in ("stuck", "limit") and ran is False
                     and scope(s)["checks"] else "; ".join(f"{cmd} → {code}" for cmd, code in checks["results"]))
+    passing = {cmd for cmd, code in checks["results"] if code == 0}  # a check that fails now needs no such warning
+    before = st.get("changed") and [cmd for cmd in passed_before(s) if cmd in passing]
+    line("caution", before and f"{'; '.join(before)} passed before the worker changed anything, so "
+                               f"{'it does' if len(before) == 1 else 'they do'} not show that the task was done")
     reverted = list(dict.fromkeys(path for g in s.of("gate") for path in g["reverted"]))
     line("scope", reverted and f"reverted {', '.join(reverted)} (copies in {os.path.join(s.dir, 'reverted')})")
     line("changed", ", ".join(f"{path} ({'binary' if a == '-' else f'+{a}' + (f' -{d}' if d != '0' else '')})"
@@ -1341,6 +1426,30 @@ def report(s, review=False, cfg=None):
     return "\n".join(lines)
 
 
+def report_json(s, cfg):
+    """The report as one JSON object: `job()`'s measured data, plus the words the text report says, measured from
+    the log the same way `report()` measures them, so the two never disagree."""
+    st, ledger, checks, status = s.last("state"), s.of("ledger"), s.last("checks") or {"results": []}, s.status()
+    passing = {cmd for cmd, code in checks["results"] if code == 0}  # a check that fails now needs no such warning
+    head, last = s.head, s.last("usage")
+    return {**job(s, cfg),
+            "left": [p for p in dict.fromkeys(r.get("profile") for r in s.of("series")) if p and p != s.profile],
+            "summary": st.get("summary", ""), "answer": answer_text(s) if status == "done" else "",
+            "question": st.get("question") or "", "error": st.get("error") or "", "why": st.get("why") or "",
+            "open": st.get("open") or "", "notes": [r["arg"] for r in ledger if r["fn"] == "note"],
+            "checks": [{"cmd": cmd, "code": code} for cmd, code in checks["results"]],
+            "checked": st.get("checked"),
+            "passed_before": [cmd for cmd in passed_before(s) if cmd in passing] if st.get("changed") else [],
+            "files": [{"path": path, "added": None if a == "-" else int(a), "deleted": None if d == "-" else int(d)}
+                      for a, d, path in st.get("changed") or []],
+            "reverted": list(dict.fromkeys(path for g in s.of("gate") for path in g["reverted"])),
+            "workdir": head["workdir"] if head["worktree"] else "",
+            "context": {"used": last["prompt"] + last["out"] if last else 0,
+                        "limit": (cfg or {}).get("profiles", {}).get(s.profile, {}).get("compact_at", 32000),
+                        "compactions": sum(r["why"] == "compact" for r in s.of("series"))},
+            "next": NEXT.get(status, "").format(id=s.id)}
+
+
 # ---------------------------------------------------------------- commands
 
 def drive(s, cfg, extra=""):
@@ -1360,7 +1469,7 @@ def drive(s, cfg, extra=""):
             s.add("state", status="error", error=message)
     if s.status() == "done" and s.head["worktree"]:  # nothing was changed: there is nothing left to accept
         remove_worktree(s.head)
-    print(report(s, cfg=cfg))
+    print(dumps(report_json(s, cfg)) if JSON else report(s, cfg=cfg))
     return EXIT.get(s.status(), 0)
 
 
@@ -1521,7 +1630,7 @@ def cmd_show(args, cfg):
         text = "\n".join(f"-- new series: {r['why']} on {r['profile']}" if r["t"] == "series" else turn_line(s, r["turn"])
                          for r in s.of("series", "result"))
     else:
-        text = report(s, args.review, cfg)
+        text = dumps(report_json(s, cfg)) if JSON else report(s, args.review, cfg)
     print(text.rstrip("\n"))
     return 0
 
@@ -1630,7 +1739,8 @@ def cmd_reject(args, cfg):
         except Fail as e:
             raise Fail(f"the tree has moved since the run, nothing was reverted ({e})") from None
     close(s, "dropped")
-    print(f"dsk {s.id} · dropped · the worker's changes were discarded")
+    print(dumps({"id": s.id, "status": "dropped"}) if JSON
+          else f"dsk {s.id} · dropped · the worker's changes were discarded")
     return 0
 
 
@@ -1664,17 +1774,18 @@ def cmd_wait(args, cfg):
         for sid in [sid for sid in waiting if not driven(sid)]:
             s = Session(sid)
             if s.last("state") and s.status() != "running":
-                print(report(s, cfg=cfg).rstrip("\n") + "\n", flush=True)
+                print(dumps(report_json(s, cfg)) if JSON else report(s, cfg=cfg).rstrip("\n") + "\n",
+                      flush=True)
                 waiting.remove(sid)
                 reported += 1
         if waiting:
             seen = time.time()
         elif args.id or time.time() - seen >= (4 if reported else 10):  # a run of the same command may still be starting
-            if not reported:
+            if not reported and not JSON:  # JSON lines only: a display reads the exit code, not a sentence
                 print("dsk · nothing is running")
             return 0
         if deadline is not None and time.time() >= deadline:
-            print(f"dsk · still running: {' '.join(waiting)}")
+            print(f"dsk · still running: {' '.join(waiting)}", file=sys.stderr if JSON else sys.stdout)
             return 124
         time.sleep(2)
 
@@ -2087,7 +2198,7 @@ class Parser(argparse.ArgumentParser):
 
 
 def main():
-    global VERBOSE
+    global JSON, VERBOSE
     if sys.argv[1:2] == ["_exec"]:
         return child(int(sys.argv[2]))
     common = argparse.ArgumentParser(add_help=False)
@@ -2115,13 +2226,16 @@ def main():
     run.add_argument("--max-turns", type=int, help="turns the run may take (default: 30 with --allow, 12 without)")
     run.add_argument("--owner", default=os.environ.get("CLAUDE_CODE_SESSION_ID", ""),
                      help="the Claude Code session that started the run (default: $CLAUDE_CODE_SESSION_ID)")
+    run.add_argument("--json", action="store_true", help="print the report as one JSON object")
     answer = command("answer", "answer the worker's question", "id")
     answer.add_argument("text", nargs="?", help="the answer")
     answer.add_argument("--brief", metavar="FILE", help="read the answer from a file (- is stdin)")
     answer.add_argument("--profile", metavar="NAME", help="continue on this provider profile")
+    answer.add_argument("--json", action="store_true", help="print the report as one JSON object")
     view = command("show", "print a session's report", "id").add_mutually_exclusive_group()
     for flag, text in (("review", "the review packet"), ("diff", "the worker's whole diff"),
-                       ("log", "tokens and actions per turn"), ("answer", "the whole answer")):
+                       ("log", "tokens and actions per turn"), ("answer", "the whole answer"),
+                       ("json", "the report as one JSON object")):
         view.add_argument("--" + flag, action="store_true", help=text)
     cont = command("continue", "give a finished session its next task", "id")
     cont.add_argument("text", nargs="?", help="the next task")
@@ -2130,15 +2244,18 @@ def main():
     cont.add_argument("--check", action="append", default=[], metavar="CMD", help="acceptance test, run by dsk")
     cont.add_argument("--max-turns", type=int, help="turns this round may take")
     cont.add_argument("--profile", metavar="NAME", help="run this round on this provider profile")
+    cont.add_argument("--json", action="store_true", help="print the report as one JSON object")
     command("accept", "mark as reviewed; after --worktree, apply the changes", "id")
     reject = command("reject", "send defects back, or --drop the work", "id")
     reject.add_argument("text", nargs="?", help="the defects, as a numbered list")
     reject.add_argument("--brief", metavar="FILE", help="read the defects from a file (- is stdin)")
     reject.add_argument("--drop", action="store_true", help="discard the work")
     reject.add_argument("--profile", metavar="NAME", help="run the next round on this provider profile")
+    reject.add_argument("--json", action="store_true", help="print the report as one JSON object")
     wait = command("wait", "block until sessions have stopped, printing each report")
     wait.add_argument("id", nargs="*", help="sessions to wait for (default: this project's running ones)")
     wait.add_argument("--timeout", type=float, metavar="SECONDS", help="give up after this long, with exit code 124")
+    wait.add_argument("--json", action="store_true", help="print the report as one JSON object")
     status = command("status", "this project's sessions")
     status.add_argument("--hook", action="store_true", help="act as a Stop hook")
     status.add_argument("--json", action="store_true", help="the last day's sessions on any project, as JSON")
@@ -2164,6 +2281,7 @@ def main():
                 "doctor": cmd_doctor, "configure": cmd_configure, "bench": cmd_bench}
     args = parser.parse_args()
     VERBOSE = args.verbose
+    JSON = args.command in ("run", "answer", "continue", "reject", "show", "wait") and args.json
 
     def interrupt(*_):
         raise KeyboardInterrupt
@@ -2173,7 +2291,7 @@ def main():
     try:
         sys.exit(commands[args.command](args, config()))
     except (Fail, OSError) as e:
-        print(f"dsk · error: {e}")
+        print(dumps({"error": str(e)}) if JSON else f"dsk · error: {e}")
         sys.exit(1)
 
 
