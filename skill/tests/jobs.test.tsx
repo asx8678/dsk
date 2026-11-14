@@ -105,6 +105,7 @@ const REPORT = [
   'checks:  python3 -m unittest discover -s tests → 0; ruff check . → 1',
   'scope:   reverted __pycache__/durations.pyc (copies in /state/1c41/reverted)',
   'changed: tests/test_durations.py (+73), durations.py (+4 -2), logo.png (binary)',
+  'context: 7.8k of 48.0k',
   'next:    dsk show 1c41 --review | dsk accept 1c41 | dsk reject 1c41 "defects"',
 ].join('\n')
 
@@ -296,7 +297,7 @@ test('a job says what it runs now, when it is quiet, and where it failed over fr
     { ...RUNNING, id: 'a001', doing: 'pytest -q', brief: 'Job one' },
     { ...RUNNING, id: 'a002', phase: 'model', act: '', active: 90, brief: 'Job two' },
     { ...RUNNING, id: 'a003', phase: 'checks', act: '', failover: 'coralbricks 429', profile: 'thirdparty', brief: 'Job three' },
-    // Its first profile was busy, so it started on the next without asking the first.
+    // Its first profile was busy, so it started on the next without asking the first: no failure, and not said.
     { ...RUNNING, id: 'a004', act: '', failover: 'coralbricks full', profile: 'opencode', brief: 'Job a004' },
     ...['a005', 'a006'].map(id => ({ ...RUNNING, id, act: '', brief: `Job ${id}` })),
   ]
@@ -312,7 +313,7 @@ test('a job says what it runs now, when it is quiet, and where it failed over fr
     '  │  ⎿  Thinking… ██       3/12 · ↑ 5.3k · ↓ 2.9k · 60% cached · quiet 1m10s',
     '  ├─ Job three · a003 · ↯ coralbricks 429 → thirdparty',
     '  │  ⎿  Checking… ██       3/12 · ↑ 5.3k · ↓ 2.9k · 60% cached',
-    '  └─ Job a004 · a004 · coralbricks busy → opencode',
+    '  └─ Job a004 · a004',
     '     ⎿  Working… ██       3/12 · ↑ 5.3k · ↓ 2.9k · 60% cached',
     '  … and 2 more running · /dsk-jobs',
   ])
@@ -485,6 +486,8 @@ test('a dsk report is drawn as a card, and a packet diff as a diff', async ($, o
       // How it stopped, its figures as the tree draws them, the provider and the id.
       '  ⎿  ⏺ ready for review · 3 turns · ↑ 6.6k · ↓ 1.2k · 66% cached · coralbricks · 1c41',
       'Added tests/test_durations.py with 11 tests; all pass.',
+      // How full the worker's context is, which decides whether the session takes a next task.
+      'context: 7.8k of 48.0k',
       // A check that passed, and one that failed with its exit code.
       '✔ python3 -m unittest discover -s tests',
       '✘ ruff check . → 1',
@@ -596,6 +599,8 @@ test('another command is left to the engine, and dsk is read less often when idl
       'dsk reject b498: 1. Fix "it"',
     'cd /repo && dsk answer b498 \'Use port 8080\'': 'dsk answer b498: Use port 8080',
     'dsk reject b498 --drop': 'dsk reject b498',
+    // A next task sent into a finished session is titled by that task.
+    'dsk continue b498 --allow "tests/**" "Now add the tests"': 'dsk continue b498: Now add the tests',
     // What comes after the dsk command is another command's, not what dsk was told.
     'dsk run --brief task.md; echo "exit=$?"': 'dsk run',
     // Words in quotes or in a here-document are text, however much they look like a call.
