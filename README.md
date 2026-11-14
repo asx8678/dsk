@@ -1,6 +1,6 @@
 # dsk
 
-A small headless CLI that Claude Code calls through Bash to hand work to DeepSeek V4.1 Flash. Claude plans and reviews; DeepSeek writes code, tests, docs and web research. One Python file, standard library only, Python 3.13 or newer. It ships as a Claude Code plugin: the skill, a reviewer agent, the review gate and a display of the jobs.
+A small headless CLI that Claude Code calls through Bash to hand work to DeepSeek V4.1 Flash. Claude plans, reviews and decides; DeepSeek scouts the code and writes it: code, tests, docs and web research. One Python file, standard library only, Python 3.13 or newer. It ships as a Claude Code plugin: the skill, a reviewer agent, the review gate and a display of the jobs.
 
 Each turn the worker sends one Python script. The script reads, edits, runs and searches through a small function API, and only what it prints comes back. A task takes about 3 turns, not 30.
 
@@ -65,6 +65,8 @@ dsk show   ID [--review | --diff | --log | --answer]
 dsk accept ID              mark as reviewed; after --worktree, apply the changes to the main tree
 dsk reject ID "defects"    send defects back into the same session; the run continues
 dsk reject ID --drop       discard the work
+dsk continue ID "task"     send the next task into a session that is done or accepted; the worker keeps its context
+        [--allow GLOB]... [--check CMD]... [--max-turns N]     (each replaces the run's; left out, it stays)
 dsk status [--hook]        this project's open sessions; --hook is the Claude Code Stop hook
 dsk status --json          the last day's sessions on any project, as JSON, for a display to poll
 dsk search "query"         raw web search, no model
@@ -80,6 +82,7 @@ dsk 7f3a · review · thirdparty · 3 turns · in 5.5k (90% cached) · out 1.5k
 summary: Added 22 tests for parse_duration and format_duration; all pass.
 checks:  python3 -m unittest discover -s tests → 0
 changed: tests/test_durations.py (+128)
+context: 7.1k of 48.0k
 next:    dsk show 7f3a --review | dsk accept 7f3a | dsk reject 7f3a "defects"
 ```
 
@@ -119,9 +122,11 @@ next:    dsk show 7f3a --review | dsk accept 7f3a | dsk reject 7f3a "defects"
 - *Research:* every URL in an answer must have been returned by `search()` or opened by `fetch()` in the session; others are listed as unverified.
 - *Review:* the Stop hook (`dsk status --hook`) exits 2 while a session started by the current Claude Code session is in `review`.
 
-**Worktrees.** `--worktree` runs the task in a fresh git worktree seeded with your uncommitted state. `accept` applies the worker's diff to the main tree with `git apply`: changes land uncommitted, a conflict is refused as a whole, and it waits for any in-place run in that tree. In place, `reject --drop` reverse-applies the worker's diff and refuses if those files have moved.
+**Worktrees.** `--worktree` runs the task in a fresh git worktree seeded with your uncommitted state. `accept` applies the worker's diff to the main tree with `git apply`: changes land uncommitted, a conflict is refused as a whole, and it waits for any in-place run in that tree. In place, `reject --drop` reverse-applies the worker's diff and refuses if those files have moved. A worktree run that ends `done` changed nothing, so its worktree and branch are removed at once.
 
-**Providers.** A session starts on the first profile in `route`. On 402, or when retries of a network failure, 408, 429 or 5xx are used up, it continues on the next profile in a new series. A 400 whose message mentions a limit is treated as a 429, because one gateway reports its concurrency limit that way. A profile with `max_sessions` N has N slots, file locks in `~/.local/state/dsk/slots/`; a run holds one from its first request on that profile until its `dsk` process exits. Profiles that reach the same `base_url` with the same `key_env` share one set of slots, limited by the smallest `max_sessions` among them. When all are taken, the run moves to the next profile without sending a request, or, on the last profile in the route, waits for a slot; the display shows such a skip as `coralbricks busy → opencode`, and a real failover as `↯ coralbricks 429 → opencode`. `dsk doctor` takes a slot too, and leaves a profile unchecked while running jobs hold all of its slots. An error that says the credit or quota is used up is not retried: a 402, or a 400, 403 or 429 whose message mentions quota, credit, balance, billing, payment, allowance or a usage limit, but not concurrency, "at a time" or a rate limit. The profile is then paused until the reset time the message names (if within a week), or for its `pause_hours`. Every run skips a paused profile without sending a request, except the last profile in the route, which is always tried. Pauses are files in `~/.local/state/dsk/paused/`; `dsk configure` shows them, and deleting one ends it. A reply with no `finish_reason` whose output reached `max_tokens` counts as cut off (`length`), because one gateway leaves the field empty.
+**Continuing.** `dsk continue ID "task"` sends a next task into a session that is `done` or `accepted`: the same conversation, so the worker keeps what it has read and the request still extends the cached prefix. It logs a `base` record with the round's own terms (`--allow`, `--check`, `--max-turns`, each kept from before when left out) and a new start snapshot, so the review packet, `accept` and `reject --drop` deal with that round's changes only. A worktree that `accept` or `done` removed is built again from the main tree as it is now, and the earlier round's `@answer` is kept aside as `answer.N` in the session directory. After a compaction the worker's first message carries the current task and the terms of its round, and the digest lists the earlier tasks as finished. Every report has a measured `context:` line, the size of the next request against the profile's `compact_at`, with the number of compactions so far: it is what tells the lead to start a fresh run instead.
+
+**Providers.** A session starts on the first profile in `route`. On 402, or when retries of a network failure, 408, 429 or 5xx are used up, it continues on the next profile in a new series. A 400 whose message mentions a limit is treated as a 429, because one gateway reports its concurrency limit that way. A profile with `max_sessions` N has N slots, file locks in `~/.local/state/dsk/slots/`; a run holds one from its first request on that profile until its `dsk` process exits. Profiles that reach the same `base_url` with the same `key_env` share one set of slots, limited by the smallest `max_sessions` among them. When all are taken, the run moves to the next profile without sending a request, or, on the last profile in the route, waits for a slot; the display says nothing of such a skip, and shows a real failover as `↯ coralbricks 429 → opencode`. `dsk doctor` takes a slot too, and leaves a profile unchecked while running jobs hold all of its slots. An error that says the credit or quota is used up is not retried: a 402, or a 400, 403 or 429 whose message mentions quota, credit, balance, billing, payment, allowance or a usage limit, but not concurrency, "at a time" or a rate limit. The profile is then paused until the reset time the message names (if within a week), or for its `pause_hours`. Every run skips a paused profile without sending a request, except the last profile in the route, which is always tried. Pauses are files in `~/.local/state/dsk/paused/`; `dsk configure` shows them, and deleting one ends it. A reply with no `finish_reason` whose output reached `max_tokens` counts as cut off (`length`), because one gateway leaves the field empty.
 
 **State** lives in `~/.local/state/dsk/<id>/`: the log, full turn outputs, the answer, the worktree and a lock.
 
@@ -185,7 +190,7 @@ Measured on 2026-11-11 with `deepseek-flash` on the official API and `deepseek-v
 ## Tests
 
 ```
-python3 -m unittest discover -s tests     # 83 tests against a scripted API server and temp git repositories
+python3 -m unittest discover -s tests     # 101 tests against a scripted API server and temp git repositories
 python3 tests/live.py --table             # real toy tasks on the real providers; costs a few cents
 ```
 
