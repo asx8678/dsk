@@ -707,7 +707,7 @@ def run_script(s, cfg, env, turn, script):
                                 cwd=s.head["workdir"], env=env, stdin=subprocess.DEVNULL, stdout=out, stderr=out,
                                 pass_fds=[theirs.fileno()], start_new_session=True)
     theirs.close()
-    job = {"dir": s.dir, "script": script, "allow": s.head["allow"], "web": s.head["web"], "sh_deny": cfg["sh_deny"]}
+    job = {"dir": s.dir, "script": script, "allow": scope(s)["allow"], "web": s.head["web"], "sh_deny": cfg["sh_deny"]}
     s.shelled = None
     deadline, buffer, running, error, stop, ended = time.time() + limit, b"", None, "", None, False
     try:
@@ -777,13 +777,18 @@ def tree(s):
     return snapshot(s.head["workdir"], os.path.join(s.dir, "index"))
 
 
+def scope(s):
+    """The terms of the round in flight: the last `base` record's, or the head's when the lead sent no next task."""
+    return s.last("base") or s.head
+
+
 def settle(s, before, turn=None):
     """Attribute to the worker what changed since the tree `before`, taken just before a script or the checks
     ran: edits anyone else makes between turns are never the worker's. Changes outside --allow are undone, and a
     copy of what is undone stays in the session directory. Logs the result and returns the reverted paths."""
     if not before:
         return []
-    workdir, allowed = s.head["workdir"], matcher(s.head["allow"])
+    workdir, allowed = s.head["workdir"], matcher(scope(s)["allow"])
     listing = git(workdir, "diff", "--name-status", "--no-renames", "-z", before, tree(s)).split("\0")
     pairs, calls = list(zip(listing[0::2], listing[1::2])), [r for r in s.of("ledger") if r["turn"] == turn]
     if turn and not getattr(s, "shelled", None):
@@ -811,7 +816,7 @@ def settle(s, before, turn=None):
 def span(s):
     """Open a window in which changes are the worker's. It is logged before anything runs, so that a run which
     dies in the middle can still be settled by the next command on the session."""
-    before = s.head["start"] and tree(s)
+    before = scope(s)["start"] and tree(s)
     if before:
         s.add("span", before=before)
     return before
@@ -819,11 +824,11 @@ def span(s):
 
 def gates(s, cfg, env):
     """After done(): the checks, run by dsk itself. Returns what failed, for the worker, or ''."""
-    if not s.head["checks"]:
+    if not scope(s)["checks"]:
         return ""
     before, results, problem = span(s), [], ""
     try:
-        for cmd in s.head["checks"]:
+        for cmd in scope(s)["checks"]:
             s.add("doing", arg=cmd)
             code, out = shell(cmd, cfg["limits"]["turn_seconds"], env, s.head["workdir"])
             results.append([cmd, code])
@@ -840,10 +845,11 @@ def changes(s):
     """(The tree of the working directory now, [added, deleted, path] for each file the worker changed since the
     start.) A file that only someone else changed during the run is not part of the worker's change set."""
     head = s.head
-    if not head["start"]:
+    if not scope(s)["start"]:
         return None, []
-    end, touched = tree(s), {path for g in s.of("gate") for path in g.get("touched", [])}
-    stat = git(head["workdir"], "diff", "--numstat", "--no-renames", "-z", head["start"], end)
+    windows = s.since("base", "gate") if s.last("base") else s.of("gate")
+    end, touched = tree(s), {path for g in windows for path in g.get("touched", [])}
+    stat = git(head["workdir"], "diff", "--numstat", "--no-renames", "-z", scope(s)["start"], end)
     return end, [entry.split("\t") for entry in stat.split("\0") if entry and entry.split("\t")[2] in touched]
 
 
@@ -877,6 +883,9 @@ def digest(recs, upto, changed):
     answers = iter([r["text"] for r in recs if r["t"] == "answer"])
     out = [f"## Digest of turns 1-{upto}, whose messages were dropped"]
     out += [f"note: {r['arg']}" for r in ledger if r["fn"] == "note"]
+    bases = [r for r in recs if r["t"] == "base"]
+    finished = ([recs[0].get("brief") or ""] + [r["task"] for r in bases[:-1]]) if bases else []  # no base: nothing is finished
+    out += [f"earlier task, finished: {' '.join(task.split())[:300]}" for task in finished if task.strip()]
     for r in ledger:
         if r["fn"] == "ask":
             out += [f"you asked: {r['arg']}", f"the lead answered: {next(answers, '(not yet)')}"]
@@ -891,7 +900,9 @@ def compaction(recs, changed):
     attached files, then the last two turns verbatim. No model call: the same log always compacts to the same bytes."""
     msgs = series_msgs(recs)
     turn = msgs[-1]["turn"]
-    first = {"role": "user", "content": first_message(recs[0], digest(recs, turn - 2, changed))}
+    base = next((r for r in reversed(recs) if r["t"] == "base"), None)
+    first = {"role": "user", "content": first_message({**recs[0], **base, "brief": base["task"]} if base else recs[0],
+                                                      digest(recs, turn - 2, changed))}
     kept = [{"turn": 0, "m": msgs[0]["m"]}, {"turn": 0, "m": first},
             *({"turn": r["turn"], "m": r["m"]} for r in msgs if r["turn"] >= turn - 1)]
     gone = [path for path, text in recs[0]["files"] if len(text) > KEEP]
@@ -918,15 +929,20 @@ def compact(s, cfg):
 
 # ---------------------------------------------------------------- the worker loop
 
+def run_header(terms, web, date):
+    """The lines that say what a run may change, what it must pass and how long it may take."""
+    return "\n".join(["## Run", "allow: " + (", ".join(terms["allow"]) or "(none: this run is read-only)"),
+                       *[f"check: {cmd}" for cmd in terms["checks"]], f"web: {'on' if web else 'off'}",
+                       f"turn limit: {terms['max_turns']}", f"date: {date}"])
+
+
 def first_message(head, digest=""):
     """DSK.md, run header, attached files, brief: most stable first, so sessions share the longest prefix."""
-    run = ["## Run", "allow: " + (", ".join(head["allow"]) or "(none: this run is read-only)"),
-           *[f"check: {cmd}" for cmd in head["checks"]], f"web: {'on' if head['web'] else 'off'}",
-           f"turn limit: {head['max_turns']}", f"date: {head['date']}"]
+    run = run_header(head, head["web"], head["date"])
     files = [f'<attached path="{path}">\n{text}\n</attached>' for path, text in head["files"]
              if not digest or len(text) <= KEEP]  # compaction drops the large attached copies
     facts = f'<attached path="DSK.md">\n{head["dsk_md"]}\n</attached>' if head["dsk_md"] else ""
-    return "\n\n".join(filter(None, [facts, "\n".join(run), *files, "## Task\n" + head["brief"], digest]))
+    return "\n\n".join(filter(None, [facts, run, *files, "## Task\n" + head["brief"], digest]))
 
 
 def take_turn(s, cfg, env, turn, reply, finish):
@@ -963,7 +979,7 @@ def said(message):
 
 def loop(s, cfg, extra=""):
     """Drive the session to its next stop. `extra` is the lead's text, appended to the pending turn result."""
-    head, limits, started, failures = s.head, cfg["limits"], time.time(), 0
+    limits, started, failures = cfg["limits"], time.time(), 0
     env = clean_env(cfg, s.dir)
     while True:
         pending = s.last("result", "msg")
@@ -979,7 +995,7 @@ def loop(s, cfg, extra=""):
         reply, finish = chat(s, cfg)
         turn = s.turn + 1
         s.add("msg", turn=turn, m=reply)
-        left = max(0, head["max_turns"] - len(s.since("round", "result")) - 1)
+        left = max(0, scope(s)["max_turns"] - len(s.since("round", "result")) - 1)
         repeated = said(reply) == previous
         if repeated:
             body, failed, stop = "not run: this reply is identical to your previous one", "repeat", None
@@ -1011,7 +1027,8 @@ def loop(s, cfg, extra=""):
 EXIT = {"question": 2, "stuck": 3, "limit": 3, "error": 1}
 TAKE_OVER = 'dsk show {id} --diff | dsk accept {id} | dsk reject {id} "guidance" | dsk reject {id} --drop'
 NEXT = {"review": 'dsk show {id} --review | dsk accept {id} | dsk reject {id} "defects"',
-        "question": 'dsk answer {id} "..."', "done": "dsk show {id} --answer", "stuck": TAKE_OVER, "limit": TAKE_OVER,
+        "question": 'dsk answer {id} "..."', "done": 'dsk show {id} --answer | dsk continue {id} "next task"',
+        "stuck": TAKE_OVER, "limit": TAKE_OVER,
         "error": "dsk show {id} --log | dsk reject {id} --drop"}
 
 
@@ -1041,10 +1058,10 @@ def worker_diff(s, *flags, since=None):
     """The worker's change set: its files, from the start snapshot (or the tree `since`) to its last stop."""
     st = s.last("state")
     paths = [":(literal)" + path for _, _, path in st.get("changed") or []]
-    return git(s.head["root"], "diff", *flags, since or s.head["start"], st["end"], "--", *paths) if paths else ""
+    return git(s.head["root"], "diff", *flags, since or scope(s)["start"], st["end"], "--", *paths) if paths else ""
 
 
-def report(s, review=False):
+def report(s, review=False, cfg=None):
     """The short report for the session's last stop, or the review packet. `summary`, `answer`, `question` and
     `notes` are the worker's words; every other line is measured."""
     st, usage, ledger, checks = s.last("state"), s.of("usage"), s.of("ledger"), s.last("checks") or {"results": []}
@@ -1059,8 +1076,8 @@ def report(s, review=False):
         if text:
             lines.append(f"{label + ':':<8} {text}")
 
-    line("brief", review and s.head["brief"])
-    line("allow", review and ", ".join(s.head["allow"]))
+    line("brief", review and (scope(s).get("task") or s.head["brief"]))
+    line("allow", review and ", ".join(scope(s)["allow"]))
     line("where", review and s.head["worktree"] and s.head["workdir"])
     line("question", st.get("question"))
     line("error", st.get("error") or (st["status"] == "running" and status == "error" and "interrupted: its dsk process is gone"))
@@ -1079,8 +1096,14 @@ def report(s, review=False):
     late = [u for u in usage if u["turn"] > 3]
     if cached_share(late) is not None and cached_share(late) < 0.8:
         line("cache", f"low ({cached_share(late):.0%} cached after turn 3)")
+    last = s.last("usage")
+    if cfg and last:  # how full the next request would be, against the point where dsk compacts the series
+        compacts = sum(r["why"] == "compact" for r in s.of("series"))
+        line("context", f"{kilo(last['prompt'] + last['out'])} of {kilo(cfg['profiles'].get(s.profile, {}).get('compact_at', 32000))}"
+                        + (f" · compacted {compacts}×" if compacts else ""))
     if partial:
-        seen = [r["end"] for r in s.of("state") if r["status"] == "review"][:-1] if status == "review" else []
+        reviews = s.since("base", "state") if s.last("base") else s.of("state")
+        seen = [r["end"] for r in reviews if r["status"] == "review"][:-1] if status == "review" else []
         diff, cap = worker_diff(s, since=seen[-1] if seen else None).splitlines(), 300 if review else 120
         lines += [f"diff since your last review (the whole diff: dsk show {s.id} --diff)"] * bool(seen)
         lines += diff[:cap] + [f"... {len(diff) - cap} more diff lines: dsk show {s.id} --diff"] * (len(diff) > cap)
@@ -1104,7 +1127,9 @@ def drive(s, cfg, extra=""):
             halt(s, "error", error=message)
         except Fail:
             s.add("state", status="error", error=message)
-    print(report(s))
+    if s.status() == "done" and s.head["worktree"]:  # nothing was changed: there is nothing left to accept
+        remove_worktree(s.head)
+    print(report(s, cfg=cfg))
     return EXIT.get(s.status(), 0)
 
 
@@ -1148,6 +1173,14 @@ def project_root():
     return top.stdout.strip() if top.returncode == 0 else None
 
 
+def make_worktree(s, root, workdir):
+    """A worktree at `workdir`, on branch dsk/<id>, holding the main tree as it is now, uncommitted state and all."""
+    seed = git(root, "diff", "--binary", "HEAD", snapshot(root, os.path.join(s.dir, "index.main")))
+    git(root, "worktree", "add", "-q", "-b", f"dsk/{s.id}", workdir, "HEAD")
+    if seed:
+        git(workdir, "apply", stdin=seed)
+
+
 def cmd_run(args, cfg):
     if bool(args.text) == bool(args.brief):
         raise Fail('give the brief as "text" or with --brief FILE, not both')
@@ -1178,10 +1211,7 @@ def cmd_run(args, cfg):
         start = None
         if args.worktree:
             workdir = os.path.join(s.dir, "wt")
-            seed = git(root, "diff", "--binary", "HEAD", snapshot(root, os.path.join(s.dir, "index.main")))  # my uncommitted state
-            git(root, "worktree", "add", "-q", "-b", f"dsk/{s.id}", workdir, "HEAD")
-            if seed:
-                git(workdir, "apply", stdin=seed)
+            make_worktree(s, root, workdir)
         if root:
             start = snapshot(workdir, os.path.join(s.dir, "index"))
     except BaseException:
@@ -1219,9 +1249,37 @@ def cmd_show(args, cfg):
         text = "\n".join(f"-- new series: {r['why']} on {r['profile']}" if r["t"] == "series" else turn_line(s, r["turn"])
                          for r in s.of("series", "result"))
     else:
-        text = report(s, args.review)
+        text = report(s, args.review, cfg)
     print(text.rstrip("\n"))
     return 0
+
+
+def cmd_continue(args, cfg):
+    """Give a finished session the lead's next task: same conversation, new terms, fresh round."""
+    s = resume(args.id, "done", "accepted")
+    head = s.head
+    if args.allow and head["start"] is None:
+        raise Fail("--allow needs a git repository")
+    allow, checks = args.allow or scope(s)["allow"], args.check or scope(s)["checks"]
+    turns = args.max_turns or scope(s)["max_turns"]
+    if head["worktree"] and not os.path.isdir(head["workdir"]):
+        # accept applied the last round and removed the worktree, so build a fresh one from the tree as it is now
+        remove_worktree(head)
+        for name in ("index", "index.main"):
+            path = os.path.join(s.dir, name)
+            if os.path.exists(path):
+                os.remove(path)
+        make_worktree(s, head["root"], head["workdir"])
+    answer = os.path.join(s.dir, "answer")
+    if os.path.exists(answer):  # the last round's @answer would answer for this one, in the report and in the gate
+        os.replace(answer, f"{answer}.{len(s.of('base')) + 1}")
+    start = tree(s) if head["start"] else None
+    s.add("base", start=start, allow=allow, checks=checks, max_turns=turns, task=args.text)
+    s.add("round")
+    extra = ("\n\nthe lead has the next task for this session. What you did before stands.\n\n"
+             + run_header({"allow": allow, "checks": checks, "max_turns": turns}, head["web"], str(datetime.date.today()))
+             + "\n\n## Task\n" + args.text)
+    return drive(s, cfg, extra)
 
 
 def cmd_accept(args, cfg):
@@ -1290,11 +1348,12 @@ def job(s, cfg):
             "doing": " ".join(last["arg"].split())[:80] if last["t"] == "doing" and status == "running" else "",
             "failover": next((f"{a['profile']} {b['status'] or 'network'}" for a, b in reversed(list(zip(series, series[1:])))
                               if b["why"] == "failover"), ""), "cost": cost,
-            "turn": len(s.since("round", "result")), "max_turns": head["max_turns"], "turns": s.turn,
+            "turn": len(s.since("round", "result")), "max_turns": scope(s)["max_turns"], "turns": s.turn,
             "in": sum(u["prompt"] for u in usage), "out": sum(u["out"] for u in usage), "cached": cached_share(usage),
             "act": " ".join(f"{acts[-1]['fn']} {acts[-1]['arg']}".split())[:80] if acts else "",
             "note": " ".join(str(st.get("question") or st.get("why") or st.get("error") or "").split())[:160],
-            "changed": len(st.get("changed") or []), "brief": " ".join(head["brief"].split())[:300],
+            "changed": len(st.get("changed") or []),
+            "brief": " ".join((scope(s).get("task") or head["brief"]).split())[:300],
             "owner": head["owner"], "root": head["root"], "worktree": head["worktree"], "created": head["created"],
             "active": os.path.getmtime(s.path)}
 
@@ -1501,6 +1560,10 @@ def main():
     for flag, text in (("review", "the review packet"), ("diff", "the worker's whole diff"),
                        ("log", "tokens and actions per turn"), ("answer", "the whole answer")):
         view.add_argument("--" + flag, action="store_true", help=text)
+    cont = command("continue", "give a finished session its next task", "id", "text")
+    cont.add_argument("--allow", action="append", default=[], metavar="GLOB", help="paths the worker may change")
+    cont.add_argument("--check", action="append", default=[], metavar="CMD", help="acceptance test, run by dsk")
+    cont.add_argument("--max-turns", type=int, help="turns this round may take")
     command("accept", "mark as reviewed; after --worktree, apply the changes", "id")
     reject = command("reject", "send defects back, or --drop the work", "id")
     reject.add_argument("text", nargs="?", help="the defects, as a numbered list")
@@ -1515,7 +1578,8 @@ def main():
     configure.add_argument("--hook", action="store_true", help="act as a Claude Code hook: store the plugin's options first")
     configure.add_argument("--announce", action="store_true", help="with --hook: say what is still missing")
     configure.add_argument("--data", metavar="DIR", help="with --hook: the plugin's data folder")
-    commands = {"run": cmd_run, "answer": cmd_answer, "show": cmd_show, "accept": cmd_accept, "reject": cmd_reject,
+    commands = {"run": cmd_run, "answer": cmd_answer, "show": cmd_show, "continue": cmd_continue,
+                "accept": cmd_accept, "reject": cmd_reject,
                 "status": cmd_status, "search": cmd_web, "fetch": cmd_web, "doctor": cmd_doctor, "configure": cmd_configure}
     args = parser.parse_args()
     VERBOSE = args.verbose
