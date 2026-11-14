@@ -4,7 +4,7 @@ Run from the project root:  python3 -m unittest discover -s tests
 The scripted server covers what a real API cannot produce on demand (a 402, a cut-off reply, exact request
 bytes); tests/live.py runs real tasks against the real providers.
 """
-import ast, importlib.util, json, os, shutil, subprocess, sys, tempfile, threading, unittest
+import ast, importlib.util, json, os, shutil, subprocess, sys, tempfile, threading, time, unittest
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from unittest import mock
 
@@ -46,7 +46,8 @@ class FakeAPI:
 
             def do_POST(self):
                 raw = self.rfile.read(int(self.headers["Content-Length"]))
-                api.requests.append({"path": self.path, "raw": raw, "key": self.headers["Authorization"]})
+                api.requests.append({"path": self.path, "raw": raw, "key": self.headers["Authorization"],
+                                     "headers": {k.lower(): v for k, v in self.headers.items()}})
                 status, payload, blank = api.answer(self.path, json.loads(raw))
                 self.send_response(status)
                 self.send_header("Content-Type", "application/json")
@@ -210,6 +211,68 @@ class Wire(Case):
         self.assertEqual(len(raws), 3)
         self.assertEqual(len(set(raws)), 1)
         self.assertEqual(len(s.of("req")), 1)
+
+    def test_profile_headers_hold_one_session_value_for_the_whole_run(self):
+        self.config["profiles"]["a"]["headers"] = {"x-opencode-session": "{session}", "x-fixed": "1"}
+        self.write_config()
+        self.api.replies = ["one", "two", "another run", {"status": 503}, {"status": 503}, {"status": 503}, "from b"]
+        s = self.session()
+        dsk.chat(s, dsk.config())
+        dsk.chat(dsk.Session(s.id), dsk.config())  # a later process, as after `dsk reject` or `dsk answer`
+        dsk.chat(self.session(), dsk.config())
+        moved = self.session()
+        dsk.chat(moved, dsk.config())
+        sent = [r["headers"] for r in self.api.chats()]
+        first, again, other = (h["x-opencode-session"] for h in sent[:3])
+        self.assertTrue(first.startswith(f"dsk-{s.id}-"))
+        self.assertEqual(first, again)
+        self.assertNotEqual(first, other)
+        self.assertEqual(sent[0]["x-fixed"], "1")
+        self.assertEqual(moved.profile, "b")  # a profile without `headers` sends only the usual three
+        self.assertNotIn("x-opencode-session", sent[-1])
+        self.assertEqual(sent[-1]["user-agent"], "dsk")
+
+    def test_only_errors_about_used_up_credit_count_as_spent(self):
+        for status, text in ((402, "Insufficient Balance"), (429, "You exceeded your current quota"),
+                             (400, "Go usage limit reached for this 5-hour window"), (403, "credit balance is too low"),
+                             (429, "Monthly token quota exceeded")):
+            self.assertTrue(dsk.spent(status, text), text)
+        for status, text in ((429, "[code=tier_limit_exceeded] membership concurrency limit exceeded: 11/10"),
+                             (429, "Your subscription allows 1 request at a time on this key"),
+                             (403, "This subscription key can only call deepseek-v4.1-flash-value."),
+                             (429, "Rate limit reached, slow down"), (500, "quota service unavailable"),
+                             (400, "This model's maximum context length limit exceeded: 1100000 tokens"),
+                             (400, "request size limit exceeded"), (400, "max_tokens limit exceeded: 400000 > 384000"),
+                             (400, "Prompt is too long: token limit exceeded")):
+            self.assertFalse(dsk.spent(status, text), text)
+
+    def test_used_up_credit_pauses_the_profile_for_every_run(self):
+        self.api.replies = [{"status": 402, "error": "Insufficient Balance"}, "from b", "b again"]
+        self.assertEqual(dsk.chat(self.session(), dsk.config())[0]["content"], "from b")
+        later = self.session()
+        self.assertEqual(dsk.chat(later, dsk.config())[0]["content"], "b again")
+        self.assertEqual([r["path"] for r in self.api.chats()], ["/a/chat/completions"] + ["/b/chat/completions"] * 2)
+        self.assertEqual(later.of("series")[-1]["status"], "paused")  # skipped without a request
+        self.assertAlmostEqual(dsk.paused("a"), time.time() + 3600, delta=60)  # pause_hours defaults to 1
+        shown = subprocess.run([sys.executable, DSK, "configure"], env=self.env, capture_output=True, text=True).stdout
+        self.assertRegex(shown, r"a:\s+\S+ · model-a · key set · paused until .*, credit used up")
+
+    def test_a_pause_ends_at_the_reset_time_the_error_names_and_the_last_profile_is_always_tried(self):
+        reset = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(time.time() + 7200))
+        self.api.replies = [{"status": 429, "error": f"usage limit reached, resets {reset}"}, "from b", "a anyway"]
+        self.assertEqual(dsk.chat(self.session(), dsk.config())[0]["content"], "from b")
+        self.assertEqual(len(self.api.chats()), 2)  # a spent 429 is not retried
+        self.assertAlmostEqual(dsk.paused("a"), time.time() + 7200, delta=5)
+        self.assertEqual(dsk.chat(self.session(route=["a"]), dsk.config())[0]["content"], "a anyway")
+        with open(os.path.join(dsk.STATE, "paused", "a"), "w") as f:
+            json.dump({"until": time.time() - 1}, f)
+        self.assertEqual(dsk.paused("a"), 0)
+
+    def test_a_reply_cut_off_without_a_finish_reason_counts_as_length(self):
+        self.api.replies = [{"content": "long", "finish": None, "usage": {"completion_tokens": dsk.MAX_TOKENS["off"]}},
+                            {"content": "short", "finish": None, "usage": {"completion_tokens": 5}}]
+        self.assertEqual(dsk.chat(self.session(), dsk.config())[1], "length")
+        self.assertIsNone(dsk.chat(self.session(), dsk.config())[1])
 
     def test_interrupted_generation_is_retried(self):
         self.api.replies = [{"content": "half", "finish": "aborted"}, "whole"]
