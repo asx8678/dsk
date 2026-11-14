@@ -5,8 +5,8 @@ Claude plans and reviews, DeepSeek writes. Each turn the worker replies with one
 Python script; dsk runs it and sends back only what it printed. One file,
 standard library only. See README.md for the protocol.
 """
-import argparse, ast, datetime, fcntl, hashlib, http.client, json, os, re, secrets, select, shlex, shutil, signal
-import socket, subprocess, sys, tempfile, time, traceback, types, urllib.error, urllib.request
+import argparse, ast, builtins, datetime, fcntl, hashlib, http.client, json, os, re, secrets, select, shlex, shutil, signal
+import socket, subprocess, sys, tempfile, threading, time, traceback, types, urllib.error, urllib.request
 
 if sys.version_info < (3, 13):  # this file parses on older Pythons, so that it can say so, or hand over to a newer one
     newer = next(filter(None, map(shutil.which, ("python3.15", "python3.14", "python3.13"))), None)
@@ -76,7 +76,13 @@ DEFAULTS = {
                 "helm upgrade", "helm uninstall", "pip install", "npm install"],
     "env_pass": [],
     "backoff": [2, 6, 18],
-    "limits": {"turn_seconds": 600, "run_seconds": 3600, "run_tokens": 2000000},
+    # route_order: "listed" tries the route as written; "fastest" tries the measured fastest first, measuring
+    # first whenever a profile of the route has no measurement younger than bench_minutes
+    "route_order": "listed",
+    "bench_minutes": 15,
+    # output_chars and read_chars: how much of what a turn printed goes back to the worker, for a turn that only reads
+    # files and for any other
+    "limits": {"turn_seconds": 600, "run_seconds": 3600, "run_tokens": 2000000, "output_chars": 6000, "read_chars": 24000},
 }
 
 
@@ -230,7 +236,7 @@ class Session:
                 raise Fail(f"no session {sid}") from None
 
     def add(self, t, **fields):
-        rec = {"t": t, **fields}
+        rec = {"t": t, **fields, "at": round(time.time(), 3)}  # last, so it replaces the `at` a close() copies in
         with open(self.path, "a", encoding="utf-8") as f:
             f.write(json.dumps(rec, ensure_ascii=False) + "\n")
         self.recs.append(rec)
@@ -297,13 +303,13 @@ def request_body(profile, effort, msgs):
     return dumps({k: v for k, v in body.items() if v is not None})
 
 
-def send(url, key, payload, extra=None):
+def send(url, key, payload, extra=None, timeout=600):
     """One POST. Returns (status, parsed JSON) on success, else (status, error text); status 0 is a network failure."""
     headers = {"Authorization": "Bearer " + key, "Content-Type": "application/json", "User-Agent": "dsk",
                **(extra or {})}
     req = urllib.request.Request(url, payload.encode(), headers)
     try:
-        with urllib.request.urlopen(req, timeout=600) as r:
+        with urllib.request.urlopen(req, timeout=timeout) as r:
             return r.status, json.loads(r.read())  # blank keep-alive lines before the body are JSON whitespace
     except urllib.error.HTTPError as e:
         with e:
@@ -438,6 +444,120 @@ def release(cfg, name):
         held.close()
 
 
+# ---------------------------------------------------------------- provider speed
+
+BENCH_PROMPT = "Speed test. Reply with one run_code call whose code is print(1)."
+
+
+def speeds():
+    """The last measurement of every profile, {name: {"seconds", "why", "at"}}; {} when there is none or it is broken."""
+    try:
+        with open(os.path.join(STATE, "speed.json"), encoding="utf-8") as f:
+            found = json.load(f)
+    except (OSError, ValueError):
+        return {}
+    return found if isinstance(found, dict) else {}
+
+
+def probe(cfg, name):
+    """Time profile `name` with two small requests: {"seconds": the smaller one, rounded, or None, "why": why not}."""
+    profile = cfg["profiles"][name]
+    key = secret(profile["key_env"])
+    if not key:
+        return {"seconds": None, "why": "no key"}
+    if paused(name):
+        return {"seconds": None, "why": "paused"}
+    if not claim_slot(cfg, name):
+        return {"seconds": None, "why": "busy"}
+    try:
+        url = profile["base_url"].rstrip("/") + "/chat/completions"
+        msgs = [{"role": "system", "content": SYSTEM}, {"role": "user", "content": BENCH_PROMPT}]
+        body, sent = request_body(profile, "off", msgs), headers(profile, "dsk-bench-" + secrets.token_hex(4))
+        times = []
+        for _ in range(2):  # send(), not post(): a retry would time the backoff, not the provider
+            started = time.monotonic()
+            status, data = send(url, key, body, sent, timeout=30)
+            if status != 200:
+                return {"seconds": None, "why": f"HTTP {status}" if status else "no answer"}
+            times.append(time.monotonic() - started)
+        return {"seconds": round(min(times), 2), "why": ""}
+    finally:
+        release(cfg, name)
+
+
+def bench(cfg, names):
+    """Probe the profiles at the same time, one thread each, and merge the result into STATE/speed.json."""
+    results = {}
+
+    def one(name):
+        try:
+            results[name] = probe(cfg, name)
+        except Exception:  # one profile must never take the whole benchmark down with it
+            results[name] = {"seconds": None, "why": "no answer"}
+
+    threads = [threading.Thread(target=one, args=(name,)) for name in names]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join()
+    found, now = speeds(), time.time()
+    for name, result in results.items():
+        old = found.get(name) or {}
+        if result["why"] == "busy" and old.get("seconds") is not None:
+            # whatever holds the slot is busy, not slower: keep its time, and `busy` says the time is an older one
+            found[name] = {"seconds": old["seconds"], "why": "busy", "at": old["at"]}
+        else:
+            found[name] = {"seconds": result["seconds"], "why": result["why"], "at": now}
+    path = os.path.join(STATE, "speed.json")
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    with open(f"{path}.{os.getpid()}", "w", encoding="utf-8") as f:
+        json.dump(found, f)
+    os.replace(f"{path}.{os.getpid()}", path)
+    return found
+
+
+def ago(seconds):
+    """How long ago, for the line about a kept measurement: whole minutes up to an hour and a half, else hours."""
+    minutes = max(0, int(seconds // 60))
+    return f"{minutes}m" if minutes < 90 else f"{round(minutes / 60)}h"
+
+
+def speed_text(entry, now=None):
+    """What one profile's line says: its time, or why it has none, and a busy profile's last time and when."""
+    if entry.get("seconds") is None:
+        return entry.get("why") or "no answer"
+    text = f"{entry['seconds']:.2f}s"
+    if entry.get("why") == "busy":
+        return f"busy (last {text}, {ago((now or time.time()) - (entry.get('at') or 0))} ago)"
+    return text
+
+
+def fast_order(found, route):
+    """`route` fastest first: the profiles with a time by ascending time, then the rest as they are listed."""
+    timed = sorted((name for name in route if (found.get(name) or {}).get("seconds") is not None),
+                   key=lambda name: found[name]["seconds"])
+    return timed + [name for name in route if name not in timed]
+
+
+def ordered_route(cfg, route):
+    """The route to try: as listed, or fastest first from measurements fresh enough to trust (measuring first)."""
+    if cfg.get("route_order", "listed") != "fastest" or len(route) < 2:
+        return list(route)  # a route of one profile has nothing to order
+    os.makedirs(STATE, exist_ok=True)
+    handle = open(os.path.join(STATE, "bench.lock"), "w")
+    try:
+        fcntl.flock(handle, fcntl.LOCK_EX)  # waits: runs started together measure once, not once each
+        found, fresh = speeds(), time.time() - 60 * float(cfg.get("bench_minutes", 15))
+        stale = [name for name in route if (found.get(name) or {}).get("at", 0) < fresh]
+        if stale:
+            found = bench(cfg, stale)
+            print("bench:   " + " · ".join(f"{name} {speed_text(found.get(name) or {})}" for name in stale),
+                  file=sys.stderr)
+    finally:
+        handle.close()
+    return fast_order(found, route)
+
+
 # ---------------------------------------------------------------- reply parser and AST gate
 
 NUDGE = ("Nothing was run: your reply was not exactly one run_code call with a `code` string. Reply with one "
@@ -445,6 +565,9 @@ NUDGE = ("Nothing was run: your reply was not exactly one run_code call with a `
 TRUNCATED = ("Your reply reached the output limit and was cut off, so nothing was run. Take smaller steps: write "
              "one file per script, and use edit() for small changes.")
 ONE_CALL = "not run: send exactly one run_code call per reply"
+REPEAT = ("not run: this reply is identical to your previous one. If the work is finished, call done() with the "
+          "result; otherwise send a different script.")
+CUT_OFF = {"role": "assistant", "content": "(my reply was cut off at the output limit and was not kept)"}
 BANNED = {"open": "read() or write()", "exec": "plain code", "eval": "plain code", "compile": "plain code",
           "__import__": "an import statement", "input": "ask()"}
 HINTS = {"os": "sh(), glob() and read()", "sys": "print() and done()", "subprocess": "sh()", "shutil": "sh()",
@@ -473,7 +596,7 @@ def gate(script):
         if isinstance(node, (ast.Import, ast.ImportFrom)):
             imported = [a.name for a in node.names]
             for module in imported if isinstance(node, ast.Import) else [node.module or "."]:
-                if module.split(".")[0] not in IMPORTS:
+                if module.split(".")[0] not in IMPORTS + ("glob",):  # glob is our function: `import glob` is harmless
                     hint = HINTS.get(module.split(".")[0], "sh('python3 ...') to run the project's own code")
                     return f"import {module} is not allowed; use {hint}"
             names = imported if isinstance(node, ast.ImportFrom) else []
@@ -490,7 +613,6 @@ def gate(script):
 GIT_READ_ONLY = ("status", "diff", "log", "show", "grep", "ls-files", "blame", "rev-parse")
 SECRET = re.compile(r"KEY|TOKEN|SECRET|PASSWORD|CREDENTIAL|^(AWS_|ARM_|AZURE_|GOOGLE_|KUBE|VAULT_|GH_|GITHUB_)"
                     r"|^SSH_AUTH_SOCK$", re.I)
-CAP = 6000  # characters of a turn's output that go back to the worker
 KEEP = 4000  # an attached file up to this many characters stays in the first message through compaction
 VERBOSE = False
 
@@ -655,8 +777,22 @@ def child(fd):
     api.update(search=lambda query, n=5: web("search", str(query), int(n)), fetch=lambda url: web("fetch", str(url)),
                note=lambda text: tell(fn="note", arg=str(text)), ask=lambda question: leave("ask", question),
                done=lambda summary, open_issues="": leave("done", summary, open_issues))
+    class Glob(types.SimpleNamespace):
+        """The name `glob` in a script: glob() is our function and so is glob.glob(), so `import glob` is harmless."""
+
+        def __call__(self, pattern):
+            return self.glob(pattern)
+
+    def importer(name, *args):
+        """`import glob` in a script must hand back our glob(), not the standard module's unsorted one."""
+        return globs if name.split(".")[0] == "glob" else builtins.__import__(name, *args)
+
+    globs = Glob(glob=api["glob"])
+    every = {"__name__": "__main__", "__builtins__": {**vars(builtins), "__import__": importer},
+             **{name: __import__(name) for name in IMPORTS}, **api,  # the modules are ready: re.search() needs no import
+             "glob": globs}  # after the api, so that glob.glob() works without an import as well
     try:
-        exec(compile(job["script"], "<script>", "exec"), {"__name__": "__main__", **api})
+        exec(compile(job["script"], "<script>", "exec"), every)
     except SystemExit:
         pass
     except BaseException as e:
@@ -931,9 +1067,11 @@ def compact(s, cfg):
 
 def run_header(terms, web, date):
     """The lines that say what a run may change, what it must pass and how long it may take."""
-    return "\n".join(["## Run", "allow: " + (", ".join(terms["allow"]) or "(none: this run is read-only)"),
-                       *[f"check: {cmd}" for cmd in terms["checks"]], f"web: {'on' if web else 'off'}",
-                       f"turn limit: {terms['max_turns']}", f"date: {date}"])
+    shown = f"output: a turn shows at most {terms['output_chars']:,} characters of what you print, {terms['read_chars']:,} when it only reads files" \
+        if "output_chars" in terms and "read_chars" in terms else ""  # a session started before these keys has no line
+    return "\n".join(filter(None, ["## Run", "allow: " + (", ".join(terms["allow"]) or "(none: this run is read-only)"),
+                       *[f"check: {cmd}" for cmd in terms["checks"]], f"web: {'on' if web else 'off'}", shown,
+                       f"turn limit: {terms['max_turns']}", f"date: {date}"]))
 
 
 def first_message(head, digest=""):
@@ -962,9 +1100,15 @@ def take_turn(s, cfg, env, turn, reply, finish):
         reverted = settle(s, before, turn)
     wrote = dict.fromkeys(r["arg"] for r in s.of("ledger")
                           if r["turn"] == turn and r["fn"] in ("write", "edit") and "err" not in r)
-    if len(output) > CAP:
-        marker = f'[... {len(output) - CAP} characters cut here; read("@{turn}") returns all of it ...]'
-        output = f"{output[:CAP // 2]}\n{marker}\n{output[-CAP // 2:]}"
+    # A turn that only reads may show more: in the logs of 118 sessions, 505 of the 550 turns whose output was
+    # cut only read files, and workers paged through one file up to 38 times.
+    fns, limits = {r["fn"] for r in s.of("ledger") if r["turn"] == turn}, cfg["limits"]
+    cap = limits["read_chars"] if fns and fns <= {"read", "glob", "grep", "note"} else limits["output_chars"]
+    if len(output) > cap:
+        marker = (f'[... {len(output) - cap} characters cut here: a turn that only reads shows at most '
+                  f'{limits["read_chars"]:,} characters, any other turn {limits["output_chars"]:,}; '
+                  f'read("@{turn}") returns all of it ...]')
+        output = f"{output[:cap // 2]}\n{marker}\n{output[-cap // 2:]}"
     parts = ["wrote: " + ", ".join(wrote) if wrote else "",
              "output:\n" + output.rstrip("\n") if output.strip() else "output: (none)",
              "error:\n" + error if error else "",
@@ -979,7 +1123,7 @@ def said(message):
 
 def loop(s, cfg, extra=""):
     """Drive the session to its next stop. `extra` is the lead's text, appended to the pending turn result."""
-    limits, started, failures = cfg["limits"], time.time(), 0
+    limits, started, failures, repeats = cfg["limits"], time.time(), 0, 0
     env = clean_env(cfg, s.dir)
     while True:
         pending = s.last("result", "msg")
@@ -994,11 +1138,13 @@ def loop(s, cfg, extra=""):
         previous = next((said(r["m"]) for r in reversed(s.of("msg")) if r["m"]["role"] == "assistant"), None)
         reply, finish = chat(s, cfg)
         turn = s.turn + 1
-        s.add("msg", turn=turn, m=reply)
+        # A cut-off reply is not kept: resent with every later request, three of them cost one session 48,000 tokens.
+        # The worker still hears that its reply was cut off, in the message that carries this turn's result.
+        s.add("msg", turn=turn, m=CUT_OFF if finish == "length" else reply)
         left = max(0, scope(s)["max_turns"] - len(s.since("round", "result")) - 1)
-        repeated = said(reply) == previous
-        if repeated:
-            body, failed, stop = "not run: this reply is identical to your previous one", "repeat", None
+        repeats = repeats + 1 if said(reply) == previous else 0
+        if repeats:  # a worker that has its answer and only forgot to call done() gets one warning, not a stop
+            body, failed, stop = REPEAT, "repeat", None
         else:
             body, failed, stop = take_turn(s, cfg, env, turn, reply, finish)
         failures = failures + 1 if failed else 0
@@ -1013,8 +1159,10 @@ def loop(s, cfg, extra=""):
             return halt(s, summary=stop["arg"], open=stop["open"])
         if stop and stop["fn"] == "ask":
             return halt(s, "question", question=stop["arg"])
-        if repeated or failures >= 3:
-            return halt(s, "stuck", why="same reply twice in a row" if repeated else "three failing turns in a row")
+        if repeats >= 2:
+            return halt(s, "stuck", why="same reply three times in a row")
+        if failures >= 3:
+            return halt(s, "stuck", why="three failing turns in a row")
         spent = sum(u["prompt"] + u["out"] for u in s.since("round", "usage"))
         over = "turn" if not left else "time" if time.time() - started > limits["run_seconds"] else \
             "token" if spent > limits["run_tokens"] else ""
@@ -1096,6 +1244,21 @@ def report(s, review=False, cfg=None):
     late = [u for u in usage if u["turn"] > 3]
     if cached_share(late) is not None and cached_share(late) < 0.8:
         line("cache", f"low ({cached_share(late):.0%} cached after turn 3)")
+    if status in ("stuck", "limit"):  # where the turns went, and what the worker last saw when it changed nothing
+        acts = s.of("ledger")
+        kinds = {}
+        for r in s.since("round", "result"):
+            kind = turn_kind(r, [a for a in acts if a["turn"] == r["turn"]])
+            kinds[kind] = kinds.get(kind, 0) + 1
+        line("spent", " · ".join(f"{kind} {n}" for kind, n in sorted(kinds.items(), key=lambda kv: -kv[1])))
+        if not st.get("changed"):
+            try:
+                with open(os.path.join(s.dir, "out", str(s.last("result")["turn"])), encoding="utf-8",
+                          errors="replace") as f:
+                    last_output = f.read(1500)
+            except OSError:  # a turn that was never run has no output file
+                last_output = ""
+            line("last", last_output.strip())
     last = s.last("usage")
     if cfg and last:  # how full the next request would be, against the point where dsk compacts the series
         compacts = sum(r["why"] == "compact" for r in s.of("series"))
@@ -1181,15 +1344,32 @@ def make_worktree(s, root, workdir):
         git(workdir, "apply", stdin=seed)
 
 
+def slurp(path):
+    """The text of a file, or of stdin for `-`: for a brief, an answer, a defect list or a next task."""
+    if path == "-":
+        return sys.stdin.read()
+    with open(path, encoding="utf-8", errors="replace") as f:
+        return f.read()
+
+
+def attachment(value, workdir):
+    """[name, text] for one --file: the whole file, or lines A to B of it when the value is PATH:A-B and PATH exists."""
+    match = re.match(r"^(.+):(\d+)-(\d+)$", value, re.S)
+    if not match or not os.path.isfile(match.group(1)):
+        return ["@stdin" if value == "-" else os.path.relpath(os.path.abspath(value), workdir), slurp(value)]
+    path, first, last = match.group(1), int(match.group(2)), int(match.group(3))
+    with open(path, encoding="utf-8", errors="replace") as f:
+        lines = f.readlines()
+    if first < 1 or first > last:
+        raise Fail(f"{value}: lines {first} to {last} is not a range; lines are numbered from 1 and A comes before B")
+    if last > len(lines):
+        raise Fail(f"{value}: {path} has {len(lines)} lines, so there is no line {last}")
+    return [f"{os.path.relpath(os.path.abspath(path), workdir)}:{first}-{last}", "".join(lines[first - 1:last])]
+
+
 def cmd_run(args, cfg):
     if bool(args.text) == bool(args.brief):
         raise Fail('give the brief as "text" or with --brief FILE, not both')
-
-    def slurp(path):
-        if path == "-":
-            return sys.stdin.read()
-        with open(path, encoding="utf-8", errors="replace") as f:
-            return f.read()
 
     root = project_root()
     if (args.allow or args.worktree) and not root:
@@ -1198,12 +1378,14 @@ def cmd_run(args, cfg):
     for name in route:
         if name not in cfg["profiles"]:
             raise Fail(f"unknown profile {name}")
+    if not args.profile:
+        route = ordered_route(cfg, route)  # fastest first when the setting says so, and measured if that is stale
     api_key(cfg["profiles"][route[0]])
     if args.web:
         api_key(cfg["search"])
     workdir = root or os.getcwd()
     brief = args.text or slurp(args.brief)
-    files = [["@stdin" if p == "-" else os.path.relpath(os.path.abspath(p), workdir), slurp(p)] for p in args.file]
+    files = [attachment(value, workdir) for value in args.file]
     dsk_md = slurp(os.path.join(workdir, "DSK.md")) if os.path.exists(os.path.join(workdir, "DSK.md")) else ""
     guard = tree_lock(root) if root and not args.worktree else None  # noqa: F841 (held until this run returns)
     s = Session().lock()
@@ -1220,6 +1402,7 @@ def cmd_run(args, cfg):
         raise
     head = s.add("head", id=s.id, root=root or workdir, workdir=workdir, worktree=args.worktree, start=start,
                  allow=args.allow, checks=args.check, web=args.web, effort=args.effort, max_turns=args.max_turns,
+                 output_chars=cfg["limits"]["output_chars"], read_chars=cfg["limits"]["read_chars"],
                  owner=args.owner, route=route, brief=brief.strip(), files=files, dsk_md=dsk_md.strip(),
                  date=str(datetime.date.today()), created=time.time())
     for path, text in files:
@@ -1234,9 +1417,12 @@ def cmd_run(args, cfg):
 
 
 def cmd_answer(args, cfg):
+    if bool(args.text) == bool(args.brief):
+        raise Fail('give the answer as "text" or with --brief FILE, not both')
+    text = args.text or slurp(args.brief)
     s = resume(args.id, "question")
-    s.add("answer", text=args.text)
-    return drive(s, cfg, "\n\nlead's answer: " + args.text)
+    s.add("answer", text=text)
+    return drive(s, cfg, "\n\nlead's answer: " + text)
 
 
 def cmd_show(args, cfg):
@@ -1256,6 +1442,9 @@ def cmd_show(args, cfg):
 
 def cmd_continue(args, cfg):
     """Give a finished session the lead's next task: same conversation, new terms, fresh round."""
+    if bool(args.text) == bool(args.brief):
+        raise Fail('give the task as "text" or with --brief FILE, not both')
+    text = args.text or slurp(args.brief)
     s = resume(args.id, "done", "accepted")
     head = s.head
     if args.allow and head["start"] is None:
@@ -1274,11 +1463,13 @@ def cmd_continue(args, cfg):
     if os.path.exists(answer):  # the last round's @answer would answer for this one, in the report and in the gate
         os.replace(answer, f"{answer}.{len(s.of('base')) + 1}")
     start = tree(s) if head["start"] else None
-    s.add("base", start=start, allow=allow, checks=checks, max_turns=turns, task=args.text)
+    s.add("base", start=start, allow=allow, checks=checks, max_turns=turns, task=text)
     s.add("round")
     extra = ("\n\nthe lead has the next task for this session. What you did before stands.\n\n"
-             + run_header({"allow": allow, "checks": checks, "max_turns": turns}, head["web"], str(datetime.date.today()))
-             + "\n\n## Task\n" + args.text)
+             + run_header({"allow": allow, "checks": checks, "max_turns": turns,
+                           **{key: head[key] for key in ("output_chars", "read_chars") if key in head}},
+                          head["web"], str(datetime.date.today()))
+             + "\n\n## Task\n" + text)
     return drive(s, cfg, extra)
 
 
@@ -1299,13 +1490,14 @@ def cmd_accept(args, cfg):
 
 
 def cmd_reject(args, cfg):
-    if args.drop == bool(args.text):
-        raise Fail('give the defects as "text", or --drop to discard the work')
-    if args.text:
+    if sum((bool(args.text), bool(args.brief), args.drop)) != 1:
+        raise Fail('give the defects as "text" or with --brief FILE, or --drop to discard the work, not two of them')
+    text = args.text or (slurp(args.brief) if args.brief else "")
+    if not args.drop:
         s = resume(args.id, "review", "stuck", "limit")
-        s.add("reject", text=args.text)
+        s.add("reject", text=text)
         s.add("round")
-        return drive(s, cfg, "\n\nthe lead reviewed this and rejected it. Fix these defects:\n" + args.text)
+        return drive(s, cfg, "\n\nthe lead reviewed this and rejected it. Fix these defects:\n" + text)
     s = resume(args.id, "review", "stuck", "limit", "question", "done", "error")
     head = s.head
     if head["worktree"]:
@@ -1319,6 +1511,22 @@ def cmd_reject(args, cfg):
     close(s, "dropped")
     print(f"dsk {s.id} · dropped · the worker's changes were discarded")
     return 0
+
+
+def cmd_bench(args, cfg):
+    """Measure the provider profiles (all of the route's by default) and print them fastest first."""
+    names = list(dict.fromkeys(args.profile or cfg["route"]))
+    for name in names:
+        if name not in cfg["profiles"]:
+            raise Fail(f"unknown profile {name}")
+    found, now = bench(cfg, names), time.time()
+    if args.json:
+        print(dumps(found))
+    else:
+        print(f"dsk bench · {len(names)} profile{'s' if len(names) != 1 else ''}")
+        for name in fast_order(found, names):
+            print(f"{name:<12} {speed_text(found.get(name) or {}, now)}")
+    return 0 if any((found.get(name) or {}).get("seconds") is not None for name in names) else 1
 
 
 def sessions(wanted):
@@ -1356,6 +1564,160 @@ def job(s, cfg):
             "brief": " ".join((scope(s).get("task") or head["brief"]).split())[:300],
             "owner": head["owner"], "root": head["root"], "worktree": head["worktree"], "created": head["created"],
             "active": os.path.getmtime(s.path)}
+
+
+def median(values):
+    """The middle value, the lower of the two in the middle of an even count, and 0 when there is nothing to measure."""
+    values = sorted(values)
+    return values[(len(values) - 1) // 2] if values else 0
+
+
+def share(part, whole):
+    """A whole-number percentage of `whole`, and 0 when there is nothing to be a share of."""
+    return round(part * 100 / whole) if whole else 0
+
+
+def percent(part, whole):
+    """The same percentage, for a line that ends in it."""
+    return f"{share(part, whole)}%"
+
+
+def duration(x):
+    """A number of seconds to one decimal, without a pointless .0."""
+    return f"{round(x, 1):.1f}".removesuffix(".0")
+
+
+def turn_kind(result, acts):
+    """What one turn did, from its result and that turn's ledger records: a failure, files, commands, a stop, reading."""
+    if result["fail"]:
+        return "failed:" + result["fail"]
+    fns = {a["fn"] for a in acts}
+    if fns & {"write", "edit"}:
+        return "write"
+    if "sh" in fns:
+        return "run"
+    return "read" if fns - {"ask", "done"} else "stop"
+
+
+def metrics(s, cfg):
+    """One session as plain numbers for `dsk stats`, all of it measured from its log. Logs written before
+    timestamps existed have no `at`, and every duration they cannot give is None."""
+    head, usage, results, series, acts = s.head, s.of("usage"), s.of("result"), s.of("series"), s.of("ledger")
+    kinds_list = [turn_kind(r, [a for a in acts if a["turn"] == r["turn"]]) for r in results]
+    kinds = {}
+    for kind in kinds_list:
+        kinds[kind] = kinds.get(kind, 0) + 1
+    prices = [cfg["profiles"].get(u["profile"], {}).get("price") for u in usage]  # dollars per million tokens
+    cost = None if not all(prices) else sum(((u["prompt"] - (u["hit"] or 0)) * p["in"] + (u["hit"] or 0) * p["cached"]
+                                             + u["out"] * p["out"]) / 1e6 for u, p in zip(usage, prices))
+    stamped = [r["at"] for r in s.recs if "at" in r]
+    reqs = [i for i, r in enumerate(s.recs) if r["t"] == "req" and "at" in r]  # a req and its usage bracket thinking
+    model = 0.0
+    speed = {}
+    for n, i in enumerate(reqs):
+        stop = reqs[n + 1] if n + 1 < len(reqs) else len(s.recs)
+        answered = next((r for r in s.recs[i + 1:stop] if r["t"] == "usage" and "at" in r), None)
+        if answered is not None:  # a req the API never answered has no time of its own to measure
+            model += answered["at"] - s.recs[i]["at"]
+            p = speed.setdefault(answered["profile"], [0.0, 0])  # seconds a turn took on that profile
+            p[0], p[1] = p[0] + answered["at"] - s.recs[i]["at"], p[1] + 1
+    states, waited = s.of("state"), 0.0  # from each stop the lead had to answer to the run that answered it
+    for n, r in enumerate(states):
+        if r["status"] in ("review", "question", "stuck", "limit", "done") and "at" in r:
+            again = next((x for x in states[n + 1:] if x["status"] == "running" and "at" in x), None)
+            waited += again["at"] - r["at"] if again else 0
+    return {"id": s.id, "root": head["root"], "owner": head["owner"], "worktree": head["worktree"],
+            "effort": head["effort"], "web": head["web"], "created": head["created"], "status": s.status(),
+            "profiles": list(dict.fromkeys(u["profile"] for u in usage)), "rounds": len(s.of("round")),
+            "rejects": len(s.of("reject")), "continues": len(s.of("base")),
+            "compactions": sum(r["why"] == "compact" for r in series),
+            "failovers": [f"{a['profile']} {b['status'] or 'network'}"
+                          for a, b in zip(series, series[1:]) if b["why"] == "failover"],
+            "turns": len(results), "kinds": kinds,
+            "lead_in": next((n for n, kind in enumerate(kinds_list) if kind != "read"), len(kinds_list)),
+            "cut": sum("characters cut here" in r["text"] for r in results),
+            "in": sum(u["prompt"] for u in usage), "out": sum(u["out"] for u in usage),
+            "hit": sum(u["hit"] or 0 for u in usage), "cached": cached_share(usage),
+            "max_out": max((u["out"] for u in usage), default=0), "speed": speed, "cost": cost,
+            # a session that began before timestamps is stamped only at its end: its time is unknown, not zero
+            "seconds": round(stamped[-1] - head["at"], 1) if "at" in head else None,
+            "model_seconds": round(model, 1) if reqs else None,
+            "lead_seconds": round(waited, 1) if "at" in head else None}
+
+
+def label(text, value):
+    """One line of the plain stats report: a label in a column ten characters wide."""
+    return f"{text + ':':<10} {value}"
+
+
+def stats_summary(pairs):
+    """The plain `dsk stats` report, one line per label, over the sessions as (log, metrics) pairs."""
+    ms = [m for _, m in pairs]
+    turns = sum(m["turns"] for m in ms)
+    statuses = {}
+    for m in ms:
+        statuses[m["status"]] = statuses.get(m["status"], 0) + 1
+    by_count = sorted(statuses.items(), key=lambda kv: (-kv[1], kv[0]))
+    most = max(ms, key=lambda m: m["turns"])
+    lines = [label("sessions", f"{len(ms)} · " + " · ".join(f"{status} {n}" for status, n in by_count)),
+             label("turns", f"{turns} · median {median(m['turns'] for m in ms)} per session · "
+                            f"most {most['turns']} ({most['id']})")]
+    kinds = {}
+    for m in ms:
+        for kind, n in m["kinds"].items():
+            kinds[kind] = kinds.get(kind, 0) + n
+    lines.append(label("kinds", " · ".join(f"{kind} {percent(n, turns)}"
+                                           for kind, n in sorted(kinds.items(), key=lambda kv: (-kv[1], kv[0])))))
+    lead = [m["lead_in"] for m in ms if m["kinds"].get("write")]
+    lines.append(label("lead-in", f"median {median(lead)} read turns before the first change · "
+                                  f"{sum(1 for n in lead if n >= 5)} sessions with 5 or more"))
+    cut = sum(m["cut"] for m in ms)
+    lines.append(label("cut", f"{cut} of {turns} turns had their output cut ({percent(cut, turns)})"))
+    biggest = max(ms, key=lambda m: m["max_out"])
+    truncated = sum(m["kinds"].get("failed:truncated", 0) for m in ms)
+    lines.append(label("replies", f"median {median(u['out'] for s, _ in pairs for u in s.of('usage'))} tokens · "
+                                  f"largest {biggest['max_out']} ({biggest['id']}) · {truncated} cut off at the limit"))
+    spent = f"in {kilo(sum(m['in'] for m in ms))} " \
+            f"({share(sum(m['hit'] for m in ms), sum(m['in'] for m in ms))}% cached) · out {kilo(sum(m['out'] for m in ms))}"
+    if all(m["cost"] is not None for m in ms):
+        spent += f" · ${sum(m['cost'] for m in ms):.2f}"
+    lines.append(label("tokens", spent))
+    rejected = sum(m["rejects"] for m in ms)
+    lines.append(label("rounds", f"{rejected} rejected rounds in {sum(1 for m in ms if m['rejects'])} sessions · "
+                                 f"{sum(m['continues'] for m in ms)} continued"))
+    if any(m["seconds"] is not None for m in ms):
+        lines.append(label("time", f"model {duration(sum(m['model_seconds'] or 0 for m in ms))}s · lead waited "
+                                   f"{duration(sum(m['lead_seconds'] or 0 for m in ms))}s · total "
+                                   f"{duration(sum(m['seconds'] or 0 for m in ms))}s"))
+    blank = {"turns": 0, "in": 0, "hit": 0, "out": 0, "away": 0, "seconds": 0.0, "timed": 0}
+    totals = {}
+    for s, m in pairs:
+        for u in s.of("usage"):
+            p = totals.setdefault(u["profile"], dict(blank))
+            p["turns"], p["in"], p["hit"], p["out"] = (p["turns"] + 1, p["in"] + u["prompt"],
+                                                       p["hit"] + (u["hit"] or 0), p["out"] + u["out"])
+        for name, (seconds, timed) in m["speed"].items():
+            p = totals.setdefault(name, dict(blank))
+            p["seconds"], p["timed"] = p["seconds"] + seconds, p["timed"] + timed
+        for a, b in zip(s.of("series"), s.of("series")[1:]):
+            if b["why"] == "failover":  # also from a profile no session shown so far has a turn on
+                totals.setdefault(a["profile"], dict(blank))["away"] += 1
+    for name, p in sorted(totals.items(), key=lambda kv: (-kv[1]["turns"], kv[0])):
+        row = f"profile {name}: {p['turns']} turns · in {kilo(p['in'])} ({share(p['hit'], p['in'])}% cached) · " \
+              f"out {kilo(p['out'])} · {p['away']} failovers away"
+        if p["timed"]:  # how long a turn takes on that profile: the wait for the reply, not the tool's own work
+            row += f" · {p['seconds'] / p['timed']:.1f} s per turn"
+        lines.append(row)
+    return lines
+
+
+def session_line(m):
+    """One line per session for `dsk stats --sessions`: what it measured and where it ran."""
+    kinds = m["kinds"]
+    failed = sum(n for kind, n in kinds.items() if kind.startswith("failed:"))
+    return (f"{m['id']} · {m['status']} · {m['turns']} turns ({kinds.get('read', 0)} r, {kinds.get('write', 0)} w, "
+            f"{kinds.get('run', 0)} x, {failed} f) · in {kilo(m['in'])} ({share(m['hit'], m['in'])}% cached) · "
+            f"out {kilo(m['out'])} · {os.path.basename(str(m['root']).rstrip('/'))}")
 
 
 def cmd_status(args, cfg):
@@ -1405,6 +1767,32 @@ def cmd_status(args, cfg):
     return 0
 
 
+def cmd_stats(args, cfg):
+    """What the sessions measured, read from their logs: turns, kinds, tokens, time, rounds and profiles."""
+    if args.id:
+        found = [Session(sid) for sid in args.id]
+    else:
+        wanted = time.time() - args.days * 86400
+        found = list(sessions(lambda head: head["created"] > wanted))
+    if args.project:  # only the sessions this project's runs wrote
+        root = project_root() or os.getcwd()
+        found = [s for s in found if s.head["root"] == root]
+    if not found:
+        print(f"no sessions in the last {args.days} days")
+        return 0
+    pairs = sorted(((s, metrics(s, cfg)) for s in found), key=lambda pair: -pair[1]["created"])
+    if args.json:
+        print(dumps({"sessions": [m for _, m in pairs]}))
+        return 0
+    for row in stats_summary(pairs):
+        print(row)
+    if args.sessions:
+        print()
+        for _, m in pairs:
+            print(session_line(m))
+    return 0
+
+
 def cmd_configure(args, cfg):
     """How dsk is set up. As a Claude Code hook (--hook) it first stores the plugin's options, which Claude Code hands
     to hooks alone, where `config` and `secret` read them; at session start (--announce) it says what is still missing."""
@@ -1443,6 +1831,11 @@ def cmd_configure(args, cfg):
         key, until = "set" if secret(profile.get("key_env", "")) else "missing", paused(name)
         until = f" · paused until {time.strftime('%a %H:%M', time.localtime(until))}, credit used up" if until else ""
         print(f"{name + ':':<8} {profile.get('base_url')} · {profile.get('model')} · key {key}{until}")
+    if cfg.get("route_order") == "fastest":
+        found = speeds()
+        print(f"{'order:':<10}fastest first: " + ", ".join(
+            f"{name} {found[name]['seconds']:.2f}s" if (found.get(name) or {}).get("seconds") is not None
+            else f"{name} (not measured)" for name in fast_order(found, cfg["route"])))
     if not ready:
         print(f"next:    in Claude Code, /plugin configure {plugin('id')}: {SETUP}; then restart Claude Code. "
               f"Or export the key in ~/.config/dsk/env.")
@@ -1547,7 +1940,8 @@ def main():
     run.add_argument("--brief", metavar="FILE", help="read the brief from a file")
     run.add_argument("--allow", action="append", default=[], metavar="GLOB", help="paths the worker may change")
     run.add_argument("--check", action="append", default=[], metavar="CMD", help="acceptance test, run by dsk")
-    run.add_argument("--file", action="append", default=[], metavar="PATH", help="attach a file (- is stdin)")
+    run.add_argument("--file", action="append", default=[], metavar="PATH",
+                     help="attach a file, or lines A to B of it as PATH:A-B (- is stdin)")
     run.add_argument("--web", action="store_true", help="enable search() and fetch()")
     run.add_argument("--worktree", action="store_true", help="work in a fresh git worktree")
     run.add_argument("--effort", choices=list(MAX_TOKENS), default="off", help="thinking effort")
@@ -1555,32 +1949,47 @@ def main():
     run.add_argument("--max-turns", type=int, default=12)
     run.add_argument("--owner", default=os.environ.get("CLAUDE_CODE_SESSION_ID", ""),
                      help="the Claude Code session that started the run (default: $CLAUDE_CODE_SESSION_ID)")
-    command("answer", "answer the worker's question", "id", "text")
+    answer = command("answer", "answer the worker's question", "id")
+    answer.add_argument("text", nargs="?", help="the answer")
+    answer.add_argument("--brief", metavar="FILE", help="read the answer from a file (- is stdin)")
     view = command("show", "print a session's report", "id").add_mutually_exclusive_group()
     for flag, text in (("review", "the review packet"), ("diff", "the worker's whole diff"),
                        ("log", "tokens and actions per turn"), ("answer", "the whole answer")):
         view.add_argument("--" + flag, action="store_true", help=text)
-    cont = command("continue", "give a finished session its next task", "id", "text")
+    cont = command("continue", "give a finished session its next task", "id")
+    cont.add_argument("text", nargs="?", help="the next task")
+    cont.add_argument("--brief", metavar="FILE", help="read the task from a file (- is stdin)")
     cont.add_argument("--allow", action="append", default=[], metavar="GLOB", help="paths the worker may change")
     cont.add_argument("--check", action="append", default=[], metavar="CMD", help="acceptance test, run by dsk")
     cont.add_argument("--max-turns", type=int, help="turns this round may take")
     command("accept", "mark as reviewed; after --worktree, apply the changes", "id")
     reject = command("reject", "send defects back, or --drop the work", "id")
     reject.add_argument("text", nargs="?", help="the defects, as a numbered list")
+    reject.add_argument("--brief", metavar="FILE", help="read the defects from a file (- is stdin)")
     reject.add_argument("--drop", action="store_true", help="discard the work")
     status = command("status", "this project's sessions")
     status.add_argument("--hook", action="store_true", help="act as a Stop hook")
     status.add_argument("--json", action="store_true", help="the last day's sessions on any project, as JSON")
+    stats = command("stats", "what the sessions measured: turns, tokens, time")
+    stats.add_argument("id", nargs="*", help="sessions to measure (default: the last N days)")
+    stats.add_argument("--days", type=int, default=7, metavar="N", help="how far back to look (default 7)")
+    stats.add_argument("--project", action="store_true", help="only this project's sessions")
+    stats.add_argument("--json", action="store_true", help="as JSON")
+    stats.add_argument("--sessions", action="store_true", help="add a line per session")
     command("search", "raw web search, no model", "target").add_argument("--count", type=int, default=5)
     command("fetch", "raw page fetch, no model", "target")
     command("doctor", "check each provider profile").add_argument("--profile")
+    bench_cmd = command("bench", "time each provider profile, fastest first")
+    bench_cmd.add_argument("--profile", action="append", default=[], metavar="NAME", help="measure this profile (repeatable)")
+    bench_cmd.add_argument("--json", action="store_true", help="the measurements as JSON")
     configure = command("configure", "show how dsk is set up")
     configure.add_argument("--hook", action="store_true", help="act as a Claude Code hook: store the plugin's options first")
     configure.add_argument("--announce", action="store_true", help="with --hook: say what is still missing")
     configure.add_argument("--data", metavar="DIR", help="with --hook: the plugin's data folder")
     commands = {"run": cmd_run, "answer": cmd_answer, "show": cmd_show, "continue": cmd_continue,
                 "accept": cmd_accept, "reject": cmd_reject,
-                "status": cmd_status, "search": cmd_web, "fetch": cmd_web, "doctor": cmd_doctor, "configure": cmd_configure}
+                "status": cmd_status, "stats": cmd_stats, "search": cmd_web, "fetch": cmd_web,
+                "doctor": cmd_doctor, "configure": cmd_configure, "bench": cmd_bench}
     args = parser.parse_args()
     VERBOSE = args.verbose
 
