@@ -23,14 +23,16 @@ Keys are masked as you type and kept in Claude Code's secure store. `/plugin con
 
 The plugin needs Python 3.13 or newer on `PATH`, as `python3` or as `python3.13`, `python3.14` or `python3.15`.
 
-### From a checkout
+### install.sh
 
 ```
-./install.sh            # links the plugin into ~/.claude/skills/dsk (as dsk@skills-dir) and a `dsk` command into ~/.local/bin
-                        # use --copy to copy instead
+./install.sh              # installs dsk from GitHub as dsk@asx8678, or updates it when it is installed
+./install.sh --local      # the same with the dsk in this checkout; Claude Code loads it from there
+./install.sh --dev        # links this checkout as dsk@skills-dir instead, so edits take effect at once
+./install.sh --uninstall  # uninstalls dsk from Claude Code; ~/.config/dsk and ~/.local/state/dsk stay
 ```
 
-`/plugin configure dsk@skills-dir` asks for the provider in the same way. Everything below is optional: it is how to set dsk up by hand, with more than one provider. What a config file and the key file say wins over the plugin's form.
+`./install.sh` needs no checkout, so it also runs as `curl -fsSL https://raw.githubusercontent.com/asx8678/dsk/main/install.sh | sh`, and running it again updates dsk. `--local` installs this checkout as dsk@asx8678: Claude Code loads it from the checkout, so edits take effect in the sessions started afterwards, and rerunning `--local` refreshes the copy that the `dsk` command of your own shell runs. Either id asks for the provider in the same way: `/plugin configure dsk@asx8678`, or `dsk@skills-dir` after `--dev`. Everything below is optional: it is how to set dsk up by hand, with more than one provider. What a config file and the key file say wins over the plugin's form.
 
 1. **Keys.** `dsk` takes each key from the environment, or else from `~/.config/dsk/env`, a private file (mode 600) of lines like `export DEEPSEEK_API_KEY='...'`. Nothing has to be sourced, so Claude Code needs no setup. A key read from the file never enters `dsk`'s environment, so scripts, `sh()` and checks cannot see it.
 2. **Config.** `~/.config/dsk/config.json` names the environment variables; it never holds a key.
@@ -48,7 +50,7 @@ The plugin needs Python 3.13 or newer on `PATH`, as `python3` or as `python3.13`
    }
    ```
 
-   The `official` profile, the `search` block and a default `sh_deny` list are built in, so the file may hold only what differs. `extra` is merged into the request body; a `null` value removes a key the provider rejects. Optional keys: `backoff` (retry waits in seconds, default `[2, 6, 18]`) and `limits` (`turn_seconds` 600, `run_seconds` 3600, `run_tokens` 2000000). A profile may set `max_sessions`, the number of runs the provider serves at once (see **Providers**), and `price`, dollars per million tokens as `{"in": 0.005, "cached": 0.003, "out": 0.57}`, from which `status --json` reports each job's cost. `headers` adds request headers; in a value, `{session}` becomes an ID that stays the same for the whole run, across `answer`, `reject` and failover. OpenCode Go needs `"headers": {"x-opencode-session": "{session}"}`. `pause_hours` (default 1) is how long a profile is skipped after it reports its credit used up, when the error names no reset time (see **Providers**).
+   The `official` profile, the `search` block and a default `sh_deny` list are built in, so the file may hold only what differs. `extra` is merged into the request body; a `null` value removes a key the provider rejects. Optional keys: `backoff` (retry waits in seconds, default `[2, 6, 18]`) and `limits` (`turn_seconds` 600, `run_seconds` 3600, `run_tokens` 2000000; `output_chars` 6000 and `read_chars` 24000, how many characters of what a turn printed go back to the worker, for a turn that only reads files and for any other). A profile may set `max_sessions`, the number of runs the provider serves at once (see **Providers**), and `price`, dollars per million tokens as `{"in": 0.005, "cached": 0.003, "out": 0.57}`, from which `status --json` reports each job's cost. `headers` adds request headers; in a value, `{session}` becomes an ID that stays the same for the whole run, across `answer`, `reject` and failover. OpenCode Go needs `"headers": {"x-opencode-session": "{session}"}`. `pause_hours` (default 1) is how long a profile is skipped after it reports its credit used up, when the error names no reset time (see **Providers**).
 3. **Check it.** `dsk doctor` tests each profile: the key, the model ID, that thinking-off is honoured, five replies over a three-turn exchange, and whether and where cached tokens are reported.
 4. **Permissions.** The skill pre-approves `dsk` only for the turn that invokes it. For later turns and background runs, add `"Bash(dsk *)"` to `permissions.allow` in `~/.claude/settings.json`. That rule also covers every `--check` command and every shell command the worker runs: none of them reaches a permission prompt, and only the guards in **Guardrails, stated honestly** stand in the way.
 5. **Display.** In a session that was already open, run `/reload-plugins` once. `/dsk-jobs on` loads the live display and `/dsk-jobs off` unloads it; see **The plugin**.
@@ -56,22 +58,25 @@ The plugin needs Python 3.13 or newer on `PATH`, as `python3` or as `python3.13`
 ## Commands
 
 ```
-dsk run [--allow GLOB]... [--check CMD]... [--file PATH]... [--web] [--worktree]
+dsk run [--allow GLOB]... [--check CMD]... [--file PATH[:A-B]]... [--web] [--worktree]
         [--effort off|low|high|max] [--profile NAME] [--max-turns 12]
         [--owner ID]       (default: $CLAUDE_CODE_SESSION_ID, which Claude Code sets for every command)
         "brief"            (or --brief FILE)
-dsk answer ID "text"       reply to the worker's question; the run continues
+dsk answer ID "text"       reply to the worker's question; the run continues (or --brief FILE, as for run)
 dsk show   ID [--review | --diff | --log | --answer]
 dsk accept ID              mark as reviewed; after --worktree, apply the changes to the main tree
-dsk reject ID "defects"    send defects back into the same session; the run continues
+dsk reject ID "defects"    send defects back into the same session; the run continues (or --brief FILE)
 dsk reject ID --drop       discard the work
 dsk continue ID "task"     send the next task into a session that is done or accepted; the worker keeps its context
         [--allow GLOB]... [--check CMD]... [--max-turns N]     (each replaces the run's; left out, it stays)
 dsk status [--hook]        this project's open sessions; --hook is the Claude Code Stop hook
 dsk status --json          the last day's sessions on any project, as JSON, for a display to poll
+dsk stats [ID ...]         what sessions measured: outcomes, where the turns went, tokens, time, per profile
+        [--days 7] [--project] [--sessions] [--json]
 dsk search "query"         raw web search, no model
 dsk fetch URL              raw page fetch, no model
 dsk doctor [--profile NAME]
+dsk bench [--profile NAME]... [--json]     time each provider now with two small requests, fastest first
 dsk configure              how dsk is set up: the route, and whether each provider has its key
 ```
 
@@ -91,7 +96,7 @@ next:    dsk show 7f3a --review | dsk accept 7f3a | dsk reject 7f3a "defects"
 | `review` | files changed, checks passed, waiting for accept or reject | 0 |
 | `done` | no file changed: a read-only answer, or a writable run that found nothing to change; the answer is in the report | 0 |
 | `question` | the worker called `ask()` | 2 |
-| `stuck` | same reply twice, or three failing turns in a row | 3 |
+| `stuck` | same reply three times, or three failing turns in a row | 3 |
 | `limit` | turn, time or token limit reached | 3 |
 | `error` | API, config or internal error, or an interrupted run | 1 |
 
@@ -103,7 +108,7 @@ next:    dsk show 7f3a --review | dsk accept 7f3a | dsk reject 7f3a "defects"
 
 **Function API.** Inside the script: `read`, `write`, `edit`, `glob`, `grep`, `sh`, `search`, `fetch`, `note`, `ask`, `done`. `write("@answer", text)` stores a long research answer in the session; `read("@3")` returns the full output of turn 3, and `read("@stdin")` an attachment that was piped in. A page fetched twice in one session is served from the session's copy.
 
-**Execution.** Each script runs in a fresh `python3 -I` child with a hard timeout that kills its process group.
+**Execution.** Each script runs in a fresh `python3 -I` child with a hard timeout that kills its process group. The allowed modules are already imported, and `import glob` gives the script dsk's own `glob()`. What a turn printed goes back cut to `limits.output_chars`, or to `limits.read_chars` when the turn only read files: in the logs of 118 sessions, nine in ten of the turns that were cut only read. A reply identical to the one before is not run and gets one warning; a second one stops the run as `stuck`. A reply cut off at the output limit is not kept in the conversation. A report for `stuck` or `limit` has a `spent:` line, the turns of the round by kind, and, when nothing was changed, `last:`, what the worker last printed.
 - An AST gate refuses imports outside a fixed list of pure standard-library modules, `open`, `exec`, `eval`, `compile`, `__import__`, `input`, and any name starting with `__`.
 - The child reports every API call to the parent over a socket. Reports and compaction are built from that ledger, not from what the model says.
 - `search` and `fetch` execute in the parent, which alone holds the key.
@@ -111,6 +116,8 @@ next:    dsk show 7f3a --review | dsk accept 7f3a | dsk reject 7f3a "defects"
 - `sh()` refuses `sudo`, any git command that writes, and the `sh_deny` list. Each command runs in its own process group, which is killed when the command returns.
 
 **Cache discipline.** The system prompt and the tool are constants in the source. The first user message is ordered stable-first: `DSK.md` (labelled as an attached file, so the worker knows it has it), run header, attached files, brief. A session is an append-only JSONL log, and every request is rebuilt from it. Before each send, `dsk` checks that the serialized messages extend the previous request of the series byte for byte, using a length and SHA-256 stored in the log, so the check also holds across `answer` and `reject`. Only session start, compaction and provider failover start a new series. Hit tokens are recorded per turn; `dsk show ID --log` prints them.
+
+**Attachments.** `--file PATH` attaches a whole file and `--file PATH:A-B` lines A to B of it, under that name; the run header tells the worker how many characters a turn shows.
 
 **Compaction.** When the last request exceeds the profile's `compact_at`, the series restarts as: system prompt, first message with a digest in place of the large attached files, then the last two turns verbatim. Attached files of up to 4,000 characters stay. If larger ones were dropped, one last message names them and tells the worker to read a file again before relying on it. The digest holds all notes, every question with its answer, one ledger line per action in the dropped turns, and the files changed so far. There is no model call, so the same log always compacts to the same bytes.
 
@@ -126,9 +133,11 @@ next:    dsk show 7f3a --review | dsk accept 7f3a | dsk reject 7f3a "defects"
 
 **Continuing.** `dsk continue ID "task"` sends a next task into a session that is `done` or `accepted`: the same conversation, so the worker keeps what it has read and the request still extends the cached prefix. It logs a `base` record with the round's own terms (`--allow`, `--check`, `--max-turns`, each kept from before when left out) and a new start snapshot, so the review packet, `accept` and `reject --drop` deal with that round's changes only. A worktree that `accept` or `done` removed is built again from the main tree as it is now, and the earlier round's `@answer` is kept aside as `answer.N` in the session directory. After a compaction the worker's first message carries the current task and the terms of its round, and the digest lists the earlier tasks as finished. Every report has a measured `context:` line, the size of the next request against the profile's `compact_at`, with the number of compactions so far: it is what tells the lead to start a fresh run instead.
 
-**Providers.** A session starts on the first profile in `route`. On 402, or when retries of a network failure, 408, 429 or 5xx are used up, it continues on the next profile in a new series. A 400 whose message mentions a limit is treated as a 429, because one gateway reports its concurrency limit that way. A profile with `max_sessions` N has N slots, file locks in `~/.local/state/dsk/slots/`; a run holds one from its first request on that profile until its `dsk` process exits. Profiles that reach the same `base_url` with the same `key_env` share one set of slots, limited by the smallest `max_sessions` among them. When all are taken, the run moves to the next profile without sending a request, or, on the last profile in the route, waits for a slot; the display says nothing of such a skip, and shows a real failover as `↯ coralbricks 429 → opencode`. `dsk doctor` takes a slot too, and leaves a profile unchecked while running jobs hold all of its slots. An error that says the credit or quota is used up is not retried: a 402, or a 400, 403 or 429 whose message mentions quota, credit, balance, billing, payment, allowance or a usage limit, but not concurrency, "at a time" or a rate limit. The profile is then paused until the reset time the message names (if within a week), or for its `pause_hours`. Every run skips a paused profile without sending a request, except the last profile in the route, which is always tried. Pauses are files in `~/.local/state/dsk/paused/`; `dsk configure` shows them, and deleting one ends it. A reply with no `finish_reason` whose output reached `max_tokens` counts as cut off (`length`), because one gateway leaves the field empty.
+**Providers.** A session starts on the first profile in `route`. With `"route_order": "fastest"` in the config, `dsk run` first puts the route in order of measured speed: `dsk bench` times each profile with two small requests (the quicker one counts; a profile whose slots are all taken keeps its last time) and keeps the result in `~/.local/state/dsk/speed.json`; a run measures again by itself when a profile's time is older than `bench_minutes` (default 15), and runs started together measure once. A full fast profile hands over to the next fastest, and a session that goes on stays on its profile, where its cache is. `dsk stats` shows the seconds per turn each profile really took. On 402, or when retries of a network failure, 408, 429 or 5xx are used up, it continues on the next profile in a new series. A 400 whose message mentions a limit is treated as a 429, because one gateway reports its concurrency limit that way. A profile with `max_sessions` N has N slots, file locks in `~/.local/state/dsk/slots/`; a run holds one from its first request on that profile until its `dsk` process exits. Profiles that reach the same `base_url` with the same `key_env` share one set of slots, limited by the smallest `max_sessions` among them. When all are taken, the run moves to the next profile without sending a request, or, on the last profile in the route, waits for a slot; the display says nothing of such a skip, and shows a real failover as `↯ coralbricks 429 → opencode`. `dsk doctor` takes a slot too, and leaves a profile unchecked while running jobs hold all of its slots. An error that says the credit or quota is used up is not retried: a 402, or a 400, 403 or 429 whose message mentions quota, credit, balance, billing, payment, allowance or a usage limit, but not concurrency, "at a time" or a rate limit. The profile is then paused until the reset time the message names (if within a week), or for its `pause_hours`. Every run skips a paused profile without sending a request, except the last profile in the route, which is always tried. Pauses are files in `~/.local/state/dsk/paused/`; `dsk configure` shows them, and deleting one ends it. A reply with no `finish_reason` whose output reached `max_tokens` counts as cut off (`length`), because one gateway leaves the field empty.
 
 **State** lives in `~/.local/state/dsk/<id>/`: the log, full turn outputs, the answer, the worktree and a lock.
+
+**Stats.** Every log record carries `at`, the time it was written. `dsk stats` reads the logs back: sessions by outcome; turns by kind (`read`, `write`, `run`, `stop`, `failed:<why>`); how many read turns came before the first change; how many turns had their output cut; reply sizes; tokens and cost; rejected rounds; and per profile the turns, tokens, failovers away and seconds per turn. `--sessions` adds a line per session and `--json` gives each session's numbers. A log from before timestamps existed gives no durations.
 
 **Progress.** `dsk status --json` prints `{"jobs": [...]}`, newest first, one object per session created in the last day on any project. Each is read off the session's log, so a run in flight shows where it is: `status`, and while running `phase` (`model` while it waits for a reply, `script`, `checks`), `doing` (the shell command or check in flight) and `act` (the last action the turn finished); `turn` of `max_turns` in the current round and `turns` overall; `in`, `out` and `cached` (the cached share of the input tokens, or null); `cost` in dollars, or null when a profile it used has no `price`; `failover` (the profile it left and why, such as `coralbricks 429`); `note` (the question, or why it stopped), `changed`, `brief`, `profile`, `owner`, `root`, `worktree`, and `created` and `active` in epoch seconds. What it read of a log is kept in `~/.local/state/dsk/status.json` and used again until that log moves, so a reading costs the same however many sessions the day holds: about 0.05 s, most of it Python starting.
 
@@ -192,6 +201,7 @@ Measured on 2026-11-11 with `deepseek-flash` on the official API and `deepseek-v
 ```
 python3 -m unittest discover -s tests     # 101 tests against a scripted API server and temp git repositories
 python3 tests/live.py --table             # real toy tasks on the real providers; costs a few cents
+sh tests/install_test.sh                  # install.sh against a throwaway home folder, without the network
 ```
 
 `../trials` holds a harness that plays the lead on realistic small projects and grades the result with held-out tests and mutants, the session logs it collected, and `FINDINGS.md`.
