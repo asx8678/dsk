@@ -597,10 +597,12 @@ class Loop(Cli):
                             script('print(read("a.txt"))\ndone("It says one.")')]
         out, sid = self.run_ok("look at the file", cwd=repo, code=2)
         self.assertRegex(out, r"^dsk \w{4} · question · a · 1 turn · in \d+\.\dk \(0% cached\) · out \d+\.\dk\n")
-        self.assertEqual(out.splitlines()[1:], ["question: Which file?", f'next:    dsk answer {sid} "..."'])
+        self.assertEqual(out.splitlines()[1:], ["question: Which file?", "context: 1.1k of 32.0k",
+                                                f'next:    dsk answer {sid} "..."'])
         code, out, _ = self.dsk("answer", sid, "a.txt please", cwd=repo)
         self.assertEqual(code, 0, out)
-        self.assertEqual(out.splitlines()[1:], ["answer:  It says one.", f"next:    dsk show {sid} --answer"])
+        self.assertEqual(out.splitlines()[1:], ["answer:  It says one.", "context: 1.2k of 32.0k",
+                                                f'next:    dsk show {sid} --answer | dsk continue {sid} "next task"'])
         self.assertIn("· done · a · 2 turns ·", out)
         first, second = self.api.bodies()
         self.assertEqual([m["role"] for m in second["messages"]], ["system", "user", "assistant", "tool"])
@@ -775,7 +777,7 @@ class Gates(Cli):
                                        "check failed: sh tests/t.sh → 3\nbroken")
         self.assertEqual(out.splitlines()[1:], [
             "summary: Fixed the script.", "open:    none", "checks:  sh tests/t.sh → 0; true → 0",
-            "changed: tests/t.sh (+1 -1)",
+            "changed: tests/t.sh (+1 -1)", "context: 1.2k of 32.0k",
             f'next:    dsk show {sid} --review | dsk accept {sid} | dsk reject {sid} "defects"'])
         self.assertIn("· review · a · 2 turns ·", out)
         header = self.api.bodies()[0]["messages"][1]["content"]
@@ -868,7 +870,8 @@ class Gates(Cli):
         self.assertEqual((self.cat(repo, "a.txt"), os.path.exists(f"{repo}/b.txt")), ("one\n", False))
         self.assertEqual(out.splitlines()[1:], ["answer:  The file says one.",
                                                f"scope:   reverted a.txt, b.txt (copies in {self.tmp}/state/dsk/{sid}/reverted)",
-                                               f"next:    dsk show {sid} --answer"])
+                                               "context: 1.1k of 32.0k",
+                                               f'next:    dsk show {sid} --answer | dsk continue {sid} "next task"'])
 
     def test_stuck_report_carries_notes_and_the_scoped_partial_change(self):
         repo = self.repo({"src/a.py": "a = 1\n", "tests/t.py": "t = 1\n"})
@@ -996,9 +999,10 @@ class Review(Cli):
     def test_review_packet_diff_log_and_answer(self):
         repo, sid = self.delegated()
         packet = self.dsk("show", sid, "--review", cwd=repo)[1].splitlines()
-        self.assertEqual(packet[1:8], ["brief:   bump t", "allow:   tests/**", "notes:   t.py holds the constant",
+        self.assertEqual(packet[1:9], ["brief:   bump t", "allow:   tests/**", "notes:   t.py holds the constant",
                                        "summary: Bumped t and added new.py.", "checks:  true → 0",
-                                       "changed: tests/new.py (+1), tests/t.py (+1 -1)", "diff --git a/tests/new.py b/tests/new.py"])
+                                       "changed: tests/new.py (+1), tests/t.py (+1 -1)", "context: 1.1k of 32.0k",
+                                       "diff --git a/tests/new.py b/tests/new.py"])
         self.assertTrue({"+n = 1", "-t = 1", "+t = 2"} <= set(packet))
         self.assertEqual(packet[-1], f'next:    dsk show {sid} --review | dsk accept {sid} | dsk reject {sid} "defects"')
         self.assertEqual(self.dsk("show", sid, cwd=repo)[1].splitlines()[1], "summary: Bumped t and added new.py.")
@@ -1082,6 +1086,163 @@ class Review(Cli):
         self.assertEqual(self.dsk("reject", sid, "--drop", cwd=repo)[0], 0)
         self.assertEqual((self.git(repo, "branch", "--list", f"dsk/{sid}"), os.path.exists(f"{self.tmp}/state/dsk/{sid}/wt")), ("", False))
         self.assertEqual(self.cat(repo, "tests/t.py"), "t = 7  # I changed the same line\n")
+
+    def test_a_worktree_run_that_ends_done_removes_its_worktree_and_its_branch(self):
+        repo = self.repo({"src/a.py": "a = 1\n"})
+        self.api.replies = [script('print(read("src/a.py").strip())\ndone("read it")')]
+        out, sid = self.run_ok("--worktree", "--allow", "src/**", "look", cwd=repo)
+        self.assertIn("· done ·", out.splitlines()[0])
+        self.assertFalse(os.path.exists(f"{self.tmp}/state/dsk/{sid}/wt"))
+        self.assertEqual(self.git(repo, "branch", "--list", f"dsk/{sid}"), "")
+        self.assertEqual(self.dsk("reject", sid, "--drop", cwd=repo)[0], 0)
+
+
+class Continue(Cli):
+    """`dsk continue` takes a next task in the finished session's own conversation."""
+
+    def test_continue_after_done_extends_the_conversation_and_review_refuses(self):
+        repo = self.repo({"tests/t.py": "t = 1\n"})
+        self.api.replies = [script('done("first")'), script('done("second")')]
+        out, sid = self.run_ok("first task", cwd=repo)
+        code, out2, err = self.dsk("continue", sid, "second task", cwd=repo)
+        self.assertEqual(code, 0, out2 + err)
+        old, new = self.api.bodies()[0]["messages"], self.api.bodies()[1]["messages"]
+        self.assertEqual(new[:len(old)], old)
+        self.assertIn("first task", old[1]["content"])
+        self.assertIn("second task", new[-1]["content"])
+        self.assertIn("2 turns", out2.splitlines()[0])
+        self.api.replies = [script('write("tests/new.py", "n = 1\\n")\ndone("x")')]
+        _, other = self.run_ok("--allow", "tests/**", "--check", "true", "task", cwd=repo)
+        code, out3, err3 = self.dsk("continue", other, "more", cwd=repo)
+        self.assertEqual(code, 1)
+        self.assertIn("done or accepted", out3 + err3)
+
+    def test_continue_after_accept_takes_the_new_allow_and_shows_only_the_new_diff(self):
+        repo = self.repo({"tests/t.py": "t = 1\n", "src/s.py": "s = 1\n"})
+        self.api.replies = [script('write("tests/new.py", "n = 1\\n")\ndone("first")'),
+                            script('sh("echo n = 9 > tests/new.py")\nwrite("src/s.py", "s = 2\\n")'
+                                   '\nwrite("src/b.py", "b = 1\\n")\ndone("second")')]
+        out, sid = self.run_ok("--allow", "tests/**", "first", cwd=repo)
+        self.assertEqual(self.dsk("accept", sid, cwd=repo)[0], 0)
+        code, out2, err = self.dsk("continue", sid, "second", "--allow", "src/**", "--check", "true", cwd=repo)
+        self.assertEqual(code, 0, out2 + err)
+        self.assertIn("scope:   reverted tests/new.py", out2)
+        self.assertEqual((self.cat(repo, "src/b.py"), self.cat(repo, "tests/new.py")), ("b = 1\n", "n = 1\n"))
+        review = self.dsk("show", sid, "--review", cwd=repo)[1]
+        brief = [line for line in review.splitlines() if line.startswith("brief:")][0]
+        self.assertIn("second", brief)
+        self.assertIn("src/b.py", review)
+        self.assertNotIn("n = 9", review)
+        self.assertNotIn("n = 1", review)
+        self.assertEqual(self.dsk("reject", sid, "--drop", cwd=repo)[0], 0)
+        self.assertEqual((os.path.exists(f"{repo}/src/b.py"), self.cat(repo, "tests/new.py")), (False, "n = 1\n"))
+
+    def test_continue_after_accept_of_a_worktree_run_builds_the_worktree_again(self):
+        repo = self.repo({"tests/t.py": "t = 1\n"})
+        self.api.replies = [script('write("tests/new.py", "n = 1\\n")\ndone("first")'),
+                            script('write("tests/more.py", "m = 1\\n")\ndone("second")')]
+        out, sid = self.run_ok("--worktree", "--allow", "tests/**", "first", cwd=repo)
+        self.assertEqual(self.dsk("accept", sid, cwd=repo)[0], 0)
+        wt = f"{self.tmp}/state/dsk/{sid}/wt"
+        self.assertFalse(os.path.exists(wt))
+        code, out2, err = self.dsk("continue", sid, "second", "--check", "true", cwd=repo)
+        self.assertEqual(code, 0, out2 + err)
+        self.assertEqual((self.cat(wt, "tests/new.py"), self.cat(wt, "tests/more.py")), ("n = 1\n", "m = 1\n"))
+        accepted = self.dsk("accept", sid, cwd=repo)
+        self.assertEqual(accepted[0], 0, accepted[1])
+        self.assertIn("1 file applied", accepted[1])
+        self.assertEqual((self.cat(repo, "tests/more.py"), self.cat(repo, "tests/new.py")), ("m = 1\n", "n = 1\n"))
+
+    def test_a_report_has_a_context_line_with_two_figures(self):
+        repo = self.repo({"tests/t.py": "t = 1\n"})
+        self.api.replies = [script('done("x")')]
+        out, sid = self.run_ok("--allow", "tests/**", "--check", "true", "task", cwd=repo)
+        lines = out.splitlines()
+        context = [line for line in lines if line.startswith("context: ")][0]
+        self.assertRegex(context, r"^context: +\d+\.\dk of \d+\.\dk$")
+        self.assertEqual(lines.index(context), len(lines) - 2)
+
+    def test_a_compacted_continued_session_keeps_the_new_allow_and_the_next_task(self):
+        repo = self.repo({"tests/t.py": "t = 1\n"})
+        big = {"prompt_tokens": 40000, "completion_tokens": 10, "total_tokens": 40010}
+        self.api.replies = [{"code": 'write("tests/new.py", "n = 1\\n")', "usage": big},
+                            script('done("first")'),
+                            {"code": 'write("src/more.py", "m = 1\\n")', "usage": big},
+                            script('done("second")')]
+        out, sid = self.run_ok("--allow", "tests/**", "first task", cwd=repo)
+        self.assertEqual(self.dsk("accept", sid, cwd=repo)[0], 0)
+        code, out2, err = self.dsk("continue", sid, "second task", "--allow", "src/**", cwd=repo)
+        self.assertEqual(code, 0, out2 + err)
+        first = [m["content"] for m in self.api.bodies()[-1]["messages"] if m["role"] == "user"][0]
+        self.assertIn("allow: src/**", first)
+        self.assertIn("## Task\nsecond task", first)
+        self.assertIn("earlier task, finished: first task", first)
+        self.assertNotIn("next task from the lead:", first)
+
+    def test_show_still_reports_context_when_the_profile_is_gone(self):
+        repo = self.repo({"tests/t.py": "t = 1\n"})
+        self.api.replies = [script('done("x")')]
+        out, sid = self.run_ok("--profile", "a", "--allow", "tests/**", "task", cwd=repo)
+        self.config["route"] = ["b"]
+        del self.config["profiles"]["a"]
+        self.write_config()
+        code, out2, _ = self.dsk("show", sid, cwd=repo)
+        self.assertEqual(code, 0, out2)
+        self.assertRegex(out2, r"(?m)^context: +\d+\.\dk of 32\.0k$")
+
+    def test_continue_forgets_the_earlier_rounds_long_answer(self):
+        repo = self.repo({"tests/t.py": "t = 1\n"})
+        self.api.replies = [script('write("@answer", "one, at length")\ndone("one")'), script('done("two")')]
+        out, sid = self.run_ok("--allow", "tests/**", "first", cwd=repo)
+        self.assertEqual(self.dsk("show", sid, "--answer", cwd=repo)[1].strip(), "one, at length")
+        code, out2, err = self.dsk("continue", sid, "second", cwd=repo)
+        self.assertEqual(code, 0, out2 + err)
+        self.assertIn("answer:  two\n", out2)
+        self.assertEqual(self.dsk("show", sid, "--answer", cwd=repo)[1].strip(), "two")
+
+    def test_continue_reviews_only_the_change_of_the_new_round(self):
+        repo = self.repo({"tests/t.py": "t = 1\n"})
+        self.api.replies = [script('edit("tests/t.py", "t = 1", "t = 2")\ndone("one")'),
+                            script('edit("tests/t.py", "t = 2", "t = 3")\ndone("two")')]
+        out, sid = self.run_ok("--allow", "tests/**", "first", cwd=repo)
+        self.assertEqual(self.dsk("accept", sid, cwd=repo)[0], 0)
+        code, out2, err = self.dsk("continue", sid, "second", cwd=repo)
+        self.assertEqual(code, 0, out2 + err)
+        review = self.dsk("show", sid, "--review", cwd=repo)[1]
+        self.assertIn("-t = 2\n", review)
+        self.assertIn("+t = 3\n", review)
+        self.assertFalse([line for line in review.splitlines() if "t = 1" in line], review)
+        self.assertNotIn("diff since your last review", review)
+        self.assertEqual(self.dsk("reject", sid, "--drop", cwd=repo)[0], 0)
+        self.assertEqual(self.cat(repo, "tests/t.py"), "t = 2\n")
+
+    def test_a_continued_worktree_run_applies_only_the_new_round(self):
+        repo = self.repo({"tests/t.py": "t = 1\n"})
+        self.api.replies = [script('edit("tests/t.py", "t = 1", "t = 2")\ndone("one")'),
+                            script('edit("tests/t.py", "t = 2", "t = 3")\ndone("two")')]
+        out, sid = self.run_ok("--worktree", "--allow", "tests/**", "first", cwd=repo)
+        self.assertEqual(self.dsk("accept", sid, cwd=repo)[0], 0)
+        self.assertEqual(self.cat(repo, "tests/t.py"), "t = 2\n")
+        code, out2, err = self.dsk("continue", sid, "second", cwd=repo)
+        self.assertEqual(code, 0, out2 + err)
+        accepted = self.dsk("accept", sid, cwd=repo)
+        self.assertEqual(accepted[0], 0, accepted[1])
+        self.assertEqual(self.cat(repo, "tests/t.py"), "t = 3\n")
+
+    def test_a_continued_round_leaves_another_persons_edit_alone(self):
+        repo = self.repo({"tests/t.py": "t = 1\n"})
+        mine = {"tests/t.py": "t = 2  # my edit, made while dsk was running\n"}
+        self.api.between_turns[3] = lambda: self.put(repo, mine)
+        self.api.replies = [script('edit("tests/t.py", "t = 1", "t = 2")\ndone("one")'),
+                            script('write("tests/new.py", "n = 1\\n")'), script('done("two")')]
+        out, sid = self.run_ok("--allow", "tests/**", "first", cwd=repo)
+        self.assertEqual(self.dsk("accept", sid, cwd=repo)[0], 0)
+        code, out2, err = self.dsk("continue", sid, "second", "--check", "true", cwd=repo)
+        self.assertEqual(code, 0, out2 + err)
+        changed = [line for line in out2.splitlines() if line.startswith("changed:")][0]
+        self.assertEqual(changed, "changed: tests/new.py (+1)")
+        self.assertEqual(self.dsk("reject", sid, "--drop", cwd=repo)[0], 0)
+        self.assertEqual(self.cat(repo, "tests/t.py"), mine["tests/t.py"])
 
 
 class Protocol(Cli):

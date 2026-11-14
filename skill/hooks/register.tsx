@@ -22,11 +22,11 @@ const CARD_LINES = 60
 const VIEW_LINES = 600
 const WAITING = ['review', 'question', 'stuck', 'limit', 'error']
 // The verbs that start or continue a run: their rows show its progress.
-const RUNS = ['run', 'answer', 'reject']
+const RUNS = ['run', 'answer', 'reject', 'continue']
 // A Bash command that calls dsk, dsk standing where a command starts: the verb,
 // and the session id after it.
 const CALL =
-  /(?:^|[;&|(\n]|\bdo|\bthen)\s*(?:\S*\/)?dsk(?:\.py)?\s+(run|answer|reject|accept|show|status)\b(?:\s+([0-9a-f]{4})\b)?/
+  /(?:^|[;&|(\n]|\bdo|\bthen)\s*(?:\S*\/)?dsk(?:\.py)?\s+(run|answer|reject|continue|accept|show|status)\b(?:\s+([0-9a-f]{4})\b)?/
 // A quoted argument, with the flag it belongs to when one stands right before it.
 const ARGUMENT = /(--[a-z-]+[ =]+)?(?:"((?:[^"\\]|\\.)*)"|'([^']*)')/g
 // What a command only carries as text: a here-document's body, and a quoted string.
@@ -54,6 +54,7 @@ const LABELS = [
   'changed',
   'sources',
   'cache',
+  'context',
   'next',
 ]
 const CHECK = /(.+?) → (-?\d+)(?:; |$)/g
@@ -459,14 +460,11 @@ const branch = (
   under: readonly RenderNode[],
   actions: RenderNode | undefined,
 ) => {
-  // A profile whose slots other runs held was skipped before any request: nothing failed, so it is no warning.
-  const isBusy = job.failover.endsWith(' full')
+  // A profile whose slots other runs held was skipped before any request: nothing failed, so nothing is said.
   const moved =
-    job.failover === ''
+    job.failover === '' || job.failover.endsWith(' full')
       ? ''
-      : isBusy
-        ? ` · ${job.failover.slice(0, -' full'.length)} busy → ${job.profile}`
-        : ` · ↯ ${job.failover} → ${job.profile}`
+      : ` · ↯ ${job.failover} → ${job.profile}`
   const tail = ` · ${job.id}${about}`
   const room = Math.max(12, columns - 5 - tail.length - moved.length)
   const lead = isLast ? '     ⎿  ' : '  │  ⎿  '
@@ -477,8 +475,7 @@ const branch = (
         <Text dimColor>{isLast ? '  └─ ' : '  ├─ '}</Text>
         {cut(job.brief, room)}
         <Text dimColor>{tail}</Text>
-        {moved !== '' &&
-          (isBusy ? <Text dimColor>{moved}</Text> : <Text color="warning">{moved}</Text>)}
+        {moved !== '' && <Text color="warning">{moved}</Text>}
       </Text>
       {under.map(line => (
         <Text wrap="truncate-end">
@@ -601,7 +598,7 @@ const card = (kit: Kit, report: Report) => {
       .map(label => `${label}: ${cut(field(label).replace(/\s+/g, ' '), 240)}`)
   // What the lead asked for, on a review packet; and after the worker's words, what stands in the way.
   const asked = noted(['brief', 'allow', 'where'])
-  const notes = noted(['why', 'open', 'notes', 'sources', 'cache'])
+  const notes = noted(['why', 'open', 'notes', 'sources', 'cache', 'context'])
 
   return (
     <Box flexDirection="column">
