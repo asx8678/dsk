@@ -93,7 +93,7 @@ DEFAULTS = {
     # first whenever a profile of the route has no measurement younger than bench_minutes
     "route_order": "listed",
     "bench_minutes": 15,
-    # output_chars and read_chars: how much of what a turn printed goes back to the worker, for a turn that only reads
+    # read_chars and output_chars: how much of what a turn printed goes back to the worker, for a turn that only reads
     # files and for any other
     # idle_seconds is under the gateways' ~125 s timeout; reply_seconds was the old socket timeout, which capped a
     # whole reply; reviewer_seconds caps one review, whose tokens are not counted in run_tokens
@@ -125,17 +125,20 @@ SETUP = "enter your DeepSeek API key, or pick provider `custom` and enter its en
 
 
 def plugin(part="options"):
-    """What the plugin's hooks last stored (`dsk configure --hook`): its options, or its id. Empty when there is none.
-    ~/.config/dsk/plugin.json only points at the options, which live in the plugin's own data folder and go with it."""
+    """What the plugin's hooks last stored (`dsk configure --hook`): its options, the path of the file that holds
+    them, or its id. Empty when there is none. ~/.config/dsk/plugin.json only points at the options, which live in
+    the plugin's own data folder and go with it."""
     try:
         with open(os.path.join(xdg("XDG_CONFIG_HOME", "~/.config"), "plugin.json"), encoding="utf-8") as f:
             pointer = json.load(f)
         if part == "id":
             return pointer["id"]
+        if part == "path":
+            return pointer["options"] if isinstance(pointer["options"], str) else ""
         with open(pointer["options"], encoding="utf-8") as f:
             return json.load(f)
     except (OSError, ValueError, KeyError, TypeError):
-        return {} if part == "options" else "dsk@<its marketplace>"
+        return {"options": {}, "path": ""}.get(part, "dsk@<its marketplace>")
 
 
 def config():
@@ -178,6 +181,17 @@ def api_key(block):
     if not key:
         raise Fail(f"{block['key_env']} is not set. In Claude Code, run /plugin configure {plugin('id')} and {SETUP}; "
                    f"or export it in ~/.config/dsk/env")
+    return key
+
+
+def search_key(cfg):
+    """The key for the official search and fetch tools, with its own message when the key that only they need is missing."""
+    block = cfg["search"]
+    key = secret(block["key_env"])
+    if not key:
+        raise Fail(f"web search needs the key {block['key_env']} and there is none, so --web, `dsk search` and "
+                   f"`dsk fetch` are unavailable. To add it, run /plugin configure {plugin('id')} in Claude Code and "
+                   f"enter a DeepSeek API key, or export {block['key_env']} in ~/.config/dsk/env")
     return key
 
 
@@ -790,7 +804,8 @@ def gate(script):
 # Build caches that checks write to outside the tree: Go, npm, pip and Swift. A config's `sandbox_write` adds folders.
 SANDBOX_WRITE = ("~/Library/Caches", "~/.cache", "~/.npm", "~/go/pkg/mod", "~/Library/Developer/Xcode/DerivedData",
                  "~/Library/org.swift.swiftpm")
-# Credentials no worker needs: dsk's own key file first. A config's `sandbox_hide` adds paths.
+# Credentials no worker needs: dsk's own key file first. A config's `sandbox_hide` adds paths, and sandbox_profile
+# adds the file where the plugin's form keeps its keys, which is in Claude Code's folder, not in ~/.config/dsk.
 SANDBOX_HIDE = ("~/.config/dsk", "~/.ssh", "~/.aws", "~/.gnupg", "~/.netrc", "~/.config/gh", "~/.docker", "~/.kube",
                 "~/Library/Keychains")
 SANDBOX_EXEC = "/usr/bin/sandbox-exec"
@@ -839,7 +854,10 @@ def sandbox_profile(cfg, workdir, sdir):
     if gits:
         forms += [f"(deny file-write* {under(gits)})",
                   f"(allow file-write* (literal {sbpl(gits[0] + '/index')}) (literal {sbpl(gits[0] + '/index.lock')}))"]
-    forms.append(f"(deny file-read* {under([home(p) for p in (*SANDBOX_HIDE, *cfg.get('sandbox_hide', []))])})")
+    hidden = [home(p) for p in (*SANDBOX_HIDE, *cfg.get("sandbox_hide", []))]
+    stored = plugin("path")  # the keys entered in the plugin's form, and the copy `configure --hook` writes beside it
+    hidden += [real(stored), real(stored) + ".new"] if stored else []
+    forms.append(f"(deny file-read* {under(hidden)})")
     return " ".join(forms)
 
 
@@ -1117,7 +1135,7 @@ def web_tool(cfg, kind, target, count=5):
     """One raw search or fetch on the official tools API. No model is involved."""
     payload = {"query": target, "count": count} if kind == "search" else {"url": target}
     url = f"{cfg['search']['base_url'].rstrip('/')}/v1/tools/{kind}"
-    return post(url, api_key(cfg["search"]), dumps(payload), cfg["backoff"])
+    return post(url, search_key(cfg), dumps(payload), cfg["backoff"])
 
 
 def web_call(s, cfg, turn, kind, args):
@@ -1565,15 +1583,41 @@ def answer_text(s, summary=""):
     return summary or (s.last("state") or {}).get("summary", "")
 
 
+def ignored_writes(s, changed):
+    """The paths the worker wrote with write() or edit() in the round in flight, sorted and relative to the working
+    directory, that are not in `changed`, still exist and that git ignores: in no diff, and gone with a worktree."""
+    if not scope(s)["start"]:
+        return []
+    base = max((i for i, r in enumerate(s.recs) if r["t"] == "base"), default=-1)
+    tracked, workdir, paths = {row[2] for row in changed}, os.path.realpath(s.head["workdir"]), set()
+    for r in s.recs[base + 1:]:
+        if r["t"] != "ledger" or r["fn"] not in ("write", "edit") or "err" in r or r["arg"].startswith("@"):
+            continue
+        full = os.path.realpath(os.path.join(workdir, r["arg"]))
+        if full != workdir and not full.startswith(workdir + os.sep):
+            continue  # outside the working directory: not the worker's to report here, and git cannot say
+        rel = os.path.relpath(full, workdir)
+        if rel not in tracked and os.path.exists(full):
+            paths.add(rel)
+    if not paths:  # one git call for the round, and none when there are no candidates
+        return []
+    done = subprocess.run(["git", "check-ignore", "-z", "--stdin"], cwd=workdir, capture_output=True,
+                          input="\0".join(sorted(paths)) + "\0", encoding="utf-8", errors="surrogateescape")
+    return sorted(p for p in done.stdout.split("\0") if p) if done.returncode == 0 else []
+
+
 def halt(s, status=None, **info):
     """Record a stop: snapshot the tree, measure what the worker changed, log the state."""
     end, changed = changes(s)
+    ignored = ignored_writes(s, changed)  # a hand-in of nothing but ignored files still changed the worktree
+    if ignored:
+        info["ignored"] = ignored
     if s.head["web"] and "summary" in info:  # research gate: a cited URL must come from search() or fetch() here
         seen = {u.rstrip("/") for r in s.of("ledger") if r["fn"] in ("search", "fetch") and "err" not in r
                 for u in r.get("urls") or [r["arg"]]}
         cited = sorted({u.rstrip(".,;:!?/") for u in re.findall(r"https?://[^\s<>\"'`)\]]+", answer_text(s, info["summary"]))})
         info.update(cited=len(cited), unverified=[u for u in cited if u not in seen])
-    status = status or ("review" if changed else "done")
+    status = status or ("review" if changed or ignored else "done")
     s.add("state", status=status, end=end, changed=changed, **info)
     return status
 
@@ -1912,8 +1956,8 @@ def passed_before(s):
 
 
 def report(s, review=False, cfg=None):
-    """The short report for the session's last stop, or the review packet. `summary`, `answer`, `question` and
-    `notes` are the worker's words; every other line is measured."""
+    """The short report for the session's last stop, or the review packet. `summary`, `answer`, `question`, `notes`
+    and `open` are the worker's words, and a `finding` line is the reviewer's; every other line is measured."""
     st, usage, ledger, checks = s.last("state"), s.of("usage"), s.of("ledger"), s.last("checks") or {"results": []}
     status, turns, cached = s.status(), s.turn, cached_share(usage)
     earlier = [p for p in dict.fromkeys(r.get("profile") for r in s.of("series")) if p and p != s.profile]
@@ -1976,6 +2020,12 @@ def report(s, review=False, cfg=None):
     line("scope", reverted and f"reverted {', '.join(reverted)} (copies in {os.path.join(s.dir, 'reverted')})")
     line("changed", ", ".join(f"{path} ({'binary' if a == '-' else f'+{a}' + (f' -{d}' if d != '0' else '')})"
                               for a, d, path in st.get("changed") or []))
+    ignored_paths = st.get("ignored") or []
+    if ignored_paths:  # a write() to ignored files is in no diff, so nothing else in the report names them
+        many = len(ignored_paths) > 1
+        where = (f"{'they are' if many else 'it is'} only in the worktree {s.head['workdir']}, which dsk accept and --drop delete" if s.head["worktree"]
+                 else f"written, but in no diff, and --drop leaves {'them' if many else 'it'}")
+        line("ignored", f"{', '.join(ignored_paths)} (git ignores {'them' if many else 'it'}: {where})")
     if "cited" in st:
         bad = st["unverified"]
         line("sources", f"{st['cited']} cited, " + (f"{len(bad)} unverified: {' '.join(bad[:5])}" if bad else "all opened in this session"))
@@ -2031,6 +2081,7 @@ def report_json(s, cfg):
             "files": [{"path": path, "added": None if a == "-" else int(a), "deleted": None if d == "-" else int(d)}
                       for a, d, path in st.get("changed") or []],
             "reverted": list(dict.fromkeys(path for g in s.of("gate") for path in g["reverted"])),
+            "ignored": st.get("ignored") or [],
             "workdir": head["workdir"] if head["worktree"] else "",
             "context": {"used": last["prompt"] + last["out"] if last else 0,
                         "limit": (cfg or {}).get("profiles", {}).get(s.profile, {}).get("compact_at", 32000),
@@ -2102,6 +2153,27 @@ def project_root():
     return top.stdout.strip() if top.returncode == 0 else None
 
 
+def ignored_patterns(root, globs):
+    """The --allow patterns that name paths git ignores. Each is tried on a sample path, the pattern with an `x` in
+    place of every wildcard, so `docs/*.md` is asked as `docs/x.md`: a rule may ignore a folder and spare some of its
+    files. The sample need not exist."""
+    found = []
+    for pattern in globs:
+        sample = re.sub(r"\*+|\?|\[[^\]]*\]", "x", pattern)
+        if subprocess.run(["git", "check-ignore", "-q", "--", sample], cwd=root, capture_output=True).returncode == 0:
+            found.append(pattern)
+    return found
+
+
+def refuse_ignored(root, globs):
+    """A worktree hands in only what git tracks or would track: accept applies a git diff and the worktree is then
+    deleted, so a file written to an ignored path there is lost without a word. Such a task has to run in place."""
+    found = ignored_patterns(root, globs)
+    if found:
+        raise Fail(f"--allow {', '.join(found)} names paths git ignores, and a worktree run cannot hand those in: dsk accept "
+                   "applies only what git tracks, and the worktree is then deleted. Run this task without --worktree")
+
+
 def make_worktree(s, root, workdir):
     """A worktree at `workdir`, on branch dsk/<id>, holding the main tree as it is now, uncommitted state and all."""
     if subprocess.run(["git", "-C", root, "rev-parse", "--verify", "-q", "HEAD"], capture_output=True).returncode:
@@ -2143,6 +2215,8 @@ def cmd_run(args, cfg):
     root = project_root()
     if (args.allow or args.worktree) and not root:
         raise Fail("--allow and --worktree need a git repository")
+    if args.worktree:
+        refuse_ignored(root, args.allow)
     route = [args.profile] if args.profile else cfg["route"]
     for name in route:
         if name not in cfg["profiles"]:
@@ -2151,7 +2225,7 @@ def cmd_run(args, cfg):
         route = ordered_route(cfg, route)  # fastest first when the setting says so, and measured if that is stale
     api_key(cfg["profiles"][route[0]])
     if args.web:
-        api_key(cfg["search"])
+        search_key(cfg)
     effort = args.effort or cfg.get("effort", "off")
     if effort not in MAX_TOKENS:
         raise Fail(f"config: effort is {effort!r}, not one of {', '.join(MAX_TOKENS)}")
@@ -2235,12 +2309,17 @@ def cmd_continue(args, cfg):
         raise Fail('give the task as "text" or with --brief FILE, not both')
     text = args.text or slurp(args.brief)
     s = resume(args.id, "done", "accepted")
+    if s.head["worktree"]:  # before anything is added to the log: a refused continue leaves the session as it was
+        refuse_ignored(s.head["root"], args.allow)
     choose_profile(s, cfg, args.profile)
     head = s.head
     if args.allow and head["start"] is None:
         raise Fail("--allow needs a git repository")
     allow, checks = args.allow or scope(s)["allow"], args.check or scope(s)["checks"]
     turns = args.max_turns or scope(s)["max_turns"]
+    if args.allow and not scope(s)["allow"] and args.max_turns is None:
+        # a read-only session that turns to writing in this round gets the turn limit a writing run would have
+        turns = max(turns, 30)
     recheck = scope(s).get("recheck", False) if args.recheck is None else args.recheck
     reviewer = scope(s).get("reviewer", False) if args.reviewer is None else args.reviewer
     if head["worktree"] and not os.path.isdir(head["workdir"]):
@@ -2868,7 +2947,7 @@ def main():
     cont.add_argument("--brief", metavar="FILE", help="read the task from a file (- is stdin)")
     cont.add_argument("--allow", action="append", default=[], metavar="GLOB", help="paths the worker may change")
     cont.add_argument("--check", action="append", default=[], metavar="CMD", help="acceptance test, run by dsk")
-    cont.add_argument("--max-turns", type=int, help="turns this round may take")
+    cont.add_argument("--max-turns", type=int, help="turns this round may take (default: the earlier limit, at least 30 when --allow is new)")
     cont.add_argument("--recheck", action=argparse.BooleanOptionalAction,
                       help="the second look for this round (left out, it stays as it was)")
     cont.add_argument("--reviewer", action=argparse.BooleanOptionalAction,

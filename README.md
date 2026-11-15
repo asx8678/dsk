@@ -40,7 +40,7 @@ Claude Code then asks which provider runs the worker, and for what that provider
 | Provider | What you enter |
 |---|---|
 | `official` | your DeepSeek API key |
-| `custom` | the endpoint URL of any OpenAI-compatible API that serves a DeepSeek model, the model name, and that endpoint's API key. A DeepSeek API key is optional here: with one, the official API is the fallback and web search (`--web`) is available |
+| `custom` | the endpoint URL of any OpenAI-compatible API that serves a DeepSeek model, the model name, and that endpoint's API key. A DeepSeek API key is optional here: with one, the official API is the fallback and web search (`--web`, `dsk search`, `dsk fetch`) is available. Without one, those answer `web search needs the key DEEPSEEK_API_KEY and there is none`, and say how to add it |
 
 - **Keys** are masked as you type and kept in Claude Code's secure store.
 - **To change an answer,** `/plugin configure dsk@asx8678` opens the same form again; restart Claude Code after changing it.
@@ -84,8 +84,8 @@ Every command prints a short plain-text report on stdout. `--verbose` adds one l
 
 | Status | Meaning | Exit code |
 |---|---|---|
-| `review` | files changed, checks passed, waiting for accept or reject | 0 |
-| `done` | no file changed: a read-only answer, or a writable run that found nothing to change; the answer is in the report | 0 |
+| `review` | files changed, or written at a path git ignores; checks passed, waiting for accept or reject | 0 |
+| `done` | no file changed and none written at a path git ignores: a read-only answer, or a writable run that found nothing to change; the answer is in the report | 0 |
 | `question` | the worker called `ask()` | 2 |
 | `stuck` | same reply three times, three replies in a row that showed nothing new, or three failing turns in a row | 3 |
 | `limit` | turn, time or token limit reached | 3 |
@@ -132,7 +132,7 @@ Every flag, an example report as text and the report as JSON (`--json`): [docs/c
 
 The picture's second row is an example of what the scope gate is for: a formatter started with `sh()` rewrites a file outside `--allow`, and `dsk` puts the file back and keeps a copy of the change.
 
-**Worktrees.** `--worktree` runs the task in a fresh git worktree seeded with your uncommitted state. `accept` applies the worktree as it stands to the main tree with `git apply`: changes land uncommitted, and a conflict is refused as a whole.
+**Worktrees.** `--worktree` runs the task in a fresh git worktree seeded with your uncommitted state. `accept` applies the worktree as it stands to the main tree with `git apply`: changes land uncommitted, and a conflict is refused as a whole. A worktree hands in only what git tracks or would track, so `dsk run --worktree`, and `dsk continue` of a worktree session, refuse an `--allow` pattern that names a path git ignores: `accept` applies only what git tracks, and the worktree is then deleted.
 
 **Providers.** A session starts on the first profile in `route`, or with `"route_order": "fastest"` on the fastest one that has a free slot. On 402, or when retries of a network failure, 408, 429 or any 5xx are used up, it continues on the next profile in a new series, and so does a worker that keeps sending the same reply. A profile that reports its credit used up is paused: runs skip it until the pause ends, unless it is the last one in the route.
 
@@ -195,7 +195,7 @@ It is the session that wrote the first generator of this page's images: 7 turns 
 |---|---|---|
 | Manifest | `.claude-plugin/plugin.json` | the name, the version, and `userConfig`: the five options of the form above |
 | Skill | `SKILL.md` | tells Claude when and how to delegate. `/dsk` from a checkout, `/dsk:dsk` installed from the marketplace |
-| Agent | `agents/reviewer.md` | `dsk:reviewer`, for review packets too long to read inline |
+| Agent | `agents/reviewer.md` | `dsk:reviewer`, for a careful change whose review packet is too long to read inline |
 | Command | `bin/dsk` | on the `PATH` of Claude's Bash tool while the plugin is enabled |
 | Hooks | `hooks/hooks.json` | three commands: at session start and before each prompt, `dsk configure --hook`; at each stop, `dsk status --hook` |
 | Hooks module | `hooks/register.tsx` | the display; TypeScript, because Claude Code runs it itself |
@@ -218,7 +218,7 @@ A `DSK.md` at a repository's root opens every run's first message: the layout, h
 
 ## Guardrails, stated honestly
 
-The AST gate, the scrubbed environment, the denylist and the scope gate stop an obedient but mistaken model. On macOS, scripts, `sh()` and checks also run under `sandbox-exec`: writing outside the working directory, the session's scratch folder, the temp folders and the usual build caches fails, and so does writing in `.git`, whose hooks and config would run code outside the sandbox. dsk's key file, `~/.ssh`, `~/.aws` and other credential stores cannot be read. It does not cover the network or git-ignored files inside the tree, and on Linux there is none: there a worker with `sh()` is as powerful as a shell and can read any file you can. Keep `--web` off for tasks that also need `sh()` in a repository with secrets, because fetched pages are untrusted input. Nothing here prevents running `dsk` inside a container.
+The AST gate, the scrubbed environment, the denylist and the scope gate stop an obedient but mistaken model. On macOS, scripts, `sh()` and checks also run under `sandbox-exec`: writing outside the working directory, the session's scratch folder, the temp folders and the usual build caches fails, and so does writing in `.git`, whose hooks and config would run code outside the sandbox. dsk's key file, the plugin's `options.json` (where its form keeps the keys) and the `.new` copy written beside it, `~/.ssh`, `~/.aws` and other credential stores cannot be read. It does not cover the network or git-ignored files inside the tree, and on Linux there is none: there a worker with `sh()` is as powerful as a shell and can read any file you can. Keep `--web` off for tasks that also need `sh()` in a repository with secrets, because fetched pages are untrusted input. Nothing here prevents running `dsk` inside a container.
 
 An in-place run cannot tell its own script's side effects from an edit someone else makes during the same seconds. Such an edit outside `--allow` is undone with the script's (a copy is kept). Use `--worktree` when anyone else is working in the tree.
 

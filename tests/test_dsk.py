@@ -588,6 +588,18 @@ class Plugin(Cli):
         code, out, _ = self.dsk("configure")
         self.assertEqual((code, out.splitlines()[0]), (1, "dsk · not set up · it has no DeepSeek API key"))
 
+    @unittest.skipUnless(dsk.sandbox_works("(version 1)(allow default)(deny file-write* (literal \"/nonexistent\"))"),
+                         "no sandbox here: not macOS, or already inside a sandbox, which macOS will not nest")
+    def test_the_sandbox_hides_the_keys_the_plugin_stored_from_scripts_and_checks(self):
+        self.hook(provider="custom", custom_base_url=self.api.url + "/c", custom_model="m", custom_api_key="sk-custom")
+        repo, stored = self.repo({"a.txt": "one\n"}), f"{self.data}/options.json"
+        self.assertIn("sk-custom", self.cat(stored))  # the form's key is in Claude Code's folder, not in ~/.config/dsk
+        self.api.replies = [script(f'r = sh("cat {stored}")\nwrite("a.txt", "two\\n")\ndone(r.out)')]
+        out, sid = self.run_ok("--allow", "a.txt", "--check", f"cat {stored}; test $? = 1", "write", cwd=repo)
+        self.assertEqual(self.api.chats()[0]["key"], "Bearer sk-custom")  # dsk itself still reads it
+        self.assertEqual((out.count("Operation not permitted"), "sk-custom" in out + self.output(sid, 1)), (1, False), out)
+        self.assertIn(f"checks:  cat {stored}; test $? = 1 → 0\n", out)
+
     def test_the_file_parses_on_an_older_python_so_that_it_can_say_what_it_needs(self):
         with open(DSK, encoding="utf-8") as f:
             ast.parse(f.read(), feature_version=(3, 9))
@@ -1665,6 +1677,63 @@ class Review(Cli):
         self.assertEqual(self.git(repo, "branch", "--list", f"dsk/{sid}"), "")
         self.assertEqual(self.dsk("reject", sid, "--drop", cwd=repo)[0], 0)
 
+    def test_a_run_that_only_writes_a_git_ignored_file_stops_for_review_and_names_it(self):
+        repo = self.repo({"src/a.py": "a = 1\n", ".gitignore": "out/\n"})
+        self.api.replies = [script('write("out/a.txt", "x\\n")\ndone("wrote the ignored file")')]
+        out, sid = self.run_ok("--allow", "out/**", "write outside git", cwd=repo)
+        self.assertIn("· review ·", out.splitlines()[0])
+        self.assertIn("ignored: out/a.txt (git ignores it: written, but in no diff, and --drop leaves it)\n", out)
+        self.assertNotIn("changed:", out)
+        self.assertEqual(self.state(sid), "review")
+        self.assertEqual(self.dsk("accept", sid, cwd=repo)[:2],
+                         (0, f"dsk {sid} · accepted · 0 files already in your working tree\n"))
+        self.assertEqual(self.cat(repo, "out/a.txt"), "x\n")
+
+    def test_a_worktree_run_that_only_writes_a_git_ignored_file_keeps_the_worktree_and_names_it(self):
+        repo = self.repo({"src/a.py": "a = 1\n", ".gitignore": "*.log\n"})
+        self.api.replies = [script('write("src/debug.log", "x\\n")\ndone("wrote the log")')]
+        out, sid = self.run_ok("--worktree", "--allow", "src/**", "make a log", cwd=repo)
+        wt = f"{self.tmp}/state/dsk/{sid}/wt"
+        self.assertIn("· review ·", out.splitlines()[0])
+        self.assertIn(f"ignored: src/debug.log (git ignores it: it is only in the worktree {wt}, "
+                      "which dsk accept and --drop delete)\n", out)
+        self.assertTrue(os.path.exists(f"{wt}/src/debug.log"))
+
+    def test_a_run_that_writes_a_tracked_and_an_ignored_file_names_both(self):
+        repo = self.repo({"src/a.py": "a = 1\n", ".gitignore": "out/\n"})
+        self.api.replies = [script('write("src/a.py", "a = 2\\n")\nwrite("out/b.txt", "y\\n")\ndone("both")')]
+        out, _ = self.run_ok("--allow", "**", "write both", cwd=repo)
+        self.assertIn("changed: src/a.py (+1 -1)\n", out)
+        self.assertIn("ignored: out/b.txt (git ignores it: written, but in no diff, and --drop leaves it)\n", out)
+
+    def test_several_ignored_files_are_named_with_them_and_they_are(self):
+        repo = self.repo({"src/a.py": "a = 1\n", ".gitignore": "out/\n"})
+        self.api.replies = [script('write("out/a.txt", "x\\n")\nwrite("out/b.txt", "y\\n")\ndone("two")')]
+        out, _ = self.run_ok("--allow", "out/**", "write two", cwd=repo)
+        self.assertIn("ignored: out/a.txt, out/b.txt (git ignores them: written, but in no diff, and --drop leaves them)\n", out)
+
+    def test_json_has_the_ignored_files_and_an_empty_list_when_none(self):
+        repo = self.repo({"src/a.py": "a = 1\n", ".gitignore": "out/\n"})
+        self.api.replies = [script('write("out/a.txt", "x\\n")\ndone("wrote the ignored file")')]
+        _, sid = self.run_ok("--allow", "out/**", "write outside git", cwd=repo)
+        self.assertEqual(json.loads(self.dsk("show", sid, "--json", cwd=repo)[1])["ignored"], ["out/a.txt"])
+        other = self.repo({"src/a.py": "a = 1\n"})
+        self.api.replies = [script('write("src/b.py", "b = 1\\n")\ndone("wrote a tracked file")')]
+        _, sid2 = self.run_ok("--allow", "src/**", "write inside git", cwd=other)
+        self.assertEqual(json.loads(self.dsk("show", sid2, "--json", cwd=other)[1])["ignored"], [])
+
+    def test_runs_with_no_ignored_file_report_exactly_as_before(self):
+        repo = self.repo({"src/a.py": "a = 1\n", ".gitignore": "out/\n"})
+        self.api.replies = [script('print(read("src/a.py"))\ndone("read it")')]
+        out, _ = self.run_ok("look", cwd=repo)
+        self.assertIn("· done ·", out.splitlines()[0])
+        self.assertNotIn("ignored:", out)
+        self.api.replies = [script('write("src/new.py", "n = 1\\n")\ndone("wrote it")')]
+        out, _ = self.run_ok("--allow", "src/**", "write it", cwd=repo)
+        self.assertIn("· review ·", out.splitlines()[0])
+        self.assertIn("changed: src/new.py (+1)\n", out)
+        self.assertNotIn("ignored:", out)
+
 
 class Continue(Cli):
     """`dsk continue` takes a next task in the finished session's own conversation."""
@@ -1721,6 +1790,32 @@ class Continue(Cli):
         self.assertEqual(accepted[0], 0, accepted[1])
         self.assertIn("1 file applied", accepted[1])
         self.assertEqual((self.cat(repo, "tests/more.py"), self.cat(repo, "tests/new.py")), ("m = 1\n", "n = 1\n"))
+
+    def test_a_worktree_run_refuses_an_allow_pattern_that_names_ignored_paths(self):
+        repo = self.repo({".gitignore": "out/\n", "src/a.py": "a = 1\n"})
+        code, out, err = self.dsk("run", "--worktree", "--allow", "out/**", "t", cwd=repo)
+        self.assertEqual(code, 1, out + err)
+        self.assertIn("dsk · error: --allow out/** names paths git ignores, and a worktree run cannot hand those in:", out)
+        self.assertEqual(self.api.requests, [])
+        self.assertEqual(self.git(repo, "branch", "--list", "dsk/*"), "")
+        self.assertEqual(len(self.git(repo, "worktree", "list").splitlines()), 1)
+        code, out, err = self.dsk("run", "--worktree", "--allow", "src/**", "--allow", "out/report.html", "t", cwd=repo)
+        self.assertEqual(code, 1, out + err)
+        self.assertIn("--allow out/report.html names paths git ignores", out)
+        for args in (["--worktree", "--allow", "**/*.md"], ["--worktree", "--allow", "*"], ["--allow", "out/**"]):
+            self.api.replies = [script('done("x")')]
+            code, out, err = self.dsk("run", *args, "t", cwd=repo)
+            self.assertEqual(code, 0, out + err)
+
+    def test_continue_of_a_worktree_session_refuses_an_allow_pattern_that_names_ignored_paths(self):
+        repo = self.repo({".gitignore": "out/\n", "src/a.py": "a = 1\n"})
+        self.api.replies = [script('done("first")')]
+        out, sid = self.run_ok("--worktree", "look", cwd=repo)
+        code, out, err = self.dsk("continue", sid, "--allow", "out/**", "t", cwd=repo)
+        self.assertEqual(code, 1, out + err)
+        self.assertIn("dsk · error: --allow out/** names paths git ignores, and a worktree run cannot hand those in:", out)
+        self.assertEqual(len(self.api.chats()), 1)
+        self.assertEqual(dsk.Session(sid).last("state")["status"], "done")
 
     def test_a_report_has_a_context_line_with_two_figures(self):
         repo = self.repo({"tests/t.py": "t = 1\n"})
