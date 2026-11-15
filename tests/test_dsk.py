@@ -777,7 +777,7 @@ class Loop(Cli):
         repo = self.repo({"src/a.py": "a = 1\n", "tests/t.py": "t = 1\n"})
         self.put(repo, {"tests/list.txt": "needle\n"})
         attempts = ['sh("git commit -m x")', 'sh("cd . && git push")', 'sh("/usr/bin/git stash")', 'sh("sudo ls")',
-                    'sh("pip install x")', 'read("../outside.txt")', 'read("/etc/hosts")', 'write("../x", "1")',
+                    'sh("pip install x")', 'write("../x", "1")',
                     'write("src/a.py", "1")', 'edit("src/a.py", "a", "b")', 'write("t.py", "1")', 'search("q")',
                     'fetch("http://x")']
         body = "attempts = [" + ", ".join(f"lambda: {a}" for a in attempts) + """]
@@ -797,8 +797,8 @@ done("tried everything")"""
         printed = self.output(sid, 1).splitlines()
         self.assertEqual([line[:8] for line in printed[:-1]], ["refused:"] * len(attempts), printed)
         self.assertEqual(printed[-1], "0 0 0 True")
-        self.assertIn("src/a.py does not match the allow patterns (tests/**)", printed[8])
-        self.assertIn("needs --web", printed[11])
+        self.assertIn("src/a.py does not match the allow patterns (tests/**)", printed[6])
+        self.assertIn("needs --web", printed[9])
         self.assertEqual((self.cat(repo, "src/a.py"), self.cat(repo, "tests/t.py"), self.cat(repo, "tests/new/deep.py")),
                          ("a = 1\n", "t = 2\n", "ok = 1\n"))
         self.assertIn("changed: tests/new/deep.py (+1), tests/t.py (+1 -1)", out)

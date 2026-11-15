@@ -745,6 +745,8 @@ def child(fd):
             raise PermissionError(f"{path} leaves the scratch folder")
         rel = os.path.relpath(real, cwd)
         if rel == ".." or rel.startswith("../"):
+            if not change:  # reading guards nothing: sh() reads any file the user can, so read() may as well
+                return real
             raise PermissionError(OUTSIDE.format(path))
         if change and not allowed(rel):
             scope = ", ".join(job["allow"]) or "none, this run is read-only"
