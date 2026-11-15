@@ -52,7 +52,7 @@ def typed(st, t, y, cmd, at, dur):
     cover = f'<rect x="46" y="{y - 15}" width="{len(cmd) * CW + 2:g}" height="20" fill="{t["bg"]}"/>'
     st.add(st.type(at, dur, len(cmd), cover))
     caret = f'<rect x="0" y="0" width="8" height="16" rx="1.5" fill="{t["cool"]}"/>'
-    st.add(st.travel([(46, y - 13), (46 + len(cmd) * CW, y - 13)], at, dur, caret))
+    st.add(st.travel([(46, y - 13), (46 + len(cmd) * CW, y - 13)], at, dur, caret, steps=len(cmd)))
 
 
 def spinner(st, t, x, y, text):
@@ -89,8 +89,8 @@ def draw(t):
         else:
             if "· review ·" in text:  # the status, picked out
                 at = text.index("review")
-                row = (f'<rect x="{x + at * CW - 4:g}" y="{row_y - 14}" width="{6 * CW + 8:g}" height="19" rx="5" fill="{t["cool"]}" opacity=".16"/>'
-                       + kit.mono(x, row_y, text, SIZE, cls))
+                highlight = f'<rect x="{x + at * CW - 4:g}" y="{row_y - 14}" width="{6 * CW + 8:g}" height="19" rx="5" fill="{t["cool"]}" opacity=".16"/>'
+                row = st.pop(5.45, highlight) + kit.mono(x, row_y, text, SIZE, cls)
             else:
                 row = kit.mono(x, row_y, text, SIZE, cls)
             if "· running ·" in text:
@@ -104,6 +104,8 @@ def draw(t):
                 if text.startswith("next:"):
                     report = -1
             else:
+                band = f'<rect x="{x - 6:g}" y="{row_y - 15}" width="{len(text) * CW + 12:g}" height="20" rx="5" fill="{t["ok"]}" opacity=".14"/>'
+                st.add(st.blink(9.4, 10.6, band))
                 st.add(st.show(9.4, row, dy=4))
     last_caret = f'<rect x="46" y="{y - 13}" width="8" height="16" rx="1.5" fill="{t["cool"]}"/>'
     blinking = st.ambient("0%{opacity:1}50%,100%{opacity:0}", 1.1, last_caret, timing="step-end")

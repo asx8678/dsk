@@ -95,4 +95,9 @@ def draw(t):
         st.add(st.travel(ASK, b, 0.5, request),
                st.travel(ASK[::-1], b + 0.6, 0.5, script),
                st.travel(EDIT, b + 1.1, 0.4, script))
+    # A ring swells from an actor's dot each time that actor acts, so a still frame still shows who did what.
+    st.add(st.ripple([0.4, 9.6], f'<circle cx="60" cy="171" r="4" fill="none" stroke="{t["warm"]}" stroke-width="1.5"/>', swell=2.6))
+    st.add(st.ripple([FIRST + j * EVERY + 0.5 for j in range(TURNS)],
+                     f'<circle cx="620" cy="61" r="4" fill="none" stroke="{t["cool"]}" stroke-width="1.5"/>', swell=2.6))
+    st.add(st.ripple([7.9, 10.0], f'<circle cx="620" cy="344" r="5" fill="none" stroke="{t["ok"]}" stroke-width="1.5"/>', swell=2.6))
     return st.svg()

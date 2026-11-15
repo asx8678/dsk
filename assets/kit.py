@@ -121,18 +121,35 @@ class Stage:
                   f"{self.pct(b)}{{opacity:1}}{self.pct(b + fade)},100%{{opacity:0}}")
         return self.wrap("blink", frames, f"animation:{{n}} {self.loop}s infinite", inner, hidden=True)
 
-    def travel(self, points, at, dur, inner, fade=0.12):
+    def ripple(self, times, inner, swell=1.9):
+        """`inner` passes through: at each of `times` seconds it shows faintly, swells to `swell` times its size about
+        its own centre and fades, as a ring on water does. A ping for the place where something just happened."""
+        frames, idle = "", "0%"
+        for at in times:
+            frames += (f"{idle},{self.pct(at)}{{opacity:0;transform:scale(1)}}"
+                       f"{self.pct(at + 0.05)}{{opacity:.6;transform:scale(1);animation-timing-function:ease-out}}"
+                       f"{self.pct(at + 0.9)}{{opacity:0;transform:scale({swell:g})}}")
+            idle = self.pct(at + 0.91)
+        frames += f"{idle},100%{{opacity:0;transform:scale(1)}}"
+        return self.wrap("blink", frames, f"transform-box:fill-box;transform-origin:center;animation:{{n}} {self.loop}s infinite",
+                         inner, hidden=True)
+
+    def travel(self, points, at, dur, inner, fade=0.12, hold=0, steps=0):
         """`inner`, drawn around the origin, passes through: from `at` it moves along the points for `dur` seconds,
-        each stretch taking its share of the time by its length."""
+        each stretch taking its share of the time by its length, and rests at the last point for `hold` seconds
+        before it fades. With `steps`, it crosses its first stretch in that many jumps, as a caret does."""
         lengths = [math.dist(p, q) for p, q in zip(points, points[1:])]
         total, gone, frames = sum(lengths) or 1, 0.0, []
         (x0, y0), (xn, yn) = points[0], points[-1]
         frames.append(f"0%,{self.pct(at - fade)}{{opacity:0;transform:translate({x0:g}px,{y0:g}px)}}")
-        frames.append(f"{self.pct(at)}{{opacity:1;transform:translate({x0:g}px,{y0:g}px)}}")
+        jumps = f";animation-timing-function:steps({steps})" if steps else ""
+        frames.append(f"{self.pct(at)}{{opacity:1;transform:translate({x0:g}px,{y0:g}px){jumps}}}")
         for (x, y), length in zip(points[1:], lengths):
             gone += length
             frames.append(f"{self.pct(at + dur * gone / total)}{{opacity:1;transform:translate({x:g}px,{y:g}px)}}")
-        frames.append(f"{self.pct(at + dur + fade)},100%{{opacity:0;transform:translate({xn:g}px,{yn:g}px)}}")
+        if hold:
+            frames.append(f"{self.pct(at + dur + hold)}{{opacity:1;transform:translate({xn:g}px,{yn:g}px)}}")
+        frames.append(f"{self.pct(at + dur + hold + fade)},100%{{opacity:0;transform:translate({xn:g}px,{yn:g}px)}}")
         return self.wrap("travel", "".join(frames), f"animation:{{n}} {self.loop}s linear infinite", inner, hidden=True)
 
     def type(self, at, dur, steps, cover):

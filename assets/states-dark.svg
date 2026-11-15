@@ -1,0 +1,101 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="880" height="350" viewBox="0 0 880 350" role="img" aria-label="A dsk run stops as review, done, question, stuck, limit or error; its report names the commands that are valid next, and answer, reject and continue send the same session back to work">
+<style>.d,.t{font-family:ui-sans-serif,system-ui,-apple-system,'Segoe UI',Helvetica,Arial,sans-serif}.m{font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,'Liberation Mono',monospace}.ink{fill:#f3f4fc}.t2{fill:#c4c9de}.mu{fill:#9097b6}.co{fill:#6366f1}.wa{fill:#ea580c}.ok{fill:#4ade80}.wn{fill:#fbbf24}.cd{fill:#a5b4fc}.gr{fill:#5b6386}.l2{fill:#3e4568}@keyframes a1{0%,2.22%{opacity:0}3.33%{opacity:1}7.78%{opacity:1}8.89%,100%{opacity:0}}.a1{animation:a1 18s infinite}@keyframes a2{0%,2.22%{opacity:0;transform:scale(1)}2.50%{opacity:.6;transform:scale(1);animation-timing-function:ease-out}7.22%{opacity:0;transform:scale(2.6)}7.28%,100%{opacity:0;transform:scale(1)}}.a2{transform-box:fill-box;transform-origin:center;animation:a2 18s infinite}@keyframes a3{0%,7.22%{opacity:0}8.33%{opacity:1}18.89%{opacity:1}20.00%,100%{opacity:0}}.a3{animation:a3 18s infinite}@keyframes a4{0%,34.44%{opacity:0}35.56%{opacity:1}45.56%{opacity:1}46.67%,100%{opacity:0}}.a4{animation:a4 18s infinite}@keyframes a5{0%,61.11%{opacity:0}62.22%{opacity:1}67.78%{opacity:1}68.89%,100%{opacity:0}}.a5{animation:a5 18s infinite}@keyframes a6{0%,10.00%{opacity:0;transform:scale(.4);animation-timing-function:cubic-bezier(.3,1.5,.5,1)}12.50%{opacity:1;transform:none}95.00%{opacity:1;transform:none}97.78%,100%{opacity:0;transform:none}}.a6{transform-box:fill-box;transform-origin:center;animation:a6 18s infinite}@keyframes a7{0%,14.44%{opacity:0;transform:scale(.4);animation-timing-function:cubic-bezier(.3,1.5,.5,1)}16.94%{opacity:1;transform:none}95.00%{opacity:1;transform:none}97.78%,100%{opacity:0;transform:none}}.a7{transform-box:fill-box;transform-origin:center;animation:a7 18s infinite}@keyframes a8{0%,36.67%{opacity:0;transform:scale(.4);animation-timing-function:cubic-bezier(.3,1.5,.5,1)}39.17%{opacity:1;transform:none}95.00%{opacity:1;transform:none}97.78%,100%{opacity:0;transform:none}}.a8{transform-box:fill-box;transform-origin:center;animation:a8 18s infinite}@keyframes a9{0%,41.11%{opacity:0;transform:scale(.4);animation-timing-function:cubic-bezier(.3,1.5,.5,1)}43.61%{opacity:1;transform:none}95.00%{opacity:1;transform:none}97.78%,100%{opacity:0;transform:none}}.a9{transform-box:fill-box;transform-origin:center;animation:a9 18s infinite}@keyframes a10{0%,63.33%{opacity:0;transform:scale(.4);animation-timing-function:cubic-bezier(.3,1.5,.5,1)}65.83%{opacity:1;transform:none}95.00%{opacity:1;transform:none}97.78%,100%{opacity:0;transform:none}}.a10{transform-box:fill-box;transform-origin:center;animation:a10 18s infinite}@keyframes a11{0%,64.44%{opacity:0;transform:translate(0px,0px);animation-timing-function:cubic-bezier(.2,.8,.2,1)}66.67%{opacity:1;transform:none}95.00%{opacity:1;transform:none}97.78%,100%{opacity:0;transform:none}}.a11{animation:a11 18s infinite}@keyframes a12{0%,48.89%{opacity:0}50.00%{opacity:1}57.78%{opacity:1}58.89%,100%{opacity:0}}.a12{animation:a12 18s infinite}@keyframes a13{0%,71.11%{opacity:0}72.22%{opacity:1}81.11%{opacity:1}82.22%,100%{opacity:0}}.a13{animation:a13 18s infinite}@keyframes a14{0%,48.89%{opacity:0;transform:scale(1)}49.17%{opacity:.6;transform:scale(1);animation-timing-function:ease-out}53.89%{opacity:0;transform:scale(2.6)}53.94%,71.11%{opacity:0;transform:scale(1)}71.39%{opacity:.6;transform:scale(1);animation-timing-function:ease-out}76.11%{opacity:0;transform:scale(2.6)}76.17%,100%{opacity:0;transform:scale(1)}}.a14{transform-box:fill-box;transform-origin:center;animation:a14 18s infinite}@keyframes a15{0%,74.44%{opacity:0;transform:scale(.4);animation-timing-function:cubic-bezier(.3,1.5,.5,1)}76.94%{opacity:1;transform:none}95.00%{opacity:1;transform:none}97.78%,100%{opacity:0;transform:none}}.a15{transform-box:fill-box;transform-origin:center;animation:a15 18s infinite}@keyframes a16{0%,52.22%{opacity:0}53.33%{opacity:1}58.33%{opacity:1}59.44%,100%{opacity:0}}.a16{animation:a16 18s infinite}@keyframes a17{0%,77.78%{opacity:0;stroke-dashoffset:44.0}77.83%{opacity:1;stroke-dashoffset:44.0;animation-timing-function:cubic-bezier(.2,.8,.2,1)}81.11%{opacity:1;stroke-dashoffset:0}95.00%{opacity:1;stroke-dashoffset:0}97.78%,100%{opacity:0;stroke-dashoffset:0}}.a17{stroke-dasharray:44.0;animation:a17 18s infinite}@keyframes a18{0%,79.44%{opacity:0;transform:scale(1)}79.72%{opacity:.6;transform:scale(1);animation-timing-function:ease-out}84.44%{opacity:0;transform:scale(1.9)}84.50%,100%{opacity:0;transform:scale(1)}}.a18{transform-box:fill-box;transform-origin:center;animation:a18 18s infinite}@keyframes a19{0%,77.78%{opacity:0;transform:translate(6px,0px);animation-timing-function:cubic-bezier(.2,.8,.2,1)}80.00%{opacity:1;transform:none}95.00%{opacity:1;transform:none}97.78%,100%{opacity:0;transform:none}}.a19{animation:a19 18s infinite}@keyframes a20{0%,22.22%{opacity:0}23.33%{opacity:1}31.11%{opacity:1}32.22%,100%{opacity:0}}.a20{animation:a20 18s infinite}@keyframes a21{0%,22.22%{opacity:0;transform:scale(1)}22.50%{opacity:.6;transform:scale(1);animation-timing-function:ease-out}27.22%{opacity:0;transform:scale(2.6)}27.28%,100%{opacity:0;transform:scale(1)}}.a21{transform-box:fill-box;transform-origin:center;animation:a21 18s infinite}@keyframes a22{0%,25.56%{opacity:0}26.67%{opacity:1}31.67%{opacity:1}32.78%,100%{opacity:0}}.a22{animation:a22 18s infinite}@keyframes a23{0%,4.33%{opacity:0;transform:translate(165px,142px)}5.00%{opacity:1;transform:translate(165px,142px)}6.67%{opacity:1;transform:translate(165px,159px)}7.33%,100%{opacity:0;transform:translate(165px,159px)}}.a23{animation:a23 18s linear infinite}@keyframes a24{0%,18.22%{opacity:0;transform:translate(290px,200px)}18.89%{opacity:1;transform:translate(290px,200px)}20.82%{opacity:1;transform:translate(352px,200px)}21.47%{opacity:1;transform:translate(352px,179px)}22.22%{opacity:1;transform:translate(376px,179px)}22.89%,100%{opacity:0;transform:translate(376px,179px)}}.a24{animation:a24 18s linear infinite}@keyframes a25{0%,30.44%{opacity:0;transform:translate(376px,179px)}31.11%{opacity:1;transform:translate(376px,179px)}31.86%{opacity:1;transform:translate(352px,179px)}32.51%{opacity:1;transform:translate(352px,200px)}34.44%{opacity:1;transform:translate(290px,200px)}35.11%,100%{opacity:0;transform:translate(290px,200px)}}.a25{animation:a25 18s linear infinite}@keyframes a26{0%,44.89%{opacity:0;transform:translate(290px,200px)}45.56%{opacity:1;transform:translate(290px,200px)}46.64%{opacity:1;transform:translate(352px,200px)}48.47%{opacity:1;transform:translate(352px,95px)}48.89%{opacity:1;transform:translate(376px,95px)}49.56%,100%{opacity:0;transform:translate(376px,95px)}}.a26{animation:a26 18s linear infinite}@keyframes a27{0%,57.11%{opacity:0;transform:translate(376px,95px)}57.78%{opacity:1;transform:translate(376px,95px)}58.20%{opacity:1;transform:translate(352px,95px)}60.03%{opacity:1;transform:translate(352px,200px)}61.11%{opacity:1;transform:translate(290px,200px)}61.78%,100%{opacity:0;transform:translate(290px,200px)}}.a27{animation:a27 18s linear infinite}@keyframes a28{0%,67.11%{opacity:0;transform:translate(290px,200px)}67.78%{opacity:1;transform:translate(290px,200px)}68.86%{opacity:1;transform:translate(352px,200px)}70.69%{opacity:1;transform:translate(352px,95px)}71.11%{opacity:1;transform:translate(376px,95px)}71.78%,100%{opacity:0;transform:translate(376px,95px)}}.a28{animation:a28 18s linear infinite}@keyframes a29{0%{transform:translate(0px,0px)}100%{transform:translate(-36px,14px)}}.a29{animation:a29 17s ease-in-out infinite alternate}@keyframes a30{0%{transform:translate(0px,0px)}100%{transform:translate(30px,-16px)}}.a30{animation:a30 21s ease-in-out infinite alternate}@media (prefers-reduced-motion: reduce){*{animation:none!important}}</style>
+<defs><clipPath id="card"><rect x="0.5" y="0.5" width="879" height="349" rx="16"/></clipPath><radialGradient id="glow-cool"><stop offset="0" stop-color="#6366f1" stop-opacity="0.22"/><stop offset="1" stop-color="#6366f1" stop-opacity="0"/></radialGradient><radialGradient id="glow-warm"><stop offset="0" stop-color="#ea580c" stop-opacity="0.14"/><stop offset="1" stop-color="#ea580c" stop-opacity="0"/></radialGradient></defs>
+<rect x="0.5" y="0.5" width="879" height="349" rx="16" fill="#0b0e18" stroke="#262b45"/>
+<g clip-path="url(#card)"><g class="a29" data-k="ambient"><circle cx="700" cy="20" r="330" fill="url(#glow-cool)"/></g><g class="a30" data-k="ambient"><circle cx="60" cy="360" r="300" fill="url(#glow-warm)"/></g></g>
+<text class="m mu" x="40" y="46" font-size="11" letter-spacing=".06em">A RUN STOPS IN ONE OF SIX WAYS</text>
+<text class="m mu" x="840" y="46" font-size="10.5" textLength="296.1" text-anchor="end" xml:space="preserve">the report's last line names what is valid next</text>
+<rect x="40.5" y="78.5" width="250" height="64" rx="12" fill="#141829" stroke="#262b45"/>
+<g class="a1" data-k="blink" opacity="0"><rect x="40.5" y="78.5" width="250" height="64" rx="12" fill="none" stroke="#ea580c" stroke-opacity=".7"/></g>
+<circle cx="64" cy="103" r="4" fill="#ea580c"/>
+<g class="a2" data-k="blink" opacity="0"><circle cx="64" cy="103" r="4" fill="none" stroke="#ea580c" stroke-width="1.5"/></g>
+<text class="d ink" x="76" y="108" font-size="16" font-weight="650">dsk run</text>
+<text class="m mu" x="60" y="130" font-size="11.5" textLength="186.3" text-anchor="start" xml:space="preserve">a brief · --allow · --check</text>
+<path d="M165 142 L165 159" fill="none" stroke="#3e4568" stroke-width="1.5"/>
+<path d="M165 159 L161 152 L169 152 Z" fill="#3e4568"/>
+<rect x="40.5" y="159.5" width="250" height="82" rx="12" fill="#141829" stroke="#262b45"/>
+<g class="a3" data-k="blink" opacity="0"><rect x="40.5" y="159.5" width="250" height="82" rx="12" fill="none" stroke="#6366f1" stroke-opacity=".7"/></g>
+<g class="a4" data-k="blink" opacity="0"><rect x="40.5" y="159.5" width="250" height="82" rx="12" fill="none" stroke="#6366f1" stroke-opacity=".7"/></g>
+<g class="a5" data-k="blink" opacity="0"><rect x="40.5" y="159.5" width="250" height="82" rx="12" fill="none" stroke="#6366f1" stroke-opacity=".7"/></g>
+<circle cx="64" cy="184" r="4" fill="#6366f1"/>
+<text class="d ink" x="76" y="189" font-size="16" font-weight="650">the worker</text>
+<rect x="60.5" y="207.5" width="13" height="13" rx="4" fill="none" stroke="#262b45"/>
+<rect x="80.5" y="207.5" width="13" height="13" rx="4" fill="none" stroke="#262b45"/>
+<rect x="100.5" y="207.5" width="13" height="13" rx="4" fill="none" stroke="#262b45"/>
+<rect x="120.5" y="207.5" width="13" height="13" rx="4" fill="none" stroke="#262b45"/>
+<rect x="140.5" y="207.5" width="13" height="13" rx="4" fill="none" stroke="#262b45"/>
+<rect x="160.5" y="207.5" width="13" height="13" rx="4" fill="none" stroke="#262b45"/>
+<g class="a6" data-k="pop"><rect x="60" y="207" width="14" height="14" rx="4" fill="#6366f1"/></g>
+<g class="a7" data-k="pop"><rect x="80" y="207" width="14" height="14" rx="4" fill="#6366f1"/></g>
+<g class="a8" data-k="pop"><rect x="100" y="207" width="14" height="14" rx="4" fill="#6366f1"/></g>
+<g class="a9" data-k="pop"><rect x="120" y="207" width="14" height="14" rx="4" fill="#6366f1"/></g>
+<g class="a10" data-k="pop"><rect x="140" y="207" width="14" height="14" rx="4" fill="#6366f1"/></g>
+<g class="a11" data-k="show"><text class="m mu" x="270" y="218" font-size="11" textLength="46.2" text-anchor="end" xml:space="preserve">5 turns</text></g>
+<text class="m mu" x="40" y="268" font-size="10.5" textLength="170.1" text-anchor="start" xml:space="preserve">answer, reject and continue</text>
+<text class="m mu" x="40" y="284" font-size="10.5" textLength="214.2" text-anchor="start" xml:space="preserve">send the same session back to work</text>
+<path d="M352 95 L352 305" fill="none" stroke="#3e4568" stroke-width="1.5"/>
+<path d="M352 95 L376 95" fill="none" stroke="#3e4568" stroke-width="1.5"/>
+<path d="M352 137 L376 137" fill="none" stroke="#3e4568" stroke-width="1.5"/>
+<path d="M352 179 L376 179" fill="none" stroke="#3e4568" stroke-width="1.5"/>
+<path d="M352 221 L376 221" fill="none" stroke="#3e4568" stroke-width="1.5"/>
+<path d="M352 263 L376 263" fill="none" stroke="#3e4568" stroke-width="1.5"/>
+<path d="M352 305 L376 305" fill="none" stroke="#3e4568" stroke-width="1.5"/>
+<path d="M290 200 L352 200" fill="none" stroke="#3e4568" stroke-width="1.5"/>
+<rect x="376.5" y="78.5" width="464" height="34" rx="9" fill="#141829" stroke="#262b45"/>
+<g class="a12" data-k="blink" opacity="0"><rect x="376.5" y="78.5" width="464" height="34" rx="9" fill="none" stroke="#ea580c" stroke-opacity=".7"/></g>
+<g class="a13" data-k="blink" opacity="0"><rect x="376.5" y="78.5" width="464" height="34" rx="9" fill="none" stroke="#ea580c" stroke-opacity=".7"/></g>
+<circle cx="394" cy="95" r="4" fill="#ea580c"/>
+<g class="a14" data-k="blink" opacity="0"><circle cx="394" cy="95" r="4" fill="none" stroke="#ea580c" stroke-width="1.5"/></g>
+<text class="m ink" x="406" y="99.5" font-size="12.5" textLength="45" text-anchor="start" xml:space="preserve">review</text>
+<text class="m mu" x="480" y="99" font-size="11" textLength="39.6" text-anchor="start" xml:space="preserve">exit 0</text>
+<g class="a15" data-k="pop"><rect x="531" y="85" width="49.6" height="19" rx="5" fill="#6366f1" opacity=".16"/></g>
+<text class="m t2" x="536" y="99" font-size="11" textLength="39.6" text-anchor="start" xml:space="preserve">accept</text>
+<text class="m mu" x="575.6" y="99" font-size="11" textLength="19.8" text-anchor="start" xml:space="preserve"> · </text>
+<g class="a16" data-k="blink" opacity="0"><rect x="590.4" y="85" width="115.6" height="19" rx="5" fill="#6366f1" opacity=".16"/></g>
+<text class="m t2" x="595.4" y="99" font-size="11" textLength="105.6" text-anchor="start" xml:space="preserve">reject "defects"</text>
+<g class="a17" data-k="draw"><circle cx="757" cy="95" r="7" fill="none" stroke="#4ade80" stroke-width="1.5"/><path d="M753.85 95.14 l2.31 2.38 l4.20 -4.90" fill="none" stroke="#4ade80" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"/></g>
+<g class="a18" data-k="blink" opacity="0"><circle cx="757" cy="95" r="7" fill="none" stroke="#4ade80" stroke-width="1.5"/></g>
+<g class="a19" data-k="show"><text class="m t2" x="822" y="99" font-size="11" textLength="52.8" text-anchor="end" xml:space="preserve">accepted</text></g>
+<rect x="376.5" y="120.5" width="464" height="34" rx="9" fill="#141829" stroke="#262b45"/>
+<circle cx="394" cy="137" r="4" fill="#9097b6"/>
+<text class="m ink" x="406" y="141.5" font-size="12.5" textLength="30" text-anchor="start" xml:space="preserve">done</text>
+<text class="m mu" x="480" y="141" font-size="11" textLength="39.6" text-anchor="start" xml:space="preserve">exit 0</text>
+<text class="m t2" x="536" y="141" font-size="11" textLength="132" text-anchor="start" xml:space="preserve">continue "next task"</text>
+<rect x="376.5" y="162.5" width="464" height="34" rx="9" fill="#141829" stroke="#262b45"/>
+<g class="a20" data-k="blink" opacity="0"><rect x="376.5" y="162.5" width="464" height="34" rx="9" fill="none" stroke="#ea580c" stroke-opacity=".7"/></g>
+<circle cx="394" cy="179" r="4" fill="#ea580c"/>
+<g class="a21" data-k="blink" opacity="0"><circle cx="394" cy="179" r="4" fill="none" stroke="#ea580c" stroke-width="1.5"/></g>
+<text class="m ink" x="406" y="183.5" font-size="12.5" textLength="60" text-anchor="start" xml:space="preserve">question</text>
+<text class="m mu" x="480" y="183" font-size="11" textLength="39.6" text-anchor="start" xml:space="preserve">exit 2</text>
+<g class="a22" data-k="blink" opacity="0"><rect x="531" y="169" width="89.2" height="19" rx="5" fill="#6366f1" opacity=".16"/></g>
+<text class="m t2" x="536" y="183" font-size="11" textLength="79.2" text-anchor="start" xml:space="preserve">answer "..."</text>
+<rect x="376.5" y="204.5" width="464" height="34" rx="9" fill="#141829" stroke="#262b45"/>
+<circle cx="394" cy="221" r="4" fill="#fbbf24"/>
+<text class="m ink" x="406" y="225.5" font-size="12.5" textLength="37.5" text-anchor="start" xml:space="preserve">stuck</text>
+<text class="m mu" x="480" y="225" font-size="11" textLength="39.6" text-anchor="start" xml:space="preserve">exit 3</text>
+<text class="m t2" x="536" y="225" font-size="11" textLength="39.6" text-anchor="start" xml:space="preserve">accept</text>
+<text class="m mu" x="575.6" y="225" font-size="11" textLength="19.8" text-anchor="start" xml:space="preserve"> · </text>
+<text class="m t2" x="595.4" y="225" font-size="11" textLength="112.2" text-anchor="start" xml:space="preserve">reject "guidance"</text>
+<text class="m mu" x="707.6" y="225" font-size="11" textLength="19.8" text-anchor="start" xml:space="preserve"> · </text>
+<text class="m t2" x="727.4" y="225" font-size="11" textLength="85.8" text-anchor="start" xml:space="preserve">reject --drop</text>
+<rect x="376.5" y="246.5" width="464" height="34" rx="9" fill="#141829" stroke="#262b45"/>
+<circle cx="394" cy="263" r="4" fill="#fbbf24"/>
+<text class="m ink" x="406" y="267.5" font-size="12.5" textLength="37.5" text-anchor="start" xml:space="preserve">limit</text>
+<text class="m mu" x="480" y="267" font-size="11" textLength="39.6" text-anchor="start" xml:space="preserve">exit 3</text>
+<text class="m t2" x="536" y="267" font-size="11" textLength="39.6" text-anchor="start" xml:space="preserve">accept</text>
+<text class="m mu" x="575.6" y="267" font-size="11" textLength="19.8" text-anchor="start" xml:space="preserve"> · </text>
+<text class="m t2" x="595.4" y="267" font-size="11" textLength="112.2" text-anchor="start" xml:space="preserve">reject "guidance"</text>
+<text class="m mu" x="707.6" y="267" font-size="11" textLength="19.8" text-anchor="start" xml:space="preserve"> · </text>
+<text class="m t2" x="727.4" y="267" font-size="11" textLength="85.8" text-anchor="start" xml:space="preserve">reject --drop</text>
+<rect x="376.5" y="288.5" width="464" height="34" rx="9" fill="#141829" stroke="#262b45"/>
+<circle cx="394" cy="305" r="4" fill="#fbbf24"/>
+<text class="m ink" x="406" y="309.5" font-size="12.5" textLength="37.5" text-anchor="start" xml:space="preserve">error</text>
+<text class="m mu" x="480" y="309" font-size="11" textLength="39.6" text-anchor="start" xml:space="preserve">exit 1</text>
+<text class="m t2" x="536" y="309" font-size="11" textLength="85.8" text-anchor="start" xml:space="preserve">reject --drop</text>
+<g class="a23" data-k="travel" opacity="0"><circle r="9" fill="#ea580c" opacity=".18"/><circle r="4.5" fill="#ea580c"/></g>
+<g class="a24" data-k="travel" opacity="0"><circle r="9" fill="#6366f1" opacity=".18"/><circle r="4.5" fill="#6366f1"/></g>
+<g class="a25" data-k="travel" opacity="0"><circle r="9" fill="#ea580c" opacity=".18"/><circle r="4.5" fill="#ea580c"/></g>
+<g class="a26" data-k="travel" opacity="0"><circle r="9" fill="#6366f1" opacity=".18"/><circle r="4.5" fill="#6366f1"/></g>
+<g class="a27" data-k="travel" opacity="0"><circle r="9" fill="#ea580c" opacity=".18"/><circle r="4.5" fill="#ea580c"/></g>
+<g class="a28" data-k="travel" opacity="0"><circle r="9" fill="#6366f1" opacity=".18"/><circle r="4.5" fill="#6366f1"/></g>
+</svg>
