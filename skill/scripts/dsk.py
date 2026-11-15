@@ -77,6 +77,7 @@ DEFAULTS = {
     "sh_deny": ["terraform apply", "terraform destroy", "kubectl apply", "kubectl delete", "helm install",
                 "helm upgrade", "helm uninstall", "pip install", "npm install"],
     "env_pass": [],
+    "effort": "off",  # the thinking effort of a `dsk run` that names none: a key of MAX_TOKENS
     "backoff": [2, 6, 18],
     # route_order: "listed" tries the route as written; "fastest" tries the measured fastest first, measuring
     # first whenever a profile of the route has no measurement younger than bench_minutes
@@ -1564,6 +1565,9 @@ def cmd_run(args, cfg):
     api_key(cfg["profiles"][route[0]])
     if args.web:
         api_key(cfg["search"])
+    effort = args.effort or cfg.get("effort", "off")
+    if effort not in MAX_TOKENS:
+        raise Fail(f"config: effort is {effort!r}, not one of {', '.join(MAX_TOKENS)}")
     workdir = root or os.getcwd()
     brief = args.text or slurp(args.brief)
     files = [attachment(value, workdir) for value in args.file]
@@ -1582,7 +1586,7 @@ def cmd_run(args, cfg):
         shutil.rmtree(s.dir, ignore_errors=True)
         raise
     head = s.add("head", id=s.id, root=root or workdir, workdir=workdir, worktree=args.worktree, start=start,
-                 allow=args.allow, checks=args.check, web=args.web, effort=args.effort,
+                 allow=args.allow, checks=args.check, web=args.web, effort=effort,
                  max_turns=args.max_turns or (30 if args.allow else 12),  # leads gave writing runs 25 to 40
                  scratch=True,
                  output_chars=cfg["limits"]["output_chars"], read_chars=cfg["limits"]["read_chars"],
@@ -2108,6 +2112,8 @@ def cmd_configure(args, cfg):
         key, until = "set" if secret(profile.get("key_env", "")) else "missing", paused(name)
         until = f" · paused until {time.strftime('%a %H:%M', time.localtime(until))}, credit used up" if until else ""
         print(f"{name + ':':<8} {profile.get('base_url')} · {profile.get('model')} · key {key}{until}")
+    if cfg.get("effort", "off") != "off":
+        print(f"{'effort:':<10}{cfg['effort']} for a run that names none")
     if cfg.get("route_order") == "fastest":
         found = speeds()
         print(f"{'order:':<10}fastest first: " + ", ".join(
@@ -2221,7 +2227,7 @@ def main():
                      help="attach a file, or lines A to B of it as PATH:A-B (- is stdin)")
     run.add_argument("--web", action="store_true", help="enable search() and fetch()")
     run.add_argument("--worktree", action="store_true", help="work in a fresh git worktree")
-    run.add_argument("--effort", choices=list(MAX_TOKENS), default="off", help="thinking effort")
+    run.add_argument("--effort", choices=list(MAX_TOKENS), help="thinking effort (default: `effort` in the config, else off)")
     run.add_argument("--profile", help="use this provider profile only")
     run.add_argument("--max-turns", type=int, help="turns the run may take (default: 30 with --allow, 12 without)")
     run.add_argument("--owner", default=os.environ.get("CLAUDE_CODE_SESSION_ID", ""),
