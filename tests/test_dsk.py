@@ -176,6 +176,7 @@ class Case(unittest.TestCase):
             "profiles": {"a": {"base_url": self.api.url + "/a", "key_env": "KEY_A", "model": "model-a"},
                          "b": {"base_url": self.api.url + "/b", "key_env": "KEY_B", "model": "model-b"}},
             "search": {"base_url": self.api.url, "key_env": "KEY_S"},
+            "sandbox": "off",  # reports must not depend on the machine: macOS refuses a sandbox inside another one
         }
         self.write_config()
         for patch in (mock.patch.dict(os.environ, self.env), mock.patch.object(dsk, "STATE", f"{self.tmp}/state/dsk")):
@@ -1145,6 +1146,20 @@ class Gates(Cli):
                                                f"scope:   reverted a.txt, b.txt (copies in {self.tmp}/state/dsk/{sid}/reverted)",
                                                "context: 1.2k of 32.0k",
                                                f'next:    dsk show {sid} --answer | dsk continue {sid} "next task"'])
+
+    @unittest.skipUnless(dsk.sandbox_works("(version 1)(allow default)(deny file-write* (literal \"/nonexistent\"))"),
+                         "no sandbox here: not macOS, or already inside a sandbox, which macOS will not nest")
+    def test_sandbox_stops_writes_to_git_and_reads_of_the_key_file_in_scripts_and_checks(self):
+        repo = self.repo({"a.txt": "one\n"})
+        self.config["sandbox"], self.config["sandbox_hide"] = "auto", [f"{self.tmp}/config/dsk"]
+        self.write_config()
+        self.api.replies = [script(f'r = sh("echo x > .git/hooks/post-checkout; cat {self.tmp}/config/dsk/config.json")\n'
+                                   'write("a.txt", "two\\n")\ndone(r.out)')]
+        out, sid = self.run_ok("--allow", "a.txt", "--check", "echo y > .git/check-was-here; test $? = 1", "write", cwd=repo)
+        self.assertEqual((self.cat(repo, "a.txt"), os.path.exists(f"{repo}/.git/hooks/post-checkout"),
+                          os.path.exists(f"{repo}/.git/check-was-here")), ("two\n", False, False))
+        self.assertEqual(out.count("Operation not permitted"), 2, out)  # the hook and the key file
+        self.assertIn(dsk.SANDBOX_LINE, dsk.Session(sid).of("msg")[1]["m"]["content"])
 
     def test_stuck_report_carries_notes_and_the_scoped_partial_change(self):
         repo = self.repo({"src/a.py": "a = 1\n", "tests/t.py": "t = 1\n"})

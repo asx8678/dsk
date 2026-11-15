@@ -725,6 +725,106 @@ def gate(script):
     return None
 
 
+# ---------------------------------------------------------------- sandbox
+
+# Build caches that checks write to outside the tree: Go, npm, pip and Swift. A config's `sandbox_write` adds folders.
+SANDBOX_WRITE = ("~/Library/Caches", "~/.cache", "~/.npm", "~/go/pkg/mod", "~/Library/Developer/Xcode/DerivedData",
+                 "~/Library/org.swift.swiftpm")
+# Credentials no worker needs: dsk's own key file first. A config's `sandbox_hide` adds paths.
+SANDBOX_HIDE = ("~/.config/dsk", "~/.ssh", "~/.aws", "~/.gnupg", "~/.netrc", "~/.config/gh", "~/.docker", "~/.kube",
+                "~/Library/Keychains")
+SANDBOX_EXEC = "/usr/bin/sandbox-exec"
+SANDBOX_LINE = ("sandbox: writing outside the working directory, @scratch and the temp folders fails with "
+                "\"Operation not permitted\"; so does writing in .git. That is policy, not a fault to work around")
+sandboxes = {}  # profile text -> whether sandbox-exec applies it on this machine, tried once per process
+
+
+def sbpl(path):
+    """A path as an SBPL string literal."""
+    return '"' + path.replace("\\", "\\\\").replace('"', '\\"') + '"'
+
+
+def git_dirs(workdir):
+    """The git directory of a working tree and the common one (they differ in a worktree), or [] outside git."""
+    done = subprocess.run(["git", "-C", workdir, "rev-parse", "--path-format=absolute", "--git-dir", "--git-common-dir"],
+                          capture_output=True, text=True)
+    return list(dict.fromkeys(map(os.path.realpath, done.stdout.split()))) if done.returncode == 0 else []
+
+
+def user_cache():
+    """macOS's per-user cache folder, the sibling of the temp folder where clang keeps its module cache, or None."""
+    if "user_cache" not in sandboxes:
+        found = subprocess.run(["getconf", "DARWIN_USER_CACHE_DIR"], capture_output=True, text=True)
+        sandboxes["user_cache"] = os.path.realpath(found.stdout.strip()) if found.returncode == 0 and found.stdout.strip() else None
+    return sandboxes["user_cache"]
+
+
+def sandbox_profile(cfg, workdir, sdir):
+    """The SBPL profile for the worker's scripts and the checks. Rules that come later win, so the order matters:
+    writes are denied, then allowed in the temp folders and build caches, denied again in the other Claude sessions'
+    scratchpads (where staged copies of tools such as dsk live), allowed in the working directory and the session's
+    scratch folder, and denied in git's own directory, whose hooks and config would run code outside any sandbox."""
+    real, home = os.path.realpath, lambda p: os.path.realpath(os.path.expanduser(p))
+    temp = list(dict.fromkeys([real("/tmp"), real(tempfile.gettempdir())]))
+    caches = [*filter(None, [user_cache()]), *(home(p) for p in (*SANDBOX_WRITE, *cfg.get("sandbox_write", [])))]
+    mine = [real(workdir), real(os.path.join(sdir, "scratch")), *temp[1:]]  # the temp folder may be a scratchpad too
+    gits = git_dirs(workdir)
+    under = lambda paths: " ".join(f"(subpath {sbpl(p)})" for p in paths)
+    forms = ["(version 1)", "(allow default)", "(deny file-write*)",
+             '(allow file-write* (literal "/dev/null") (literal "/dev/tty") (literal "/dev/stdout") '
+             '(literal "/dev/stderr") (regex #"^/dev/fd/"))',
+             f"(allow file-write* {under(temp + caches)})",
+             '(deny file-write* (regex #"^/private/tmp/claude-[0-9]+/"))',
+             f"(allow file-write* {under(mine)} (literal {sbpl(os.path.join(real(sdir), 'answer'))}))"]
+    if gits:
+        forms += [f"(deny file-write* {under(gits)})",
+                  f"(allow file-write* (literal {sbpl(gits[0] + '/index')}) (literal {sbpl(gits[0] + '/index.lock')}))"]
+    forms.append(f"(deny file-read* {under([home(p) for p in (*SANDBOX_HIDE, *cfg.get('sandbox_hide', []))])})")
+    return " ".join(forms)
+
+
+def sandbox_works(profile):
+    """Whether sandbox-exec applies `profile` here, tried once. A failure is never read off a command's own output:
+    sandbox-exec exits 65 when it cannot apply a profile, and so may any command."""
+    if profile not in sandboxes:
+        try:
+            sandboxes[profile] = subprocess.run([SANDBOX_EXEC, "-p", profile, "/usr/bin/true"], capture_output=True,
+                                                timeout=30).returncode == 0
+        except (OSError, subprocess.SubprocessError):
+            sandboxes[profile] = False
+    return sandboxes[profile]
+
+
+def sandbox_mode(cfg, workdir, sdir, refused=False):
+    """At a run's start: (True, "") when its scripts and checks will run sandboxed, else (False, why). `refused` is
+    the lead's --no-sandbox, for a task whose tools start a sandbox of their own, which macOS will not nest."""
+    mode = cfg.get("sandbox", "auto")
+    if mode not in ("auto", "off", "required"):
+        raise Fail(f"config: sandbox is {mode!r}, not one of auto, off, required")
+    if refused and mode == "required":
+        raise Fail("config: sandbox is required, so --no-sandbox is refused")
+    if refused:
+        return False, "--no-sandbox"
+    if mode == "off":
+        return False, ""
+    why = "" if sys.platform == "darwin" and os.path.exists(SANDBOX_EXEC) else "no sandbox-exec on this system"
+    why = why or ("" if sandbox_works(sandbox_profile(cfg, workdir, sdir)) else "sandbox-exec could not apply the profile")
+    if why and mode == "required":
+        raise Fail(f"config: sandbox is required, but {why}")
+    return not why, why
+
+
+def sandboxed(s, cfg):
+    """The command prefix that runs a script or a check in the session's sandbox, or [] for a session without one."""
+    if not s.head.get("sandbox"):
+        return []
+    profile = sandbox_profile(cfg, s.head["workdir"], s.dir)
+    if not sandbox_works(profile):
+        raise Fail("the sandbox this run started with cannot be applied any more; dsk reject ID --drop, or set "
+                   '"sandbox": "off" in the config and run it again')
+    return [SANDBOX_EXEC, "-p", profile]
+
+
 # ---------------------------------------------------------------- script execution
 
 GIT_READ_ONLY = ("status", "diff", "log", "show", "grep", "ls-files", "blame", "rev-parse")
@@ -773,11 +873,12 @@ def kill_group(pgid):
         pass  # already gone; macOS answers EPERM for a group of zombies
 
 
-def shell(cmd, timeout, env=None, cwd=None, started=lambda pid: None):
-    """Run a command in its own process group and kill the group when it returns, so nothing outlives it."""
+def shell(cmd, timeout, env=None, cwd=None, started=lambda pid: None, wrap=()):
+    """Run a command in its own process group and kill the group when it returns, so nothing outlives it. `wrap` is
+    a prefix such as the sandbox's, which the command then runs under."""
     with tempfile.TemporaryFile() as out:
-        proc = subprocess.Popen(cmd, shell=True, cwd=cwd, env=env, stdin=subprocess.DEVNULL, stdout=out,
-                                stderr=out, start_new_session=True)
+        proc = subprocess.Popen([*wrap, "/bin/sh", "-c", cmd] if wrap else cmd, shell=not wrap, cwd=cwd, env=env,
+                                stdin=subprocess.DEVNULL, stdout=out, stderr=out, start_new_session=True)
         started(proc.pid)
         try:
             code = proc.wait(timeout)
@@ -988,7 +1089,7 @@ def run_script(s, cfg, env, turn, script):
     limit, out_path = cfg["limits"]["turn_seconds"], os.path.join(s.dir, "out", str(turn))
     ours, theirs = socket.socketpair()
     with open(out_path, "wb") as out:
-        proc = subprocess.Popen([sys.executable, "-I", SELF, "_exec", str(theirs.fileno())],
+        proc = subprocess.Popen([*sandboxed(s, cfg), sys.executable, "-I", SELF, "_exec", str(theirs.fileno())],
                                 cwd=s.head["workdir"], env=env, stdin=subprocess.DEVNULL, stdout=out, stderr=out,
                                 pass_fds=[theirs.fileno()], start_new_session=True)
     theirs.close()
@@ -1124,7 +1225,8 @@ def gates(s, cfg, env):
     try:
         for cmd in scope(s)["checks"]:
             s.add("doing", arg=cmd)
-            code, out = shell(cmd, cfg["limits"]["turn_seconds"], env, s.head["workdir"])
+            # In the sandbox too: a check runs what the worker wrote, such as its tests.
+            code, out = shell(cmd, cfg["limits"]["turn_seconds"], env, s.head["workdir"], wrap=sandboxed(s, cfg))
             results.append([cmd, code])
             if code:
                 problem = f"check failed: {cmd} → {code}\n{out[-2000:].strip()}"
@@ -1260,7 +1362,8 @@ def run_header(terms, web, date):
     return "\n".join(filter(None, ["## Run", "allow: " + (", ".join(terms["allow"]) or "(none: this run is read-only)"),
                        *[f"check: {cmd}" for cmd in terms["checks"]], f"web: {'on' if web else 'off'}", shown,
                        f"turn limit: {terms['max_turns']}", f"date: {date}",
-                       SCRATCH if terms.get("scratch") else ""]))  # a session started before the folder has no line
+                       SCRATCH if terms.get("scratch") else "",  # a session started before the folder has no line
+                       SANDBOX_LINE if terms.get("sandbox") else ""]))
 
 
 def first_message(head, digest="", files=None, review=""):
@@ -1498,6 +1601,7 @@ def report(s, review=False, cfg=None):
     line("question", st.get("question"))
     line("error", st.get("error") or (st["status"] == "running" and status == "error" and "interrupted: its dsk process is gone"))
     line("why", st.get("why"))
+    line("sandbox", s.head.get("unsandboxed") and f"off: {s.head['unsandboxed']}")
     line("notes", partial and " | ".join(r["arg"] for r in ledger if r["fn"] == "note"))
     line("answer" if status == "done" else "summary", (answer_text(s) if status == "done" else st.get("summary", ""))[:1500])
     line("open", st.get("open"))
@@ -1707,6 +1811,7 @@ def cmd_run(args, cfg):
             make_worktree(s, root, workdir)
         if root:
             start = snapshot(workdir, os.path.join(s.dir, "index"))
+        sandbox, unsandboxed = sandbox_mode(cfg, workdir, s.dir, args.no_sandbox)
     except BaseException:
         remove_worktree({"root": root, "workdir": workdir, "id": s.id}) if args.worktree else None
         shutil.rmtree(s.dir, ignore_errors=True)
@@ -1714,7 +1819,7 @@ def cmd_run(args, cfg):
     head = s.add("head", id=s.id, root=root or workdir, workdir=workdir, worktree=args.worktree, start=start,
                  allow=args.allow, checks=args.check, web=args.web, effort=effort,
                  max_turns=args.max_turns or (30 if args.allow else 12),  # leads gave writing runs 25 to 40
-                 scratch=True,
+                 scratch=True, sandbox=sandbox, unsandboxed=unsandboxed,
                  output_chars=cfg["limits"]["output_chars"], read_chars=cfg["limits"]["read_chars"],
                  owner=args.owner, route=route, brief=brief.strip(), files=files, dsk_md=dsk_md.strip(),
                  date=str(datetime.date.today()), created=time.time())
@@ -2372,6 +2477,8 @@ def main():
                      help="attach a file, or lines A to B of it as PATH:A-B (- is stdin)")
     run.add_argument("--web", action="store_true", help="enable search() and fetch()")
     run.add_argument("--worktree", action="store_true", help="work in a fresh git worktree")
+    run.add_argument("--no-sandbox", action="store_true",
+                     help="run this task's scripts and checks without the macOS sandbox, for tools that start their own")
     run.add_argument("--effort", choices=list(MAX_TOKENS), help="thinking effort (default: `effort` in the config, else off)")
     run.add_argument("--profile", help="use this provider profile only")
     run.add_argument("--max-turns", type=int, help="turns the run may take (default: 30 with --allow, 12 without)")

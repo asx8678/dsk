@@ -3,7 +3,7 @@
 Every `dsk` command and flag, what a report looks like as text, and the same report as JSON.
 
 ```
-dsk run [--allow GLOB]... [--check CMD]... [--file PATH[:A-B]]... [--web] [--worktree]
+dsk run [--allow GLOB]... [--check CMD]... [--file PATH[:A-B]]... [--web] [--worktree] [--no-sandbox]
         [--effort off|low|high|max] [--profile NAME]
         [--max-turns N]    (default: 30 with --allow, 12 without)
         [--owner ID]       (default: $CLAUDE_CODE_SESSION_ID, which Claude Code sets for every command)
