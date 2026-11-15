@@ -119,6 +119,7 @@ STATE = xdg("XDG_STATE_HOME", "~/.local/state")
 
 
 # The options the Claude Code plugin asks for (plugin.json `userConfig`), and the key variable each key stands for.
+ALIASES = {}  # a renamed provider's old name -> its name now, filled by config()
 OPTIONS = ("provider", "deepseek_api_key", "custom_base_url", "custom_model", "custom_api_key")
 OPTION_KEYS = {"DEEPSEEK_API_KEY": "deepseek_api_key", "DSK_CUSTOM_API_KEY": "custom_api_key"}
 SETUP = "enter your DeepSeek API key, or pick provider `custom` and enter its endpoint URL, model name and API key"
@@ -156,9 +157,18 @@ def config():
                 user = json.load(f)
         except ValueError as e:
             raise Fail(f"{path}: {e}") from None
+        # renamed: {old name: current name}, written by `dsk provider rename`. It renames a built-in or the plugin's
+        # profile, which would otherwise come back under its first name, and lets a job started under an old name go on.
+        renamed = user.pop("renamed", {}) if isinstance(user.get("renamed"), dict) else {}
+        for old, new in renamed.items():
+            if old in cfg["profiles"] and new not in cfg["profiles"]:
+                cfg["profiles"][new] = cfg["profiles"].pop(old)
         for nested in ("profiles", "limits"):
             cfg[nested].update(user.pop(nested, {}))
         cfg.update(user)
+        cfg["route"] = list(dict.fromkeys(n if n in cfg["profiles"] else renamed.get(n, n) for n in cfg["route"]))
+        ALIASES.clear()
+        ALIASES.update({old: new for old, new in renamed.items() if old not in cfg["profiles"] and new in cfg["profiles"]})
     return cfg
 
 
@@ -306,7 +316,8 @@ class Session:
 
     head = property(lambda self: self.recs[0])
     turn = property(lambda self: max((r["turn"] for r in self.of("msg")), default=0))
-    profile = property(lambda self: self.last("series")["profile"])
+    # A job started under a provider's old name runs on under its new one (`dsk provider rename`).
+    profile = property(lambda self: ALIASES.get(self.last("series")["profile"], self.last("series")["profile"]))
 
 
 # ---------------------------------------------------------------- wire
@@ -2906,12 +2917,14 @@ def cmd_provider(args, cfg):
     if not name:
         raise Fail(f"provider {args.action} needs a name")
     path, user = user_config()
-    profiles, route = user.setdefault("profiles", {}), user.get("route", list(cfg["route"]))
+    profiles, route = user.setdefault("profiles", {}), list(cfg["route"])  # with renames applied
     if args.action == "add":
         if not PROVIDER_NAME.fullmatch(name):
             raise Fail(f"{name!r}: a name is lower-case letters, digits, - and _, starting with a letter, at most 32")
         if name in cfg["profiles"]:
             raise Fail(f"there is already a provider named {name}; change it with: dsk provider set {name}")
+        if name in user.get("renamed", {}):
+            raise Fail(f"{name} was the name of the provider now called {user['renamed'][name]}; pick another name")
         if not args.url or not args.model:
             raise Fail("provider add needs --url and --model")
         check_endpoint(args.url, args.model)
@@ -2928,6 +2941,39 @@ def cmd_provider(args, cfg):
         return 0
     if name not in cfg["profiles"]:
         raise Fail(f"no provider named {name}; dsk provider list shows them")
+    if args.action == "rename":
+        new = (args.new or "").strip()
+        if not PROVIDER_NAME.fullmatch(new):
+            raise Fail(f"{new!r}: a name is lower-case letters, digits, - and _, starting with a letter, at most 32")
+        if new == name:
+            print(f"dsk · {name} · nothing to change")
+            return 0
+        if new in cfg["profiles"]:
+            raise Fail(f"there is already a provider named {new}")
+        renamed = user.get("renamed") if isinstance(user.get("renamed"), dict) else {}
+        renamed = {old: (new if now == name else now) for old, now in renamed.items() if old != new}
+        renamed[name] = new  # an alias for the jobs running under the old name, and the rename of a built-in one
+        user["renamed"] = {old: now for old, now in renamed.items() if old != now}
+        if name in profiles:
+            profiles[new] = profiles.pop(name)
+        if "route" in user:
+            user["route"] = [new if n == name else n for n in user["route"]]
+        write_kept(path, json.dumps(user, indent=2) + "\n")
+        print(f"dsk · renamed {name} to {new}; its key stays in {cfg['profiles'][name]['key_env']}")
+        return 0
+    if args.action == "up":
+        route = list(cfg["route"])
+        if name not in route:
+            raise Fail(f"{name} is disabled; enable it first")
+        at = route.index(name)
+        if at == 0:
+            print(f"dsk · {name} is already tried first")
+            return 0
+        route[at - 1], route[at] = route[at], route[at - 1]
+        user["route"] = route
+        write_kept(path, json.dumps(user, indent=2) + "\n")
+        print(f"dsk · {name} moved up · route: {' → '.join(route)}")
+        return 0
     if args.action == "set":
         check_endpoint(args.url, args.model)
         key = read_key(args)
@@ -3138,9 +3184,10 @@ def main():
     configure.add_argument("--hook", action="store_true", help="act as a Claude Code hook: store the plugin's options first")
     configure.add_argument("--announce", action="store_true", help="with --hook: say what is still missing")
     configure.add_argument("--data", metavar="DIR", help="with --hook: the plugin's data folder")
-    provider = command("provider", "list, add, change, enable or disable the provider profiles")
-    provider.add_argument("action", choices=["list", "add", "set", "enable", "disable"])
+    provider = command("provider", "list, add, change, rename, reorder, enable or disable the provider profiles")
+    provider.add_argument("action", choices=["list", "add", "set", "rename", "up", "enable", "disable"])
     provider.add_argument("name", nargs="?")
+    provider.add_argument("new", nargs="?", help="rename: the new name")
     provider.add_argument("--url", help="add, set: the base URL of the OpenAI-compatible API")
     provider.add_argument("--model", help="add, set: the model id as the endpoint lists it")
     provider.add_argument("--key-stdin", action="store_true", help="add, set: read the API key from standard input")

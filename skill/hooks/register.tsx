@@ -751,7 +751,7 @@ const save = async ($: EngineInterface) => {
   const now = await read($, providers)
   const field = { name: draft.name.trim(), url: draft.url.trim(), model: draft.model.trim(), key: draft.key.trim() }
   const missing = [
-    ...(now.mode === 'add' && field.name === '' ? ['name'] : []),
+    ...(field.name === '' ? ['name'] : []),
     ...(field.url === '' ? ['API URL'] : []),
     ...(field.model === '' ? ['model name'] : []),
     ...(now.mode === 'add' && field.key === '' ? ['API key'] : []),
@@ -763,28 +763,72 @@ const save = async ($: EngineInterface) => {
     return
   }
 
-  const old = now.list.find(one => one.name === now.editing)
-  const args =
-    now.mode === 'add'
-      ? ['provider', 'add', field.name, '--url', field.url, '--model', field.model]
-      : [
-          'provider',
-          'set',
-          now.editing,
-          ...(old?.base_url === field.url ? [] : ['--url', field.url]),
-          ...(old?.model === field.model ? [] : ['--model', field.model]),
-        ]
-  const ran = await dsk($, field.key === '' ? args : [...args, '--key-stdin'], field.key === '' ? undefined : field.key)
-  const said = (ran?.text ?? '').trim() || 'dsk did not answer. Is it on PATH and up to date?'
-
-  if (ran?.isOk !== true) {
+  const failed = async (said: string) => {
     await update($, providers, was => ({ ...was, note: said, isError: true }))
+  }
+  const answer = (ran: { isOk: boolean; text: string } | undefined) =>
+    (ran?.text ?? '').trim() || 'dsk did not answer. Is it on PATH and up to date?'
+  const old = now.list.find(one => one.name === now.editing)
+  const saidAll: string[] = []
 
-    return
+  // A new name first, so the change below finds the provider under it. A rename that went through stays, even when
+  // the change after it fails: the form then edits the provider under its new name.
+  if (now.mode === 'edit' && field.name !== now.editing) {
+    const renamed = await dsk($, ['provider', 'rename', now.editing, field.name])
+
+    if (renamed?.isOk !== true) {
+      await failed(answer(renamed))
+
+      return
+    }
+
+    saidAll.push(answer(renamed))
+    await update($, providers, was => ({ ...was, editing: field.name }))
+  }
+
+  const isChanged = old?.base_url !== field.url || old?.model !== field.model || field.key !== ''
+
+  if (now.mode === 'add' || isChanged) {
+    const args =
+      now.mode === 'add'
+        ? ['provider', 'add', field.name, '--url', field.url, '--model', field.model]
+        : [
+            'provider',
+            'set',
+            field.name,
+            ...(old?.base_url === field.url ? [] : ['--url', field.url]),
+            ...(old?.model === field.model ? [] : ['--model', field.model]),
+          ]
+    const ran = await dsk($, field.key === '' ? args : [...args, '--key-stdin'], field.key === '' ? undefined : field.key)
+
+    if (ran?.isOk !== true) {
+      await refresh($, { note: [...saidAll, answer(ran)].join('\n'), isError: true })
+
+      return
+    }
+
+    saidAll.push(answer(ran))
   }
 
   draft = { name: '', url: '', model: '', key: '' }
-  await refresh($, { mode: 'list', editing: '', note: said, isError: false })
+  await refresh($, {
+    mode: 'list',
+    editing: '',
+    note: saidAll.join('\n') || `${field.name}: nothing to change`,
+    isError: false,
+  })
+}
+
+/** Moves an enabled provider one place earlier on the route. */
+const moveUp = async ($: EngineInterface, one: Provider) => {
+  const ran = await dsk($, ['provider', 'up', one.name])
+  await refresh($, { note: (ran?.text ?? '').trim(), isError: ran?.isOk !== true })
+}
+
+/** Back to the list without saving. */
+const cancel = async ($: EngineInterface) => {
+  draft = { name: '', url: '', model: '', key: '' }
+  await update($, providers, (was): Providers => ({ ...was, mode: 'list', editing: '', note: '', isError: false }))
 }
 
 /** Takes a provider off the route, or puts it back as the last one tried. */
@@ -975,7 +1019,7 @@ export const register: Register = on => {
     await $.ui.open({ id: SETUP, title: 'dsk providers', focus: true })
 
     return {
-      text: 'Fill in the name, API URL, model name and API key in the dsk providers pane, then press save. It runs after the providers you have.',
+      text: 'Fill in the name, API URL, model name and API key in the dsk providers pane; Enter in the last field or save adds it. It runs after the providers you have, and /dsk-config moves it up.',
     }
   })
 
@@ -989,7 +1033,7 @@ export const register: Register = on => {
     return {
       text: now.isError
         ? now.note
-        : `dsk tries ${used.join(' → ') || 'nothing'}${off.length > 0 ? `; disabled: ${off.join(', ')}` : ''}. Web search: ${now.search ? 'on' : 'off, no DeepSeek key'}. Edit, enable or disable them, or add one, in the dsk providers pane.`,
+        : `dsk tries ${used.join(' → ') || 'nothing'}${off.length > 0 ? `; disabled: ${off.join(', ')}` : ''}. Web search: ${now.search ? 'on' : 'off, no DeepSeek key'}. Rename, edit, reorder, enable or disable them, or add one, in the dsk providers pane.`,
     }
   })
 
@@ -1005,34 +1049,36 @@ export const register: Register = on => {
 
     if (now.mode !== 'list') {
       const isAdd = now.mode === 'add'
+      const was = now.list.find(one => one.name === now.editing)
 
       return (
         <Box flexDirection="column">
-          <Text bold>{isAdd ? 'Add a DeepSeek provider' : `Change ${now.editing}`}</Text>
+          <Text bold>{isAdd ? 'Add a provider' : `Edit ${now.editing}`}</Text>
           <Text dimColor wrap="wrap">
-            Any OpenAI-compatible API that serves a DeepSeek model. Type in each field; Enter or save keeps it.
+            {isAdd
+              ? 'Any OpenAI-compatible API that serves a DeepSeek model. Tab or ↓ moves to the next field; Enter in the last one saves.'
+              : `Change any field; an empty API key keeps the one in ${was?.key_env ?? 'its variable'}. Enter in the last field saves.`}
           </Text>
           <Text> </Text>
-          {isAdd && (
-            <Input
-              key="provider-name"
-              label="Name       "
-              placeholder="lower-case, such as myhost"
-              value={draft.name}
-              autoFocus
-              onInput={value => {
-                draft.name = value
-              }}
-              onSubmit={value => {
-                draft.name = value
-              }}
-            />
-          )}
+          <Input
+            key="provider-name"
+            label="Name       "
+            placeholder="lower-case letters, digits, - or _, such as myhost"
+            value={draft.name}
+            {...(isAdd ? { autoFocus: true as const } : {})}
+            onInput={value => {
+              draft.name = value
+            }}
+            onSubmit={value => {
+              draft.name = value
+            }}
+          />
           <Input
             key="provider-url"
             label="API URL    "
             placeholder="https://example.com/v1"
             value={draft.url}
+            {...(isAdd ? {} : { autoFocus: true as const })}
             onInput={value => {
               draft.url = value
             }}
@@ -1055,28 +1101,25 @@ export const register: Register = on => {
           <Input
             key="provider-key"
             label="API key    "
-            placeholder={isAdd ? "the endpoint's API key" : 'leave empty to keep the key it has'}
+            placeholder={isAdd ? "the endpoint's API key" : `leave empty to keep it (${was?.key ? 'set' : 'missing now'})`}
             value={draft.key}
             onInput={value => {
               draft.key = value
             }}
-            onSubmit={value => {
+            onSubmit={async value => {
               draft.key = value
+              await save($)
             }}
           />
           {draft.key !== '' && <Text dimColor>{`key entered: ${hidden(draft.key.trim())}`}</Text>}
+          {!isAdd && draft.name.trim() !== now.editing && draft.name.trim() !== '' && (
+            <Text dimColor wrap="wrap">{`Renames ${now.editing} to ${draft.name.trim()}; its key and place on the route stay. Running jobs carry on.`}</Text>
+          )}
           <Text> </Text>
           <Box>
-            <Button key="provider-save" label="save" onPress={() => save($)} />
+            <Button key="provider-save" label={isAdd ? 'add' : 'save'} onPress={() => save($)} />
             <Text> </Text>
-            <Button
-              key="provider-cancel"
-              label="cancel"
-              onPress={async () => {
-                draft = { name: '', url: '', model: '', key: '' }
-                await update($, providers, (was): Providers => ({ ...was, mode: 'list', editing: '', note: '', isError: false }))
-              }}
-            />
+            <Button key="provider-cancel" label="cancel" onPress={() => cancel($)} />
           </Box>
           {note}
           <Text dimColor wrap="wrap">
@@ -1086,40 +1129,63 @@ export const register: Register = on => {
       )
     }
 
+    const used = now.list.filter(one => one.enabled)
+    const off = now.list.filter(one => !one.enabled)
+    const row = (one: Provider) => (
+      <Box flexDirection="column">
+        <Box>
+          <Text color={one.enabled ? (one.key ? 'success' : 'warning') : 'inactive'}>
+            {one.enabled ? (one.key ? '● ' : '▲ ') : '○ '}
+          </Text>
+          <Text color={one.enabled ? undefined : 'inactive'} bold={one.enabled}>
+            {`${one.enabled ? `${one.position}. ` : ''}${one.name}`}
+          </Text>
+          <Text dimColor wrap="truncate-end">{`  ${one.model} · ${one.base_url}`}</Text>
+        </Box>
+        <Box>
+          <Text>{'    '}</Text>
+          {!one.key && <Text color="warning">{`no key in ${one.key_env} · `}</Text>}
+          <Button key={`edit-${one.name}`} label="edit" onPress={() => openForm($, one)} />
+          <Text> </Text>
+          {one.enabled && (one.position ?? 1) > 1 && (
+            <Box>
+              <Button key={`up-${one.name}`} label="move up" onPress={() => moveUp($, one)} />
+              <Text> </Text>
+            </Box>
+          )}
+          <Button
+            key={`toggle-${one.name}`}
+            label={one.enabled ? 'disable' : 'enable'}
+            onPress={() => toggle($, one)}
+          />
+        </Box>
+      </Box>
+    )
+
     return (
       <Box flexDirection="column">
         <Text bold>dsk providers</Text>
         <Text dimColor wrap="wrap">
-          A run tries the enabled ones from the top; the next takes over when one fails.
+          {used.length > 0
+            ? `A run goes to ${used.map(one => one.name).join(' → ')}: the first that answers; the next takes over when one fails.`
+            : 'No provider is enabled: add one or enable one below.'}
         </Text>
         <Text> </Text>
-        {now.list.map(one => (
+        {used.map(row)}
+        {off.length > 0 && (
           <Box flexDirection="column">
-            <Box>
-              <Text color={one.enabled ? undefined : 'inactive'} bold={one.enabled}>
-                {`${one.enabled ? `${one.position}.` : 'off'} ${one.name}`}
-              </Text>
-              <Text dimColor wrap="truncate-end">
-                {` · ${one.model} · ${one.base_url} · key ${one.key ? 'set' : 'missing'}`}
-              </Text>
-            </Box>
-            <Box>
-              <Text>{'    '}</Text>
-              <Button key={`edit-${one.name}`} label="edit" onPress={() => openForm($, one)} />
-              <Text> </Text>
-              <Button
-                key={`toggle-${one.name}`}
-                label={one.enabled ? 'disable' : 'enable'}
-                onPress={() => toggle($, one)}
-              />
-            </Box>
+            <Text> </Text>
+            <Text dimColor>Disabled</Text>
+            {off.map(row)}
           </Box>
-        ))}
+        )}
         <Text> </Text>
         <Box>
-          <Button key="provider-add" label="add provider" onPress={() => openForm($)} />
+          <Button key="provider-add" label="+ add provider" onPress={() => openForm($)} />
         </Box>
-        <Text dimColor>{`Web search (--web): ${now.search ? 'on' : 'off, it needs a DeepSeek API key'}`}</Text>
+        <Text color={now.search ? undefined : 'warning'} dimColor={now.search}>
+          {`Web search (--web): ${now.search ? 'on' : 'off, it needs a DeepSeek API key (DEEPSEEK_API_KEY)'}`}
+        </Text>
         {note}
       </Box>
     )
