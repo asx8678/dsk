@@ -19,6 +19,10 @@ Measured on 2026-11-11 with `deepseek-flash` on the official API and `deepseek-v
 - **A reject's defects survive compaction (0.6.2).** The rebuilt first message held only the brief or the last `continue` task. A reject sent more than two turns before a compaction vanished, and the worker went back to the original brief with a fresh turn budget.
   - **Measured:** in the logs of 2026-11-12 to 11-15, 17 of the 22 reject rounds that compacted lost the list, and one of those rounds was accepted with a listed defect unfixed.
   - **Since then:** the reject's text follows the task under `## The lead's review`. `reject --max-turns N` caps that round alone. The `caution:` line of such a round counts the checks that passed when the previous round stopped.
+- **Replies are streamed (0.6.3).** Without a stream, a gateway that hears nothing from its upstream for about 125 seconds gives up with HTTP 524, and a long thinking reply needs more than that.
+  - **Before:** 37 524s in the 504 sessions logged by 2026-11-15: 1 in 42 turns at effort `max`, 1 in 245 at `high`, 1 in 850 without thinking. Each cost 125 seconds and a failover onto a cold cache, and 4 ended their run.
+  - **Measured with streaming:** all five configured providers stream, report usage and cached tokens at the end, and send `[DONE]`. A 16,000-token reply streamed for 249 seconds through zro and a 32,000-token one for 202 seconds through opendesign, with no 524; the longest gap between events was 1.3 seconds and the first data came within 2.6.
+- **A failover compacts for the profile it moves to (0.6.3).** A failover starts a series with no usage record, so compaction never looked: one run moved from a profile that compacts at 48k to one that compacts at 24k and sent it 37k.
 - **After a rejected round, `show --review` prints only what changed since the last review.**
 - **A 429 that survives the retries also fails over,** like a repeated 5xx. So does a network failure.
 - **`python3 -I` discards `PYTHONHASHSEED`,** so the seed is pinned for `sh()` and checks but not for the script process itself.

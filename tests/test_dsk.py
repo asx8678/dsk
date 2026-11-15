@@ -50,10 +50,16 @@ class FakeAPI:
                 api.requests.append({"path": self.path, "raw": raw, "key": self.headers["Authorization"],
                                      "headers": {k.lower(): v for k, v in self.headers.items()}})
                 status, payload, blank = api.answer(self.path, json.loads(raw))
+                stream = hasattr(payload, "__next__")  # a stream is a generator of event lines
                 self.send_response(status)
-                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Type", "text/event-stream" if stream else "application/json")
                 self.end_headers()
-                self.wfile.write(b"\n" * blank + json.dumps(payload).encode())
+                if stream:  # written as produced, the way a gateway sends a long reply
+                    self.wfile.write(b": keep-alive\n" * blank)
+                    for line in payload:
+                        self.wfile.write(line.encode() + b"\n")
+                else:
+                    self.wfile.write(b"\n" * blank + json.dumps(payload).encode())
 
         self.httpd = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
         self.url = f"http://127.0.0.1:{self.httpd.server_address[1]}"
@@ -116,9 +122,42 @@ class FakeAPI:
         self.seen.append(wire)
         usage = {"prompt_tokens": len(wire) // 4, "completion_tokens": len(json.dumps(message)) // 4,
                  "prompt_cache_hit_tokens": shared // 4, "prompt_cache_miss_tokens": len(wire) // 4 - shared // 4}
-        choice = {"index": 0, "finish_reason": reply.get("finish", "tool_calls" if calls else "stop"), "message": message}
+        finish = reply.get("finish", "tool_calls" if calls else "stop")
+        if body.get("stream") and not reply.get("json"):  # a provider that honours the request answers with events
+            return 200, self.stream_reply(reply, message, finish, reply.get("usage", usage), body), reply.get("blank", 0)
+        choice = {"index": 0, "finish_reason": finish, "message": message}
         payload = {"id": "x", "object": "chat.completion", "choices": [choice], "usage": reply.get("usage", usage)}
         return 200, payload, reply.get("blank", 0)
+
+    def stream_reply(self, reply, message, finish, usage, body):
+        """The reply as server-sent events: a role chunk, every field in two pieces, a finish chunk, usage and [DONE]."""
+        def delta(fields):
+            return "data: " + json.dumps({"choices": [{"index": 0, "delta": fields, "finish_reason": None}]})
+
+        yield delta({"role": "assistant", "content": ""})
+        if reply.get("drop"):  # the connection dies after the first chunk
+            return
+        for field in ("reasoning_content", "reasoning"):
+            if message.get(field):  # a long thought arrives over several deltas
+                half = len(message[field]) // 2
+                yield delta({field: message[field][:half]})
+                yield delta({field: message[field][half:]})
+        text = message.get("content") or ""
+        half = len(text) // 2
+        yield delta({"content": text[:half]})
+        yield delta({"content": text[half:]})
+        for n, call in enumerate(message.get("tool_calls") or []):
+            function = call["function"]
+            half = len(function["arguments"]) // 2
+            yield delta({"tool_calls": [{"index": n, "id": call["id"], "type": call["type"], "function": {
+                "name": function["name"], "arguments": function["arguments"][:half]}}]})
+            yield delta({"tool_calls": [{"index": n, "function": {"arguments": function["arguments"][half:]}}]})
+        if reply.get("stall"):  # the gateway thinks for a while before the reply ends
+            time.sleep(reply["stall"])
+        yield "data: " + json.dumps({"choices": [{"index": 0, "delta": {}, "finish_reason": finish}]})
+        if (body.get("stream_options") or {}).get("include_usage"):
+            yield "data: " + json.dumps({"choices": [], "usage": usage})
+        yield "data: [DONE]"
 
 
 class Case(unittest.TestCase):
@@ -163,7 +202,8 @@ class Wire(Case):
         body = dsk.request_body(profile, "off", msgs)
         self.assertEqual(body, dsk.request_body(dict(profile), "off", list(msgs)))
         self.assertEqual(body, '{"model":"m","messages":[{"role":"user","content":"héllo"}],"tools":' + dsk.dumps(dsk.TOOLS)
-                         + ',"max_tokens":16000,"stream":false,"tool_choice":"required","thinking":{"type":"disabled"},'
+                         + ',"max_tokens":16000,"stream":true,"stream_options":{"include_usage":true},'
+                           '"tool_choice":"required","thinking":{"type":"disabled"},'
                            '"reasoning_effort":"none","temperature":0}')
         high = json.loads(dsk.request_body(profile, "high", msgs))
         self.assertEqual((high["thinking"], high["reasoning_effort"], high["max_tokens"], high["tool_choice"]),
@@ -178,6 +218,8 @@ class Wire(Case):
         body = json.loads(dsk.request_body(profile, "off", []))
         self.assertNotIn("thinking", body)
         self.assertEqual((body["enable_thinking"], body["user_id"]), (False, "dsk"))
+        body = json.loads(dsk.request_body({"model": "m", "extra": {"stream": False}}, "off", []))
+        self.assertEqual((body["stream"], "stream_options" in body), (False, False))  # no streaming, no stream options
 
     def test_system_prompt_is_static(self):
         today = __import__("datetime").date.today()
@@ -189,6 +231,13 @@ class Wire(Case):
     def test_blank_keepalive_lines_are_tolerated(self):
         self.api.replies = [{"content": "hello", "blank": 5}]
         self.assertEqual(dsk.chat(self.session(), dsk.config()), ({"role": "assistant", "content": "hello"}, "stop"))
+
+    def test_a_provider_that_answers_json_even_when_stream_was_asked_still_runs_a_turn(self):
+        self.api.replies = [{"code": "print(1)", "json": True}]
+        s = self.session()
+        reply, finish = dsk.chat(s, dsk.config())
+        self.assertEqual((finish, reply["tool_calls"][0]["function"]["arguments"]), ("tool_calls", '{"code": "print(1)"}'))
+        self.assertIsNone(s.of("usage")[0]["first"])  # nothing was streamed, so nothing to time
 
     def test_reply_is_kept_exactly_as_it_will_be_replayed(self):
         self.api.replies = [{"arguments": '{"code":  "print(\\"é\\")" }'}]
@@ -1777,8 +1826,9 @@ class Protocol(Cli):
         self.assertEqual((code, lines[0]), (0, f"dsk doctor · a · {self.api.url}/a · model-a"))
         self.assertEqual(lines[1:4], ["key:      KEY_A works, model accepted", "thinking: off is honoured",
                                       "replies:  5 of 5 are one well-formed run_code call"])
-        self.assertRegex(lines[4], r"^cache:    prompt_cache_hit_tokens · same request three times: 0/\d+, (\d+)/\1, (\d+)/\2 · extended: ")
-        self.assertEqual(lines[5:], ["settings: caching works, compact_at 32000 is fine", "search:   works"])
+        self.assertRegex(lines[4], r"^stream:   yes, first data after 0\.\ds$")
+        self.assertRegex(lines[5], r"^cache:    prompt_cache_hit_tokens · same request three times: 0/\d+, (\d+)/\1, (\d+)/\2 · extended: ")
+        self.assertEqual(lines[6:], ["settings: caching works, compact_at 32000 is fine", "search:   works"])
         first, second, third, fourth = (r["raw"] for r in self.api.chats()[:4])
         self.assertTrue(first == second == third != fourth)
         self.env["KEY_B"] = ""
@@ -1907,7 +1957,8 @@ class Stats(Cli):
         self.assertGreater(timed, 0)
         self.assertEqual(lines["profile a"], f"profile a: {len(usage)} turns · in {dsk.kilo(total_in)} "
                                              f"({round(hit * 100 / total_in)}% cached) · out {dsk.kilo(total_out)} · "
-                                             f"0 failovers away · {secs / timed:.1f} s per turn")
+                                             f"0 failovers away · {secs / timed:.1f} s per turn · "
+                                             f"first data p95 {dsk.p95([u['first'] for u in usage if u['first'] is not None]):.1f}s")
         code, out, err = self.dsk("stats", "--sessions", cwd=repo)
         tail = out.split("\n\n")[1].splitlines()
         mine = dsk.Session(second).of("usage")

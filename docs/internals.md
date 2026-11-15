@@ -24,13 +24,17 @@ Each script runs in a fresh `python3 -I` child with a hard timeout that kills it
 
 The system prompt and the tool are constants in the source. The first user message is ordered stable-first: `DSK.md` (labelled as an attached file, so the worker knows it has it), run header, attached files, brief. A session is an append-only JSONL log, and every request is rebuilt from it. Before each send, `dsk` checks that the serialized messages extend the previous request of the series byte for byte, using a length and SHA-256 stored in the log, so the check also holds across `answer` and `reject`. Only session start, compaction and provider failover start a new series. Hit tokens are recorded per turn; `dsk show ID --log` prints them.
 
+## Streaming
+
+Every request asks for a stream with usage at the end (`stream_options.include_usage`). The reply is rebuilt from the events into the shape a JSON reply has: text, `reasoning_content` and `reasoning` each joined on its own, tool calls joined by index, the last `finish_reason`, the usage chunk. The socket timeout is `limits.idle_seconds`, so a stream that goes quiet fails like a dropped connection; `limits.reply_seconds` caps the whole reply. A response that is not `text/event-stream` is read as JSON. Each `usage` record has `first`, the seconds until the first data arrived.
+
 ## Attachments
 
 `--file PATH` attaches a whole file and `--file PATH:A-B` lines A to B of it, under that name; the run header tells the worker how many characters a turn shows.
 
 ## Compaction
 
-When the last request exceeds the profile's `compact_at`, the series restarts as: system prompt, first message with a digest in place of the dropped turns, then the last two turns verbatim. The first message keeps the task. In a round that a reject started, it also keeps that reject's defects, under `## The lead's review`. Attached files of up to 4,000 characters always stay. Larger ones stay in the order attached while the compacted messages fit in half of `compact_at`, counted at 3 characters a token. If any were dropped, one last message names them, a line range as `read("PATH", A, B)`, and tells the worker to read a file again before relying on it. The digest holds all notes, every question with its answer, one ledger line per action in the dropped turns, and the files changed so far. There is no model call, so the same log always compacts to the same bytes.
+When the last request exceeds the profile's `compact_at`, the series restarts as: system prompt, first message with a digest in place of the dropped turns, then the last two turns verbatim. The first message keeps the task. In a round that a reject started, it also keeps that reject's defects, under `## The lead's review`. Attached files of up to 4,000 characters always stay. Larger ones stay in the order attached while the compacted messages fit in half of `compact_at`, counted at 3 characters a token. If any were dropped, one last message names them, a line range as `read("PATH", A, B)`, and tells the worker to read a file again before relying on it. The digest holds all notes, every question with its answer, one ledger line per action in the dropped turns, and the files changed so far. There is no model call, so the same log always compacts to the same bytes. The check runs again before every request, against the `compact_at` of the profile the request goes to, so a failover to a profile that compacts sooner compacts first. In a `--worktree` run, a dropped file that git ignores is named by its path in the main tree, since the worktree has no copy of it.
 
 ## Gates
 

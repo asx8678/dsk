@@ -85,7 +85,10 @@ DEFAULTS = {
     "bench_minutes": 15,
     # output_chars and read_chars: how much of what a turn printed goes back to the worker, for a turn that only reads
     # files and for any other
-    "limits": {"turn_seconds": 600, "run_seconds": 3600, "run_tokens": 2000000, "output_chars": 6000, "read_chars": 24000},
+    # idle_seconds is under the gateways' ~125 s timeout; reply_seconds was the old socket timeout, which capped a
+    # whole reply
+    "limits": {"turn_seconds": 600, "run_seconds": 3600, "run_tokens": 2000000, "output_chars": 6000, "read_chars": 24000,
+               "idle_seconds": 90, "reply_seconds": 600},
 }
 
 
@@ -302,29 +305,100 @@ def request_body(profile, effort, msgs, heat=0):
     """The only place a chat request is serialized: fixed key order, one static tool, nothing volatile. `heat` is
     the temperature of a run without thinking: 0, except right after a reply that repeated itself (see HEAT)."""
     body = {"model": profile["model"], "messages": msgs, "tools": TOOLS, "max_tokens": MAX_TOKENS[effort],
-            "stream": False}
+            "stream": True, "stream_options": {"include_usage": True}}
     if effort == "off":  # both spellings of "no thinking": some gateways honour only `reasoning_effort`
         body |= {"tool_choice": "required", "thinking": {"type": "disabled"}, "reasoning_effort": "none",
                  "temperature": heat}
     else:  # thinking mode rejects a forced tool call
         body |= {"tool_choice": "auto", "thinking": {"type": "enabled"}, "reasoning_effort": effort}
     body |= profile.get("extra", {})  # a null in `extra` removes a key the provider rejects
+    if body.get("stream") is False:  # a profile that cannot stream gets no `stream_options` either
+        body.pop("stream_options", None)
     return dumps({k: v for k, v in body.items() if v is not None})
 
 
-def send(url, key, payload, extra=None, timeout=600):
-    """One POST. Returns (status, parsed JSON) on success, else (status, error text); status 0 is a network failure."""
+def send(url, key, payload, extra=None, timeout=600, idle=None, deadline=None):
+    """One POST. Returns (status, parsed JSON) on success, else (status, error text); status 0 is a network failure.
+    A streamed reply is rebuilt from its server-sent events, with the seconds its first data took as `_first`."""
     headers = {"Authorization": "Bearer " + key, "Content-Type": "application/json", "User-Agent": "dsk",
                **(extra or {})}
     req = urllib.request.Request(url, payload.encode(), headers)
-    try:
-        with urllib.request.urlopen(req, timeout=timeout) as r:
-            return r.status, json.loads(r.read())  # blank keep-alive lines before the body are JSON whitespace
+    began, streaming = time.time(), json.loads(payload).get("stream") is True
+    try:  # urllib applies the timeout to every read, so `idle` is how long a stream may stay silent
+        with urllib.request.urlopen(req, timeout=min(timeout, idle) if streaming and idle else timeout) as r:
+            if r.headers.get_content_type() != "text/event-stream":
+                return r.status, json.loads(r.read())  # blank keep-alive lines before the body are JSON whitespace
+            reply = sse(r, began, deadline)  # (status, why) when the stream failed, as for an HTTP error
+            return reply if isinstance(reply, tuple) else (r.status, reply)
     except urllib.error.HTTPError as e:
         with e:
             return e.code, " ".join(e.read().decode("utf-8", "replace").split())[:300]
-    except (OSError, ValueError, http.client.HTTPException) as e:
+    except (OSError, ValueError, http.client.HTTPException, KeyError, IndexError, TypeError, AttributeError) as e:
         return 0, f"{type(e).__name__}: {e}"
+
+
+def sse(r, began, deadline):
+    """The reply a JSON response would carry, rebuilt from a stream's events: joined text, calls by index, the last
+    finish_reason and the usage chunk. A stream that fails gives (status, why) instead: an error event, or an end
+    with neither a finish_reason nor [DONE]."""
+    content, thoughts, calls, usage = [], {}, {}, None
+    first = finish = event = None
+    cut_short = done = False
+    for line in r:  # a socket timeout here is an OSError, and send() reports it as a network failure
+        line = line.decode("utf-8").strip()
+        if not line or line.startswith(":"):  # a keep-alive comment or a blank line
+            continue
+        if line.startswith("event:"):  # the name of the event whose data comes next
+            event = line[6:].strip()
+            continue
+        if not line.startswith("data:"):
+            continue
+        data = line[5:].strip()
+        if not data:  # an empty data line is a heartbeat too
+            continue
+        if data == "[DONE]":
+            done = True
+            break
+        chunk = json.loads(data)
+        if first is None:
+            first = time.time() - began
+        if event == "error" and not (isinstance(chunk, dict) and chunk.get("error")):
+            return 502, str(chunk)[:300]  # an error event that carries its message without an "error" key
+        if not isinstance(chunk, dict):
+            return 0, f"not an event object: {data[:200]}"
+        if chunk.get("error"):
+            error = chunk["error"]
+            code = error.get("code") if isinstance(error, dict) else None
+            return (code if type(code) is int and 400 <= code <= 599 else 502), str(error)[:300]
+        usage = chunk.get("usage") or usage
+        for choice in chunk.get("choices") or []:
+            delta = choice.get("delta") or choice.get("message") or {}
+            content.append(delta.get("content") or "")
+            for field in ("reasoning_content", "reasoning"):  # replayable() picks one, so they never merge
+                if delta.get(field):
+                    thoughts.setdefault(field, []).append(delta[field])
+            for n, call in enumerate(delta.get("tool_calls") or []):  # without an index, by place in the list
+                slot = calls.setdefault(call.get("index", n), {})
+                slot["id"] = slot.get("id") or call.get("id")  # sent once; a repeat must not change it
+                slot["type"] = slot.get("type") or call.get("type") or "function"
+                function = call.get("function") or {}
+                slot["name"] = slot.get("name") or function.get("name")
+                slot["arguments"] = slot.get("arguments", "") + (function.get("arguments") or "")
+            finish = choice.get("finish_reason") or finish
+        if deadline is not None and time.time() - began > deadline:  # a reply that outlives its deadline is cut here
+            finish, cut_short = "length", True
+            break
+    if finish is None and not cut_short and not done:
+        return 0, "stream ended early"  # the gateway closed the stream: post() retries it
+    message = {"role": "assistant", "content": "".join(content), **{k: "".join(v) for k, v in thoughts.items()}}
+    if calls:
+        message["tool_calls"] = [{"id": c.get("id"), "type": c.get("type", "function"),
+                                  "function": {"name": c.get("name"), "arguments": c.get("arguments", "")}}
+                                 for _, c in sorted(calls.items())]
+    reply = {"choices": [{"message": message, "finish_reason": finish}], "usage": usage or {}, "_stream": True}
+    if first is not None:
+        reply["_first"] = first
+    return reply
 
 
 def transient(status):
@@ -332,12 +406,12 @@ def transient(status):
     return status in RETRY or 500 <= status <= 599
 
 
-def post(url, key, payload, backoff, headers=None, patient=True):
+def post(url, key, payload, backoff, headers=None, patient=True, idle=None, deadline=None):
     """POST with backoff on transient failures. Every retry sends the identical bytes. When not `patient`, a
     failure that took more than SLOW seconds to arrive is returned at once, for the caller to try another profile."""
     for wait in [*backoff, None]:
         began = time.time()
-        status, data = send(url, key, payload, headers)
+        status, data = send(url, key, payload, headers, idle=idle, deadline=deadline)
         if status == 200 and "choices" in data and data["choices"][0].get("finish_reason") in (
                 "insufficient_system_resource", "aborted"):
             status, data = 503, "generation interrupted by the server"
@@ -438,7 +512,8 @@ def chat(s, cfg, heat=0):
         s.add("req", **fingerprint(wire))
         session = f"dsk-{s.id}-{fingerprint(dumps(s.head))['sha'][:8]}"  # from the log, so every process agrees
         status, data = post(profile["base_url"].rstrip("/") + "/chat/completions", key, body, cfg["backoff"],
-                            headers(profile, session), patient=not later)
+                            headers(profile, session), patient=not later, idle=cfg["limits"]["idle_seconds"],
+                            deadline=cfg["limits"]["reply_seconds"])
         if status == 200:
             try:
                 choice, usage = data["choices"][0], data.get("usage") or {}
@@ -449,7 +524,7 @@ def chat(s, cfg, heat=0):
                 raise Fail(f"{name}: the provider's content filter withheld the reply")
             hit = usage.get("prompt_cache_hit_tokens", (usage.get("prompt_tokens_details") or {}).get("cached_tokens"))
             s.add("usage", turn=s.turn + 1, profile=name, prompt=usage.get("prompt_tokens") or len(body) // 4,
-                  hit=hit, out=usage.get("completion_tokens") or 0)
+                  hit=hit, out=usage.get("completion_tokens") or 0, first=data.get("_first"))
             finish = choice.get("finish_reason")
             cap = profile.get("extra", {}).get("max_tokens") or MAX_TOKENS[s.head["effort"]]
             if finish is None and (usage.get("completion_tokens") or 0) >= cap:  # a gateway that leaves it empty
@@ -1114,10 +1189,15 @@ def digest(recs, upto, changed):
     return "\n".join(out + ["files changed so far: " + (", ".join(changed) or "none")])
 
 
-def name_again(path):
-    """A dropped attachment as the read() call that fetches it again: lines A to B of a file, or the whole file."""
+def name_again(path, head=None):
+    """A dropped attachment as the read() call that fetches it again: lines A to B of a file, or the whole file. A
+    file git ignores is not in a worktree, so there it is named by its path in the main tree, which read() takes."""
     match = re.match(r"^(.+):(\d+)-(\d+)$", path, re.S)
-    return f'read("{match.group(1)}", {match.group(2)}, {match.group(3)})' if match else path
+    name = match.group(1) if match else path
+    if (head and head.get("worktree") and not name.startswith("@") and not os.path.isabs(name)
+            and not os.path.exists(os.path.join(head["workdir"], name)) and os.path.exists(os.path.join(head["root"], name))):
+        name = os.path.join(head["root"], name)
+    return f'read("{name}", {match.group(2)}, {match.group(3)})' if match else name
 
 
 def compaction(recs, changed, compact_at=32000):
@@ -1146,7 +1226,7 @@ def compaction(recs, changed, compact_at=32000):
             keep.add(i)
     kept = [{"turn": 0, "m": msgs[0]["m"]}, {"turn": 0, "m": first(keep)},
             *({"turn": r["turn"], "m": r["m"]} for r in msgs if r["turn"] >= turn - 1)]
-    gone = [name_again(path) for i, path, text in files if i not in keep]
+    gone = [name_again(path, recs[0]) for i, path, text in files if i not in keep]
     if gone and kept[-1]["m"]["role"] == "tool":
         # Said last, where it cannot be missed. Without it a worker carries on from memory and invents what the
         # file said; in trials it then re-read the file on its next turn every time.
@@ -1904,6 +1984,12 @@ def median(values):
     return values[(len(values) - 1) // 2] if values else 0
 
 
+def p95(values):
+    """The 95th percentile by nearest rank, the lowest sample at or above 95% of them, and 0 with nothing to measure."""
+    values = sorted(values)
+    return values[max(0, (len(values) * 95 + 99) // 100 - 1)] if values else 0
+
+
 def share(part, whole):
     """A whole-number percentage of `whole`, and 0 when there is nothing to be a share of."""
     return round(part * 100 / whole) if whole else 0
@@ -2028,6 +2114,8 @@ def stats_summary(pairs):
             p = totals.setdefault(u["profile"], dict(blank))
             p["turns"], p["in"], p["hit"], p["out"] = (p["turns"] + 1, p["in"] + u["prompt"],
                                                        p["hit"] + (u["hit"] or 0), p["out"] + u["out"])
+            if u.get("first") is not None:  # a streamed reply: how long it took to start
+                p.setdefault("firsts", []).append(u["first"])
         for name, (seconds, timed) in m["speed"].items():
             p = totals.setdefault(name, dict(blank))
             p["seconds"], p["timed"] = p["seconds"] + seconds, p["timed"] + timed
@@ -2039,6 +2127,8 @@ def stats_summary(pairs):
               f"out {kilo(p['out'])} · {p['away']} failovers away"
         if p["timed"]:  # how long a turn takes on that profile: the wait for the reply, not the tool's own work
             row += f" · {p['seconds'] / p['timed']:.1f} s per turn"
+        if p.get("firsts"):  # how long the provider took to send the first data of a reply
+            row += f" · first data p95 {p95(p['firsts']):.1f}s"
         lines.append(row)
     return lines
 
@@ -2210,12 +2300,15 @@ def cmd_doctor(args, cfg):
         sent = headers(profile, "dsk-doctor-" + secrets.token_hex(4))  # one value for all five requests
         msgs = [{"role": "system", "content": SYSTEM}, {"role": "user", "content": task}]
         good, thought, field, hits = 0, 0, "not reported", []
+        stream = "no, the provider answers in JSON"  # whether the reply came as events, from the first request
         for step in range(5):  # the same request three times a few seconds apart, then two that extend it
             status, data = post(url, key, request_body(profile, "off", msgs), cfg["backoff"], sent)
             if status != 200:
                 healthy = False
                 print(f"model:    HTTP {status} {data}")
                 break
+            if step == 0 and data.get("_stream") and data.get("_first") is not None:
+                stream = f"yes, first data after {data['_first']:.1f}s"
             usage, reply = data.get("usage") or {}, replayable(data["choices"][0]["message"], "off")
             field = "prompt_cache_hit_tokens" if "prompt_cache_hit_tokens" in usage else \
                 "prompt_tokens_details.cached_tokens" if "cached_tokens" in (usage.get("prompt_tokens_details") or {}) else field
@@ -2235,6 +2328,7 @@ def cmd_doctor(args, cfg):
             print("thinking: " + (f"NOT off: {thought} reasoning tokens. Put this provider's switch in profiles.{name}.extra"
                                   if thought else "off is honoured"))
             print(f"replies:  {good} of 5 are one well-formed run_code call")
+            print(f"stream:   {stream}")
             print(f"cache:    {field} · same request three times: {', '.join(hits[:3])} · extended: {', '.join(hits[3:])}")
             print("settings: " + (f"caching works, compact_at {profile.get('compact_at', 32000)} is fine" if cached else
                                   "no cache hits seen, so every turn is billed in full: set compact_at to 24000 or lower"))
