@@ -1195,14 +1195,15 @@ class Compaction(Cli):
 
     def test_the_same_log_compacts_to_the_same_bytes(self):
         log = self.long_run()
+        limit = self.config["profiles"]["a"]["compact_at"]
         cut = next(i for i, r in enumerate(log.recs) if r["t"] == "series" and r["why"] == "compact")
         logged = [{"turn": r["turn"], "m": r["m"]} for r in log.recs[cut + 1:cut + 8]]
-        self.assertEqual(dsk.compaction(log.recs[:cut], log.recs[cut]["changed"]), logged)
+        self.assertEqual(dsk.compaction(log.recs[:cut], log.recs[cut]["changed"], limit), logged)
         program = ("import importlib.util, json, sys\n"
                    f"spec = importlib.util.spec_from_file_location('dsk', {DSK!r})\n"
                    "dsk = importlib.util.module_from_spec(spec); spec.loader.exec_module(dsk)\n"
                    f"recs = [json.loads(line) for line in open({log.path!r})][:{cut}]\n"
-                   f"sys.stdout.write(dsk.dumps(dsk.compaction(recs, {log.recs[cut]['changed']!r})))")
+                   f"sys.stdout.write(dsk.dumps(dsk.compaction(recs, {log.recs[cut]['changed']!r}, {limit})))")
         outputs = {subprocess.run([sys.executable, "-c", program], env={**self.env, "PYTHONHASHSEED": seed},
                                   capture_output=True, text=True).stdout for seed in ("1", "2", "3")}
         self.assertEqual(outputs, {dsk.dumps(logged)})

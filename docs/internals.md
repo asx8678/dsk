@@ -30,7 +30,7 @@ The system prompt and the tool are constants in the source. The first user messa
 
 ## Compaction
 
-When the last request exceeds the profile's `compact_at`, the series restarts as: system prompt, first message with a digest in place of the large attached files, then the last two turns verbatim. Attached files of up to 4,000 characters stay. If larger ones were dropped, one last message names them and tells the worker to read a file again before relying on it. The digest holds all notes, every question with its answer, one ledger line per action in the dropped turns, and the files changed so far. There is no model call, so the same log always compacts to the same bytes.
+When the last request exceeds the profile's `compact_at`, the series restarts as: system prompt, first message with a digest in place of the dropped turns, then the last two turns verbatim. The first message keeps the task. In a round that a reject started, it also keeps that reject's defects, under `## The lead's review`. Attached files of up to 4,000 characters always stay. Larger ones stay in the order attached while the compacted messages fit in half of `compact_at`, counted at 3 characters a token. If any were dropped, one last message names them, a line range as `read("PATH", A, B)`, and tells the worker to read a file again before relying on it. The digest holds all notes, every question with its answer, one ledger line per action in the dropped turns, and the files changed so far. There is no model call, so the same log always compacts to the same bytes.
 
 ## Gates
 

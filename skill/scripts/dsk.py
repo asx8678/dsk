@@ -654,7 +654,7 @@ def gate(script):
 GIT_READ_ONLY = ("status", "diff", "log", "show", "grep", "ls-files", "blame", "rev-parse")
 SECRET = re.compile(r"KEY|TOKEN|SECRET|PASSWORD|CREDENTIAL|^(AWS_|ARM_|AZURE_|GOOGLE_|KUBE|VAULT_|GH_|GITHUB_)"
                     r"|^SSH_AUTH_SOCK$", re.I)
-KEEP = 4000  # an attached file up to this many characters stays in the first message through compaction
+KEEP = 4000  # an attached file up to this many characters always stays in the first message through compaction
 VERBOSE = False
 JSON = False  # main() sets it for the six commands whose `--json` prints the report as one JSON object
 
@@ -989,6 +989,15 @@ def scope(s):
     return s.last("base") or s.head
 
 
+def round_limit(recs):
+    """The turn limit of the round in flight: a `reject` may set one, and then it holds for that round alone."""
+    start = next((r for r in reversed(recs) if r["t"] in ("base", "reject")), None)
+    if start and start["t"] == "reject" and start.get("max_turns"):
+        return start["max_turns"]
+    base = next((r for r in reversed(recs) if r["t"] == "base"), None)
+    return (base or recs[0])["max_turns"]
+
+
 def settle(s, before, turn=None):
     """Attribute to the worker what changed since the tree `before`, taken just before a script or the checks
     ran: edits anyone else makes between turns are never the worker's. Changes outside --allow are undone, and a
@@ -1102,17 +1111,39 @@ def digest(recs, upto, changed):
     return "\n".join(out + ["files changed so far: " + (", ".join(changed) or "none")])
 
 
-def compaction(recs, changed):
+def name_again(path):
+    """A dropped attachment as the read() call that fetches it again: lines A to B of a file, or the whole file."""
+    match = re.match(r"^(.+):(\d+)-(\d+)$", path, re.S)
+    return f'read("{match.group(1)}", {match.group(2)}, {match.group(3)})' if match else path
+
+
+def compaction(recs, changed, compact_at=32000):
     """The messages that restart the series: system prompt, first message with a digest in place of the large
     attached files, then the last two turns verbatim. No model call: the same log always compacts to the same bytes."""
     msgs = series_msgs(recs)
     turn = msgs[-1]["turn"]
+    digest_text = digest(recs, turn - 2, changed)
     base = next((r for r in reversed(recs) if r["t"] == "base"), None)
-    first = {"role": "user", "content": first_message({**recs[0], **base, "brief": base["task"]} if base else recs[0],
-                                                      digest(recs, turn - 2, changed))}
-    kept = [{"turn": 0, "m": msgs[0]["m"]}, {"turn": 0, "m": first},
+    start = max((i for i, r in enumerate(recs) if r["t"] in ("base", "reject")), default=0)
+    rejected = recs[start] if recs[start]["t"] == "reject" else None  # the last base or reject starts the round in flight
+    head = {**recs[0], **base, "brief": base["task"]} if base else dict(recs[0])
+    head["max_turns"] = round_limit(recs)  # a round the lead started with a reject may have a limit of its own
+    review = f"## The lead's review\nThe lead reviewed your work on this task and rejected it. Fix these defects:\n{rejected['text']}" if rejected else ""
+    files = [(i, path, text) for i, (path, text) in enumerate(recs[0]["files"])]
+    keep = {i for i, path, text in files if len(text) <= KEEP}  # a file up to KEEP always stays
+    turns = [r["m"] for r in msgs if r["turn"] >= turn - 1]
+
+    def first(chosen):
+        pairs = [(path, text) for i, path, text in files if i in chosen]
+        return {"role": "user", "content": first_message(head, digest_text, pairs, review)}
+
+    # Larger files stay too, in the order attached, while the compacted messages fit in half the profile's limit.
+    for i, path, text in files:
+        if len(text) > KEEP and len(dumps([msgs[0]["m"], first(keep | {i}), *turns])) <= compact_at * 3 // 2:
+            keep.add(i)
+    kept = [{"turn": 0, "m": msgs[0]["m"]}, {"turn": 0, "m": first(keep)},
             *({"turn": r["turn"], "m": r["m"]} for r in msgs if r["turn"] >= turn - 1)]
-    gone = [path for path, text in recs[0]["files"] if len(text) > KEEP]
+    gone = [name_again(path) for i, path, text in files if i not in keep]
     if gone and kept[-1]["m"]["role"] == "tool":
         # Said last, where it cannot be missed. Without it a worker carries on from memory and invents what the
         # file said; in trials it then re-read the file on its next turn every time.
@@ -1128,7 +1159,7 @@ def compact(s, cfg):
     if last["t"] != "usage" or last["prompt"] <= limit or min(r["turn"] for r in msgs if r["turn"]) > s.turn - 2:
         return
     changed = [path for _, _, path in changes(s)[1]]
-    fresh = compaction(s.recs, changed)
+    fresh = compaction(s.recs, changed, limit)
     s.add("series", why="compact", profile=s.profile, turn=s.turn, changed=changed)
     for rec in fresh:
         s.add("msg", **rec)
@@ -1146,13 +1177,12 @@ def run_header(terms, web, date):
                        SCRATCH if terms.get("scratch") else ""]))  # a session started before the folder has no line
 
 
-def first_message(head, digest=""):
-    """DSK.md, run header, attached files, brief: most stable first, so sessions share the longest prefix."""
+def first_message(head, digest="", files=None, review=""):
+    """DSK.md, run header, attached files, brief, review: most stable first, so sessions share the longest prefix."""
     run = run_header(head, head["web"], head["date"])
-    files = [f'<attached path="{path}">\n{text}\n</attached>' for path, text in head["files"]
-             if not digest or len(text) <= KEEP]  # compaction drops the large attached copies
+    attached = [f'<attached path="{path}">\n{text}\n</attached>' for path, text in (head["files"] if files is None else files)]
     facts = f'<attached path="DSK.md">\n{head["dsk_md"]}\n</attached>' if head["dsk_md"] else ""
-    return "\n\n".join(filter(None, [facts, run, *files, "## Task\n" + head["brief"], digest]))
+    return "\n\n".join(filter(None, [facts, run, *attached, "## Task\n" + head["brief"], review, digest]))
 
 
 def take_turn(s, cfg, env, turn, reply, finish):
@@ -1232,7 +1262,7 @@ def loop(s, cfg, extra=""):
         # A cut-off reply is not kept: resent with every later request, three of them cost one session 48,000 tokens.
         # The worker still hears that its reply was cut off, in the message that carries this turn's result.
         s.add("msg", turn=turn, m=CUT_OFF if finish == "length" else reply)
-        left = max(0, scope(s)["max_turns"] - len(s.since("round", "result")) - 1)
+        left = max(0, round_limit(s.recs) - len(s.since("round", "result")) - 1)
         now = said(reply)
         # Alternating between two scripts gets a worker no further than repeating one, so both count the same way.
         alternates = len(said_here) >= 3 and now == said_here[-2] and said_here[-1] == said_here[-3] and said_here[-1] != now
@@ -1340,10 +1370,15 @@ def worker_diff(s, *flags, since=None):
 
 def passed_before(s):
     """The checks the worker ran itself, and saw pass, in a turn before the first one that changed a file: a check
-    that passes on the untouched tree cannot show that the task was done. Only what the log holds: a worker that
-    never ran the check first leaves this empty, which says nothing about the check."""
+    that passes on the untouched tree cannot show that the task was done. A round the lead started with a reject
+    also counts the checks dsk ran when the rejected round stopped. Only what the log holds: a worker that never
+    ran the check first leaves this empty, which says nothing about the check."""
     checks = {cmd[:200]: cmd for cmd in scope(s)["checks"]}  # the ledger keeps the first 200 characters of a command
-    start, passed, turn = max((i for i, r in enumerate(s.recs) if r["t"] == "base"), default=0), [], []
+    start = max((i for i, r in enumerate(s.recs) if r["t"] in ("base", "reject")), default=0)
+    passed, turn = [], []
+    if s.recs[start]["t"] == "reject":  # dsk ran these when the rejected round stopped
+        stopped = next((r for r in reversed(s.recs[:start]) if r["t"] == "checks"), {"results": []})
+        passed = [cmd for cmd, code in stopped["results"] if code == 0]
     for r in s.recs[start:]:
         if r["t"] == "ledger" and r["fn"] in ("write", "edit") and "err" not in r or r["t"] == "gate" and r.get("touched"):
             break
@@ -1385,8 +1420,13 @@ def report(s, review=False, cfg=None):
                     and scope(s)["checks"] else "; ".join(f"{cmd} → {code}" for cmd, code in checks["results"]))
     passing = {cmd for cmd, code in checks["results"] if code == 0}  # a check that fails now needs no such warning
     before = st.get("changed") and [cmd for cmd in passed_before(s) if cmd in passing]
-    line("caution", before and f"{'; '.join(before)} passed before the worker changed anything, so "
-                               f"{'it does' if len(before) == 1 else 'they do'} not show that the task was done")
+    if (s.last("base", "reject") or {}).get("t") == "reject":  # checks dsk ran last round say little about this one
+        caution = before and f"{'; '.join(before)} passed before this round's changes too, so " \
+                             f"{'it does' if len(before) == 1 else 'they do'} not show that the defects were fixed: rerun each defect yourself"
+    else:
+        caution = before and f"{'; '.join(before)} passed before the worker changed anything, so " \
+                             f"{'it does' if len(before) == 1 else 'they do'} not show that the task was done"
+    line("caution", caution)
     reverted = list(dict.fromkeys(path for g in s.of("gate") for path in g["reverted"]))
     line("scope", reverted and f"reverted {', '.join(reverted)} (copies in {os.path.join(s.dir, 'reverted')})")
     line("changed", ", ".join(f"{path} ({'binary' if a == '-' else f'+{a}' + (f' -{d}' if d != '0' else '')})"
@@ -1726,12 +1766,17 @@ def cmd_reject(args, cfg):
     text = args.text or (slurp(args.brief) if args.brief else "")
     if args.drop and args.profile:
         raise Fail("--profile chooses the provider of the next round, and --drop has none")
+    if args.drop and args.max_turns:
+        raise Fail("--max-turns sets the turn limit of the next round, and --drop has none")
     if not args.drop:
         s = resume(args.id, "review", "stuck", "limit")
         choose_profile(s, cfg, args.profile)
-        s.add("reject", text=text)
+        s.add("reject", text=text, max_turns=args.max_turns)
         s.add("round")
-        return drive(s, cfg, "\n\nthe lead reviewed this and rejected it. Fix these defects:\n" + text)
+        extra = "\n\nthe lead reviewed this and rejected it. Fix these defects:\n" + text
+        if args.max_turns:
+            extra += f"\n\nturn limit for this round: {args.max_turns}"
+        return drive(s, cfg, extra)
     s = resume(args.id, "review", "stuck", "limit", "question", "done", "error")
     head = s.head
     if head["worktree"]:
@@ -1837,7 +1882,7 @@ def job(s, cfg):
             "doing": " ".join(last["arg"].split())[:80] if last["t"] == "doing" and status == "running" else "",
             "failover": next((f"{a['profile']} {b['status'] or 'network'}" for a, b in reversed(list(zip(series, series[1:])))
                               if b["why"] == "failover" and b.get("status") != "chosen"), ""), "cost": cost,
-            "turn": len(s.since("round", "result")), "max_turns": scope(s)["max_turns"], "turns": s.turn,
+            "turn": len(s.since("round", "result")), "max_turns": round_limit(s.recs), "turns": s.turn,
             "in": sum(u["prompt"] for u in usage), "out": sum(u["out"] for u in usage), "cached": cached_share(usage),
             "act": " ".join(f"{acts[-1]['fn']} {acts[-1]['arg']}".split())[:80] if acts else "",
             "note": " ".join(str(st.get("question") or st.get("why") or st.get("error") or "").split())[:160],
@@ -2256,6 +2301,7 @@ def main():
     reject.add_argument("text", nargs="?", help="the defects, as a numbered list")
     reject.add_argument("--brief", metavar="FILE", help="read the defects from a file (- is stdin)")
     reject.add_argument("--drop", action="store_true", help="discard the work")
+    reject.add_argument("--max-turns", type=int, help="turns the round this reject starts may take")
     reject.add_argument("--profile", metavar="NAME", help="run the next round on this provider profile")
     reject.add_argument("--json", action="store_true", help="print the report as one JSON object")
     wait = command("wait", "block until sessions have stopped, printing each report")

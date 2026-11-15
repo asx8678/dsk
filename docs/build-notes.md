@@ -13,6 +13,12 @@ Measured on 2026-11-11 with `deepseek-flash` on the official API and `deepseek-v
   - With a 400-character file and compaction forced at 2,000 tokens, 0 of 4 runs finished, with your original rule wording as much as with mine. Keeping the file: 4 of 4.
   - With a file of over 100,000 characters and one compaction at the configured thresholds, 5 of 6 finished, but only after a failed check sent the worker back to the file four turns later. With the reminder: 4 of 4, and the file is read again on the next turn.
   - Not tested: repeated compaction with a large file since the reminder was added (2 of 12 finished before it), and files between those two sizes. The 4,000-character limit is a choice, not a measured optimum.
+  - Since 0.6.2, larger files also stay, in the order attached, while the compacted messages fit in half of `compact_at`, counted at 3 characters a token. The median is 3.24, measured on 487 first requests.
+    - **Before:** of the 205 compactions logged from 2026-11-11 to 11-15, 139 dropped an attachment, and about 200 turns re-read one within six turns.
+    - **The shipped code, replayed on all 221 compactions logged by 11-15:** on 48k profiles it keeps every large file in 77 of the 112 compactions that had one, and some of them in 19 more. On 24k profiles it keeps every one in 4 of 33, and some in 12. None goes past half the window. The 67 compactions with neither a reject nor a large file give the same bytes as before.
+- **A reject's defects survive compaction (0.6.2).** The rebuilt first message held only the brief or the last `continue` task. A reject sent more than two turns before a compaction vanished, and the worker went back to the original brief with a fresh turn budget.
+  - **Measured:** in the logs of 2026-11-12 to 11-15, 17 of the 22 reject rounds that compacted lost the list, and one of those rounds was accepted with a listed defect unfixed.
+  - **Since then:** the reject's text follows the task under `## The lead's review`. `reject --max-turns N` caps that round alone. The `caution:` line of such a round counts the checks that passed when the previous round stopped.
 - **After a rejected round, `show --review` prints only what changed since the last review.**
 - **A 429 that survives the retries also fails over,** like a repeated 5xx. So does a network failure.
 - **`python3 -I` discards `PYTHONHASHSEED`,** so the seed is pinned for `sh()` and checks but not for the script process itself.

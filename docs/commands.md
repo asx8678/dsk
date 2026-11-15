@@ -14,6 +14,7 @@ dsk answer ID "text"       reply to the worker's question; the run continues (or
 dsk show   ID [--review | --diff | --log | --answer | --json]
 dsk accept ID              mark as reviewed; after --worktree, apply the changes to the main tree
 dsk reject ID "defects"    send defects back into the same session; the run continues (or --brief FILE)
+        [--max-turns N]    (the turns of the round this starts, and of that round only)
 dsk reject ID --drop       discard the work
 dsk continue ID "task"     send the next task into a session that is done or accepted; the worker keeps its context
         [--allow GLOB]... [--check CMD]... [--max-turns N]     (each replaces the run's; left out, it stays)
