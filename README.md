@@ -40,7 +40,7 @@ Claude Code then asks which provider runs the worker, and for what that provider
 | Provider | What you enter |
 |---|---|
 | `official` | your DeepSeek API key |
-| `custom` | the endpoint URL of any OpenAI-compatible API that serves a DeepSeek model, the model name, and that endpoint's API key. A DeepSeek API key is optional here: with one, the official API is the fallback and web search (`--web`, `dsk search`, `dsk fetch`) is available. Without one, those answer `web search needs the key DEEPSEEK_API_KEY and there is none`, and say how to add it |
+| `custom` | the endpoint URL of any OpenAI-compatible API that serves a DeepSeek model, the model name, and that endpoint's API key. Every main task runs on that endpoint. A DeepSeek API key is optional here and serves web search only: with one, web search (`--web`, `dsk search`, `dsk fetch`) is available. Without one, those answer `web search needs the key DEEPSEEK_API_KEY and there is none`, and say how to add it |
 
 - **Keys** are masked as you type and kept in Claude Code's secure store.
 - **To change an answer,** `/plugin configure dsk@asx8678` opens the same form again; restart Claude Code after changing it.

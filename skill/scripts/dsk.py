@@ -147,8 +147,8 @@ def config():
     if opts.get("custom_base_url") and opts.get("custom_model"):  # the plugin's `custom`: any OpenAI-compatible endpoint
         cfg["profiles"]["custom"] = {"base_url": opts["custom_base_url"], "key_env": "DSK_CUSTOM_API_KEY",
                                      "model": opts["custom_model"], "compact_at": 24000, "extra": {}}
-        if opts.get("provider") == "custom":  # with a DeepSeek key as well, the official API is the fallback
-            cfg["route"] = ["custom"] + ["official"] * bool(opts.get("deepseek_api_key"))
+        if opts.get("provider") == "custom":  # every run goes to the custom endpoint; a DeepSeek key serves web search only
+            cfg["route"] = ["custom"]
     path = os.path.join(xdg("XDG_CONFIG_HOME", "~/.config"), "config.json")
     if os.path.exists(path):
         try:
