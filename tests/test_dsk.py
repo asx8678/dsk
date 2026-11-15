@@ -540,9 +540,8 @@ class Plugin(Cli):
         self.assertEqual([request["path"], request["key"], json.loads(request["raw"])["model"]],
                          ["/c/chat/completions", "Bearer sk-custom", "my-model"])
         self.assertNotIn("sk-custom", json.dumps(dsk.clean_env(dsk.config(), self.tmp)))
-        self.hook(**custom, deepseek_api_key="sk-official")  # with a DeepSeek key as well, the official API is the fallback
-        self.assertEqual(self.dsk("configure")[1].splitlines()[1:],
-                         [f"custom:  {self.api.url}/c · my-model · key set", "official: https://api.deepseek.com · deepseek-flash · key set"])
+        self.hook(**custom, deepseek_api_key="sk-official")  # with a DeepSeek key as well, runs still go only to custom
+        self.assertEqual(self.dsk("configure")[1].splitlines()[1:], [f"custom:  {self.api.url}/c · my-model · key set"])
         self.hook(**{**custom, "provider": "official"}, deepseek_api_key="sk-official")  # the picker decides which one runs
         self.assertEqual(self.dsk("configure")[1].splitlines()[0], "dsk · ready · official · https://api.deepseek.com · deepseek-flash")
 
