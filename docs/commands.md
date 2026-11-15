@@ -31,7 +31,13 @@ dsk search "query"         raw web search, no model
 dsk fetch URL              raw page fetch, no model
 dsk doctor [--profile NAME]
 dsk bench [--profile NAME]... [--json]     time each provider now with two small requests, fastest first
-dsk configure              how dsk is set up: the route, and whether each provider has its key
+dsk configure              how dsk is set up: its version, the route, and whether each provider has its key
+dsk provider list [--json]                 the providers in route order, and who serves web search
+dsk provider add NAME --url URL --model MODEL --key-stdin   a new provider, ahead of official DeepSeek
+dsk provider set NAME [--url URL] [--model MODEL] [--key-stdin]
+dsk provider rename NAME NEW
+dsk provider move NAME PLACE               its priority: 1 is tried first (`up NAME` moves it one place earlier)
+dsk provider enable NAME | disable NAME    on or off the route; official DeepSeek off the route serves web search only
 ```
 
 ## A report

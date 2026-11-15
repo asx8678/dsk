@@ -2772,6 +2772,15 @@ def cmd_stats(args, cfg):
     return 0
 
 
+def version():
+    """This dsk's version, from the plugin's manifest beside this script; '' when there is none (a bare checkout copy)."""
+    try:
+        with open(os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", ".claude-plugin", "plugin.json"),
+                  encoding="utf-8") as f:
+            return str(json.load(f).get("version", ""))
+    except (OSError, ValueError):
+        return ""
+
 def cmd_configure(args, cfg):
     """How dsk is set up. As a Claude Code hook (--hook) it first stores the plugin's options, which Claude Code hands
     to hooks alone, where `config` and `secret` read them; at session start (--announce) it says what is still missing."""
@@ -2795,16 +2804,30 @@ def cmd_configure(args, cfg):
                         json.dump(value, f)
                     os.replace(path + ".new", path)
             ready, state = setup(config())
+            news = ""
+            if args.announce:  # the first session on a new version says so: after an install or an update
+                now, seen_at = version(), os.path.join(data, "version")
+                try:
+                    with open(seen_at, encoding="utf-8") as f:
+                        seen = f.read().strip()
+                except OSError:
+                    seen = ""
+                if now and now != seen:
+                    news = f"dsk {seen} → {now} updated." if seen else f"dsk {now} installed."
+                    with open(seen_at, "w", encoding="utf-8") as f:
+                        f.write(now)
+            if args.announce and ready and news:
+                print(json.dumps({"systemMessage": f"{news} /dsk on shows the jobs, /dsk-config configures it."}))
             if args.announce and not ready:
                 how = f"Run /plugin configure {plugin('id')} and {SETUP}. Then restart Claude Code."
-                print(json.dumps({"systemMessage": f"dsk is not set up yet: {state}. {how}", "hookSpecificOutput": {
+                print(json.dumps({"systemMessage": f"{news + ' ' if news else ''}dsk is not set up yet: {state}. {how}", "hookSpecificOutput": {
                     "hookEventName": "SessionStart", "additionalContext": f"The dsk plugin has no working provider ({state}), so "
                     f"`dsk run` will fail. If the user wants to delegate with dsk, tell them: {how} Never ask for a key in the chat."}}))
         except Exception:  # a hook must never stand in the way of a session or a prompt
             pass
         return 0
     ready, state = setup(cfg)
-    print(f"dsk · {'ready' if ready else 'not set up'} · {state}")
+    print(f"dsk{' ' + version() if version() else ''} · {'ready' if ready else 'not set up'} · {state}")
     for name in cfg["route"]:
         profile = cfg["profiles"].get(name, {})
         key, until = "set" if secret(profile.get("key_env", "")) else "missing", paused(name)
@@ -2823,7 +2846,7 @@ def cmd_configure(args, cfg):
     return 0 if ready else 1
 
 
-# ---------------------------------------------------------------- providers: /dsk-add and /dsk-config
+# ---------------------------------------------------------------- providers: /dsk-config
 
 PROVIDER_NAME = re.compile(r"[a-z][a-z0-9_-]{0,31}")
 
@@ -2893,25 +2916,50 @@ def check_endpoint(url, model):
         raise Fail("the model name is empty or holds a space")
 
 
+def is_official(cfg, name):
+    """Whether a profile is DeepSeek's own API: the endpoint and the key that web search uses. Off the route it still
+    serves web search; on it, it does the work too."""
+    profile, search = cfg["profiles"].get(name) or {}, cfg["search"]
+    return (profile.get("key_env") == search["key_env"]
+            and profile.get("base_url", "").rstrip("/") == search["base_url"].rstrip("/"))
+
+
+def placed(cfg, route, name):
+    """The route with a provider put on it: ahead of official DeepSeek, which stays the fallback; official itself, or
+    any provider when official is not on the route, goes last. `dsk provider move` changes the order afterwards."""
+    at = len(route) if is_official(cfg, name) else next((i for i, n in enumerate(route) if is_official(cfg, n)), len(route))
+    return [*route[:at], name, *route[at:]]
+
+
+def ordinal(n):
+    return f"{n}{'th' if 10 <= n % 100 <= 20 else {1: 'st', 2: 'nd', 3: 'rd'}.get(n % 10, 'th')}"
+
+
 def provider_rows(cfg):
-    """Each profile, the route's first in its order: name, endpoint, model, whether it is on the route, whether its key is set."""
+    """Each profile, the route's first in its order: name, endpoint, model, whether it is on the route, whether its key
+    is set, and whether it is official DeepSeek, which web search uses."""
     route = [n for n in cfg["route"] if n in cfg["profiles"]]
     return [{"name": n, "base_url": p.get("base_url", ""), "model": p.get("model", ""), "key_env": p.get("key_env", ""),
              "key": bool(secret(p.get("key_env", ""))), "enabled": n in route,
-             "position": route.index(n) + 1 if n in route else None}
+             "position": route.index(n) + 1 if n in route else None, "official": is_official(cfg, n)}
             for n, p in sorted(cfg["profiles"].items(), key=lambda kv: route.index(kv[0]) if kv[0] in route else len(route))]
 
 
 def cmd_provider(args, cfg):
-    """List, add, change, enable or disable the provider profiles. Writes ~/.config/dsk/config.json, keeping every key in
-    it, and a key to ~/.config/dsk/env, never into the config."""
+    """List, add, change, reorder, enable or disable the provider profiles. Writes ~/.config/dsk/config.json, keeping
+    every key in it, and a key to ~/.config/dsk/env, never into the config."""
     if args.action == "list":
-        rows = provider_rows(cfg)
+        rows, search = provider_rows(cfg), bool(secret(cfg["search"]["key_env"]))
         if args.json:
-            print(json.dumps({"providers": rows, "search": bool(secret(cfg["search"]["key_env"]))}))
+            print(json.dumps({"providers": rows, "search": search, "order": cfg.get("route_order", "listed")}))
         for r in [] if args.json else rows:
             where = f"{r['position']}." if r["enabled"] else "off"
-            print(f"{where:<4}{r['name']:<14}{r['model']} · {r['base_url']} · key {'set' if r['key'] else 'missing'}")
+            use = "" if not r["official"] else " · web search and work" if r["enabled"] else " · web search only"
+            print(f"{where:<4}{r['name']:<14}{r['model']} · {r['base_url']} · key {'set' if r['key'] else 'missing'}{use}")
+        if not args.json:
+            print(f"web search: {'on' if search else 'off, it needs ' + cfg['search']['key_env']}")
+            if cfg.get("route_order") == "fastest":
+                print("order: route_order is fastest, so the measured fastest is tried first, not the first listed")
         return 0
     name = (args.name or "").strip()
     if not name:
@@ -2935,9 +2983,9 @@ def cmd_provider(args, cfg):
         set_key(key_env, key)  # the key first: a profile that names a key never written would fail every run
         profiles[name] = {"base_url": args.url.rstrip("/"), "key_env": key_env, "model": args.model,
                           "compact_at": 24000, "extra": {}}
-        user["route"] = [*route, name]
+        user["route"] = placed(cfg, route, name)
         write_kept(path, json.dumps(user, indent=2) + "\n")
-        print(f"dsk · added {name} · {args.model} · {args.url.rstrip('/')} · it runs after {', '.join(route) or 'nothing'}")
+        print(f"dsk · added {name} · {args.model} · {args.url.rstrip('/')} · route: {' → '.join(user['route'])}")
         return 0
     if name not in cfg["profiles"]:
         raise Fail(f"no provider named {name}; dsk provider list shows them")
@@ -2974,6 +3022,27 @@ def cmd_provider(args, cfg):
         write_kept(path, json.dumps(user, indent=2) + "\n")
         print(f"dsk · {name} moved up · route: {' → '.join(route)}")
         return 0
+    if args.action == "move":
+        route = list(cfg["route"])
+        known = [n for n in route if n in cfg["profiles"]]
+        if name not in known:
+            raise Fail(f"{name} is disabled; enable it first")
+        try:
+            to = int(args.new)
+        except (TypeError, ValueError):
+            to = 0
+        if not 1 <= to <= len(known):
+            raise Fail(f"provider move needs the place, from 1 to {len(known)}, as in: dsk provider move {name} 1")
+        if known.index(name) == to - 1:
+            print(f"dsk · {name} is already tried {ordinal(to)}")
+            return 0
+        known.remove(name)
+        known.insert(to - 1, name)
+        order = iter(known)  # a name on the route that has no profile keeps its place
+        user["route"] = [next(order) if n in cfg["profiles"] else n for n in route]
+        write_kept(path, json.dumps(user, indent=2) + "\n")
+        print(f"dsk · {name} is now tried {ordinal(to)} · route: {' → '.join(user['route'])}")
+        return 0
     if args.action == "set":
         check_endpoint(args.url, args.model)
         key = read_key(args)
@@ -3005,9 +3074,10 @@ def cmd_provider(args, cfg):
         print(f"dsk · {name} is already enabled")
         return 0
     else:
-        user["route"] = [*route, name]
+        user["route"] = placed(cfg, route, name)
     write_kept(path, json.dumps(user, indent=2) + "\n")
-    print(f"dsk · {name} {args.action}d · route: {' → '.join(user['route'])}")
+    search = " · it still serves web search" if args.action == "disable" and is_official(cfg, name) else ""
+    print(f"dsk · {name} {args.action}d · route: {' → '.join(user['route'])}{search}")
     return 0
 
 
@@ -3185,9 +3255,9 @@ def main():
     configure.add_argument("--announce", action="store_true", help="with --hook: say what is still missing")
     configure.add_argument("--data", metavar="DIR", help="with --hook: the plugin's data folder")
     provider = command("provider", "list, add, change, rename, reorder, enable or disable the provider profiles")
-    provider.add_argument("action", choices=["list", "add", "set", "rename", "up", "enable", "disable"])
+    provider.add_argument("action", choices=["list", "add", "set", "rename", "up", "move", "enable", "disable"])
     provider.add_argument("name", nargs="?")
-    provider.add_argument("new", nargs="?", help="rename: the new name")
+    provider.add_argument("new", nargs="?", help="rename: the new name; move: the new place on the route, from 1")
     provider.add_argument("--url", help="add, set: the base URL of the OpenAI-compatible API")
     provider.add_argument("--model", help="add, set: the model id as the endpoint lists it")
     provider.add_argument("--key-stdin", action="store_true", help="add, set: read the API key from standard input")

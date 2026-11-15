@@ -13,6 +13,7 @@
 
 <p align="center">
   <a href="#install">Install</a> ·
+  <a href="#in-claude-code">In Claude Code</a> ·
   <a href="#hand-over-a-task">Hand over a task</a> ·
   <a href="#how-it-works">How it works</a> ·
   <a href="#measured-not-claimed">Measured</a> ·
@@ -43,8 +44,8 @@ Claude Code then asks which provider runs the worker, and for what that provider
 | `custom` | the endpoint URL of any OpenAI-compatible API that serves a DeepSeek model, the model name, and that endpoint's API key. Every main task runs on that endpoint. A DeepSeek API key is optional here and serves web search only: with one, web search (`--web`, `dsk search`, `dsk fetch`) is available. Without one, those answer `web search needs the key DEEPSEEK_API_KEY and there is none`, and say how to add it |
 
 - **Keys** are masked as you type and kept in Claude Code's secure store.
-- **To change an answer,** `/plugin configure dsk@asx8678` opens the same form again; restart Claude Code after changing it.
-- **More providers:** `/dsk-add` opens a pane that asks for a name, API URL, model name and API key, and adds that provider after the ones you have. `/dsk-config` lists every provider in the order runs try them, with its model, endpoint and whether its key is set, and lets you rename, edit, move up, enable, disable or add one (a rename keeps the key and the place on the route, and running jobs carry on). Both write `~/.config/dsk/config.json` (every other setting in it is kept) and put the key in `~/.config/dsk/env`, readable by you alone. The same is there from the shell: `dsk provider list|add|set|rename|up|enable|disable`.
+- **To change an answer,** `/plugin configure dsk@asx8678` opens the same form again; restart Claude Code after changing it. Everything else is changed in `/dsk-config`: see [In Claude Code](#in-claude-code).
+- **To update,** type `/dsk update`: see [In Claude Code](#in-claude-code).
 - **To check it,** `dsk doctor` tests the key and the model against the provider, and `dsk configure` shows how dsk is set up. Until a provider is set, each session starts by saying what is missing.
 - **It needs** Python 3.13 or newer on `PATH`, as `python3` or as `python3.13`, `python3.14` or `python3.15`.
 
@@ -63,6 +64,77 @@ Claude Code then asks which provider runs the worker, and for what that provider
 Keys in `~/.config/dsk/env` and profiles in `~/.config/dsk/config.json` work too, and win over the form. [docs/configuration.md](docs/configuration.md) says what each `install.sh` mode does and how to set dsk up by hand, with more than one provider.
 
 </details>
+
+## In Claude Code
+
+Two commands, typed like any other slash command:
+
+| You type | What it does |
+|---|---|
+| `/dsk` | Opens the list of jobs: this session's jobs from the last day (running, waiting for you, finished) with their cost, and what runs in other sessions. `[ diff ]` and `[ turns ]` on a job open its whole diff or each of its turns |
+| `/dsk on` | Turns the live display on: running jobs show above the prompt, and `/dsk` lists them. It stays on in every session you start afterwards |
+| `/dsk off` | Turns the live display off. It stays off in every session you start afterwards, until `/dsk on`. Claude still delegates to dsk, and the review gate still holds: only the display stops |
+| `/dsk update` | Fetches the newest dsk from this repository and installs it, then says which version you had and which you have now. Restart Claude Code, or run `/reload-plugins`, to load it |
+| `/dsk-config` | Opens the settings pane: dsk's version, on or off, and the providers. Everything under [Providers and models](#providers-and-models) is done here |
+
+- **The version** is shown at the top of `/dsk-config`, by `/dsk update`, in the first line of `dsk configure`, and once at the start of the first session after an install or an update (`dsk 0.9.1 → 0.10.0 updated.`).
+- **`/dsk update` by hand** is these two commands, which also work from a shell; your keys and `~/.config/dsk` stay:
+
+  ```
+  claude plugin marketplace update asx8678
+  claude plugin update dsk@asx8678
+  ```
+
+  `./install.sh` in a checkout updates dsk too when it is already installed. An update is only found when the `version` in `skill/.claude-plugin/plugin.json` went up.
+
+### Providers and models
+
+A provider is an API that serves a DeepSeek model: DeepSeek's own (`official`), or any OpenAI-compatible endpoint you add (a custom provider). `/dsk-config` lists them in the order a run tries them, each with its model, its endpoint and whether its key is set. It looks roughly like this:
+
+```
+dsk 0.10.0 ● on  [ turn off ]
+
+Providers
+The work goes to myhost → official: the first that answers; the next takes over when one fails.
+
+● 1. myhost    deepseek-v4.1-flash · https://example.com/v1
+    [ edit ] priority 1st  [ disable ]
+● 2. official  deepseek-flash · https://api.deepseek.com
+    [ edit ] priority 2nd  use for web search and work
+
+[ + add provider ]
+Web search (--web): on, through official DeepSeek
+```
+
+**Who does what.** Web search and the work are set apart:
+
+| What you have | Who does the work (scouting, writing code, reviews) | Web search (`--web`, `dsk search`, `dsk fetch`) |
+|---|---|---|
+| Official DeepSeek only | official | official |
+| Official DeepSeek and a custom provider | the custom provider first. Official is the fallback when the custom one fails, or does no work at all if you set it to **web search only** | official |
+| A custom provider only, no DeepSeek key | the custom provider | not available: it needs a DeepSeek API key |
+
+- **Official DeepSeek always serves web search** once its key is entered, whatever else is set up. Web search has no other provider.
+- **A custom provider is tried first.** One you add with `+ add provider` goes ahead of official DeepSeek on the route (and after the custom providers you already have); so does one you enable again. Picking `custom` in the install form goes further: every task runs on the custom endpoint, and official DeepSeek is left with web search only.
+- **Official DeepSeek: web search only, or work as well.** Its row has a `use for` picker with two choices. `web search only` takes it off the route: no task is ever sent to it, and it moves under a "Web search only" heading. `web search and work` puts it back, as the last provider tried. dsk refuses `web search only` while official is the only provider that can do the work.
+- **Priority.** With more than one provider enabled, each row has a `priority` picker: `1st` is tried first, `2nd` takes over when it fails, and so on. Picking a place moves that provider there and shifts the others.
+- **The model.** `edit` on a provider opens its name, API URL, model name and API key. Change **Model name** to the model id as that endpoint lists it and save. `official` starts as `deepseek-flash`; a custom provider uses whatever you entered. An empty API key field keeps the key you have. `dsk doctor` then tests the key and the model against the provider.
+- **Add, rename, disable.** `+ add provider` asks for a name, API URL, model name and API key. A rename keeps the key and the place on the route, and running jobs carry on. `disable` takes a custom provider off the route without deleting it; `enable` puts it back.
+- **Where it is kept.** The pane writes `~/.config/dsk/config.json` (every other setting in it is kept) and puts keys in `~/.config/dsk/env`, readable by you alone. Both win over the install form.
+
+The same from a shell:
+
+```sh
+dsk provider list                                  # the route in order, and who serves web search
+echo "$KEY" | dsk provider add myhost --url https://example.com/v1 --model deepseek-v4.1-flash --key-stdin
+dsk provider set official --model deepseek-flash   # change a model; --url and --key-stdin change the rest
+dsk provider move myhost 1                         # priority: tried first
+dsk provider disable official                      # official DeepSeek: web search only
+dsk provider enable official                       # official DeepSeek: web search and work, tried last
+dsk provider rename myhost fast
+```
+
+With `"route_order": "fastest"` in `config.json`, the provider measured fastest is tried first, whatever the priority says; `/dsk-config` and `dsk provider list` say so when it is set. See [docs/configuration.md](docs/configuration.md#providers).
 
 ## Hand over a task
 
@@ -195,14 +267,14 @@ It is the session that wrote the first generator of this page's images: 7 turns 
 | Part | File | What it is |
 |---|---|---|
 | Manifest | `.claude-plugin/plugin.json` | the name, the version, and `userConfig`: the five options of the form above |
-| Skill | `SKILL.md` | tells Claude when and how to delegate. `/dsk` from a checkout, `/dsk:dsk` installed from the marketplace |
+| Skill | `SKILL.md` | tells Claude when and how to delegate; Claude loads it by itself. By hand it is `/dsk:dsk` |
 | Agent | `agents/reviewer.md` | `dsk:reviewer`, for a careful change whose review packet is too long to read inline |
 | Command | `bin/dsk` | on the `PATH` of Claude's Bash tool while the plugin is enabled |
 | Hooks | `hooks/hooks.json` | three commands: at session start and before each prompt, `dsk configure --hook`; at each stop, `dsk status --hook` |
-| Hooks module | `hooks/register.tsx` | the display; TypeScript, because Claude Code runs it itself |
+| Hooks module | `hooks/register.tsx` | the display and the commands `/dsk` and `/dsk-config`; TypeScript, because Claude Code runs it itself |
 | CLI | `scripts/dsk.py` | everything else. Claude Code never loads it, it only runs it |
 
-The Stop hook and the two configure hooks are always on. The display is not: `/dsk-jobs on` loads it and `/dsk-jobs off` unloads it, in the session where you type it and in the sessions you start afterwards. Unloaded, it reads nothing and draws nothing.
+The Stop hook and the two configure hooks are always on. The display is not: `/dsk on` turns it on and `/dsk off` turns it off (or the button in `/dsk-config`), in the session where you type it and in the sessions you start afterwards. `/dsk` lists the jobs. Off, it reads nothing and draws nothing. Every command is in [In Claude Code](#in-claude-code).
 
 What the display draws, and how the form's answers reach `dsk`: [docs/plugin.md](docs/plugin.md).
 
@@ -238,12 +310,13 @@ What is known not to work yet: [docs/limits.md](docs/limits.md).
 | `status`, `wait [ID ...]` | this project's open sessions; block until sessions have stopped |
 | `stats [ID ...]` | what sessions measured: outcomes, where the turns went, tokens, time, per profile |
 | `search "query"`, `fetch URL` | raw web search and page fetch, no model |
-| `doctor`, `bench`, `configure` | check each profile; time each provider, fastest first; how dsk is set up |
+| `doctor`, `bench`, `configure` | check each profile; time each provider, fastest first; how dsk is set up, with its version |
+| `provider list\|add\|set\|rename\|move\|up\|enable\|disable` | what `/dsk-config` runs: the providers, their models and keys, their priority, and whether official DeepSeek does work or web search only |
 
 ## Tests
 
 ```
-python3 -m unittest discover -s tests     # 132 tests against a scripted API server and temp git repositories
+python3 -m unittest discover -s tests     # 163 tests against a scripted API server and temp git repositories
 python3 tests/live.py --table             # real toy tasks on the real providers; costs a few cents
 sh tests/install_test.sh                  # install.sh against a throwaway home folder, without the network
 ```

@@ -338,8 +338,8 @@ EOF
     echo "   background runs, add this to \"permissions\": {\"allow\": [...]} in ~/.claude/settings.json:"
     echo "       \"Bash(dsk *)\""
     n=$((n + 1))
-    echo "$n. Display. Restart Claude Code, or run /reload-plugins in sessions that are already open. Then /dsk-jobs on"
-    echo "   loads the live display of the jobs and /dsk-jobs off unloads it; the choice holds for later sessions."
+    echo "$n. Display. Restart Claude Code, or run /reload-plugins in sessions that are already open. Then /dsk on"
+    echo "   turns on the live display of the jobs and /dsk off turns it off; the choice holds for later sessions. /dsk-config configures it."
 }
 
 case "$mode" in
