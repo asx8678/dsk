@@ -1,5 +1,5 @@
 ---
-name: dsk
+name: delegate
 description: Hand the hands-on work to a DeepSeek worker through the dsk CLI, and keep planning, orchestration, review and decisions for yourself. Use it by default to scout a codebase (find where things live, trace a flow, read many files or logs), to write code from your plan (features, fixes, tests, boilerplate, mechanical edits), and for sourced web research. Do the work yourself only when a change is shorter than its brief, is security-sensitive, or needs the user's credentials.
 allowed-tools:
   - Bash(dsk *)

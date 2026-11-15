@@ -677,8 +677,8 @@ test('the config pane sets a provider priority, and what official DeepSeek is us
     order: 'listed',
   }
   await $.command.run({
-    command: 'dsk-config',
-    args: '',
+    command: 'dsk',
+    args: 'config',
     origin: { kind: 'composer' },
     presentation: { isFullscreen: true, columns: 120 },
   })

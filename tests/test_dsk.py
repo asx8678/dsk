@@ -607,7 +607,7 @@ class Plugin(Cli):
 
 
 class Providers(Cli):
-    """`dsk provider`: what /dsk-config runs. It rewrites the user's config.json and env, so it must keep
+    """`dsk provider`: what /dsk config runs. It rewrites the user's config.json and env, so it must keep
     everything it was not asked to change."""
 
     def files(self):

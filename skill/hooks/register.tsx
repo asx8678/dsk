@@ -118,13 +118,14 @@ const providers = atom(
   { list: [], search: false, isFastest: false, mode: 'list', editing: '', note: '', isError: false } as Providers,
   { shape: 'providers-2' },
 )
-// The pane of /dsk-config.
+// The pane of /dsk config.
 const SETUP = 'dsk-providers'
 // What /dsk takes after its name, each with the line the typeahead shows beside it.
 const WORDS = [
   { word: 'on', description: 'Turn dsk on: running jobs show above the prompt' },
   { word: 'off', description: 'Turn dsk off: only the display stops' },
   { word: 'update', description: 'Fetch the newest dsk and install it' },
+  { word: 'config', description: 'Open the settings: on or off, and the providers' },
 ] as const
 
 type Kit = Pick<Elements['terminal'], 'Box' | 'Text' | 'Code' | 'Button'>
@@ -1113,6 +1114,23 @@ const show = async ($: EngineInterface, id: string, kind: 'diff' | 'log') => {
   await update($, view, () => ({ id, kind, text: text.slice(0, 200_000) }))
 }
 
+/** Opens the settings pane, and says in a line how dsk is set up. */
+const configure = async ($: EngineInterface) => {
+  await refresh($, { mode: 'list', editing: '' })
+  await $.ui.open({ id: SETUP, title: 'dsk config', focus: true })
+  const now = await read($, providers)
+  const used = now.list.filter(one => one.enabled).map(one => `${one.name} (${one.model})`)
+  const searchOnly = now.list.filter(one => !one.enabled && one.official).map(one => one.name)
+  const off = now.list.filter(one => !one.enabled && !one.official).map(one => one.name)
+  const state = `dsk${shownVersion === '' ? '' : ` ${shownVersion}`} is ${isLoaded ? 'on' : 'off'}. `
+
+  return {
+    text: now.isError
+      ? now.note
+      : `${state}The work goes to ${used.join(' → ') || 'nothing'}${searchOnly.length > 0 ? `; web search only: ${searchOnly.join(', ')}` : ''}${off.length > 0 ? `; disabled: ${off.join(', ')}` : ''}. Web search: ${now.search ? 'on' : 'off, no DeepSeek key'}. In the dsk config pane: add, edit or rename a provider, set its priority, enable or disable it, and choose whether official DeepSeek serves web search only or work as well.`,
+  }
+}
+
 export const register: Register = on => {
   on('session.start', async ($, e, next) => {
     me = await $.session.id()
@@ -1120,13 +1138,8 @@ export const register: Register = on => {
     shownVersion = await version($)
     await $.command.register({
       name: COMMAND,
-      description: 'Open the list of dsk jobs; /dsk on or off turns dsk on or off; /dsk update updates it',
-      argumentHint: '[on|off|update]',
-      immediate: true,
-    })
-    await $.command.register({
-      name: 'dsk-config',
-      description: 'Configure dsk: turn it on or off; add, change, enable or disable providers',
+      description: 'Open the list of dsk jobs; /dsk on or off turns dsk on or off; /dsk update updates it; /dsk config configures it',
+      argumentHint: '[on|off|update|config]',
       immediate: true,
     })
     // The choice made with `/dsk on` or `off` holds for the sessions after it.
@@ -1138,22 +1151,6 @@ export const register: Register = on => {
     }
 
     return next(e)
-  })
-
-  on('command.run', { command: 'dsk-config' }, async $ => {
-    await refresh($, { mode: 'list', editing: '' })
-    await $.ui.open({ id: SETUP, title: 'dsk config', focus: true })
-    const now = await read($, providers)
-    const used = now.list.filter(one => one.enabled).map(one => `${one.name} (${one.model})`)
-    const searchOnly = now.list.filter(one => !one.enabled && one.official).map(one => one.name)
-    const off = now.list.filter(one => !one.enabled && !one.official).map(one => one.name)
-    const state = `dsk${shownVersion === '' ? '' : ` ${shownVersion}`} is ${isLoaded ? 'on' : 'off'}. `
-
-    return {
-      text: now.isError
-        ? now.note
-        : `${state}The work goes to ${used.join(' → ') || 'nothing'}${searchOnly.length > 0 ? `; web search only: ${searchOnly.join(', ')}` : ''}${off.length > 0 ? `; disabled: ${off.join(', ')}` : ''}. Web search: ${now.search ? 'on' : 'off, no DeepSeek key'}. In the dsk config pane: add, edit or rename a provider, set its priority, enable or disable it, and choose whether official DeepSeek serves web search only or work as well.`,
-    }
   })
 
   on('ui.render', { component: 'Pane', requestId: SETUP }, async ($, e) => {
@@ -1374,7 +1371,7 @@ export const register: Register = on => {
       return {
         text:
           word === 'on'
-            ? `dsk is on, here and in the sessions you start after this one. Running jobs show above the prompt, /${COMMAND} lists them all, /${COMMAND} off turns it off, /dsk-config configures it.`
+            ? `dsk is on, here and in the sessions you start after this one. Running jobs show above the prompt, /${COMMAND} lists them all, /${COMMAND} off turns it off, /${COMMAND} config configures it.`
             : `dsk is off, here and in the sessions you start after this one. /${COMMAND} on turns it on again.`,
       }
     }
@@ -1383,10 +1380,14 @@ export const register: Register = on => {
       return { text: await upgrade($) }
     }
 
+    if (word === 'config') {
+      return configure($)
+    }
+
     if (word !== '' || !isLoaded) {
       return {
         text: isLoaded
-          ? `Usage: /${COMMAND} lists the jobs, /${COMMAND} off turns dsk off, /${COMMAND} update updates it, /dsk-config configures it.`
+          ? `Usage: /${COMMAND} lists the jobs, /${COMMAND} off turns dsk off, /${COMMAND} update updates it, /${COMMAND} config configures it.`
           : `dsk is off. /${COMMAND} on turns it on.`,
       }
     }

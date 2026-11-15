@@ -8,7 +8,7 @@
     {
       "name": "dsk",
       "source": "./skill",
-      "description": "Claude Code plans, reviews and decides; a DeepSeek worker scouts the code and writes it: the skill, a reviewer agent, the review gate, and an optional live display of the jobs (/dsk on; /dsk lists the jobs, /dsk-config configures it)."
+      "description": "Claude Code plans, reviews and decides; a DeepSeek worker scouts the code and writes it: the skill, a reviewer agent, the review gate, and an optional live display of the jobs (/dsk on; /dsk lists the jobs, /dsk config configures it)."
     }
   ]
 }

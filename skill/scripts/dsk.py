@@ -2817,7 +2817,7 @@ def cmd_configure(args, cfg):
                     with open(seen_at, "w", encoding="utf-8") as f:
                         f.write(now)
             if args.announce and ready and news:
-                print(json.dumps({"systemMessage": f"{news} /dsk on shows the jobs, /dsk-config configures it."}))
+                print(json.dumps({"systemMessage": f"{news} /dsk on shows the jobs, /dsk config configures it."}))
             if args.announce and not ready:
                 how = f"Run /plugin configure {plugin('id')} and {SETUP}. Then restart Claude Code."
                 print(json.dumps({"systemMessage": f"{news + ' ' if news else ''}dsk is not set up yet: {state}. {how}", "hookSpecificOutput": {
@@ -2846,7 +2846,7 @@ def cmd_configure(args, cfg):
     return 0 if ready else 1
 
 
-# ---------------------------------------------------------------- providers: /dsk-config
+# ---------------------------------------------------------------- providers: /dsk config
 
 PROVIDER_NAME = re.compile(r"[a-z][a-z0-9_-]{0,31}")
 

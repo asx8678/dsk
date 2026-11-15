@@ -60,7 +60,7 @@ export type Provider = {
   official: boolean
 }
 
-/** What the providers pane of /dsk-config shows. The form's text is not here: no key is stored. */
+/** What the providers pane of /dsk config shows. The form's text is not here: no key is stored. */
 export type Providers = {
   list: Provider[]
   /** Whether web search has its DeepSeek key. */
