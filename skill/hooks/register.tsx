@@ -120,6 +120,12 @@ const providers = atom(
 )
 // The pane of /dsk-config.
 const SETUP = 'dsk-providers'
+// What /dsk takes after its name, each with the line the typeahead shows beside it.
+const WORDS = [
+  { word: 'on', description: 'Turn dsk on: running jobs show above the prompt' },
+  { word: 'off', description: 'Turn dsk off: only the display stops' },
+  { word: 'update', description: 'Fetch the newest dsk and install it' },
+] as const
 
 type Kit = Pick<Elements['terminal'], 'Box' | 'Text' | 'Code' | 'Button'>
 type Call = { verb: string; id: string | undefined; said: string }
@@ -1111,7 +1117,7 @@ export const register: Register = on => {
   on('session.start', async ($, e, next) => {
     me = await $.session.id()
     cwd = e.cwd
-    shownVersion = await version()
+    shownVersion = await version($)
     await $.command.register({
       name: COMMAND,
       description: 'Open the list of dsk jobs; /dsk on or off turns dsk on or off; /dsk update updates it',
@@ -1396,6 +1402,28 @@ export const register: Register = on => {
     return {
       text: `${sum.running} running · ${sum.waiting} waiting · ↑ ${kilo(sum.in)}${cached} · ↓ ${kilo(sum.out)}${cost} in the last day`,
     }
+  })
+
+  // The typeahead lists commands by name, so /dsk alone would not show what it
+  // takes: these rows do, and complete a word begun after it.
+  on('prompt.autocomplete', async ($, e, next) => {
+    const rest = await next(e)
+    const token = e.token.toLowerCase()
+    const name = `/${COMMAND}`
+    const before = e.text.slice(0, e.start).trim().toLowerCase()
+    let mine: { text: string; description: string }[] = []
+
+    if (e.start === 0 && token.length >= 3 && name.startsWith(token)) {
+      mine = WORDS.map(({ word, description }) => ({ text: `${name} ${word}`, description }))
+    } else if (e.start > 0 && before === name) {
+      // A word typed in full needs no row: taking it would change nothing.
+      mine = WORDS.filter(({ word }) => word.startsWith(token) && word !== token).map(({ word, description }) => ({
+        text: word,
+        description,
+      }))
+    }
+
+    return mine.length === 0 ? rest : { suggestions: [...mine, ...rest.suggestions] }
   })
 
   // Note when each dsk call began, so its row can find the job it started, and
