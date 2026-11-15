@@ -19,7 +19,7 @@ dsk reject ID "defects"    send defects back into the same session; the run cont
         [--max-turns N]    (the turns of the round this starts, and of that round only)
 dsk reject ID --drop       discard the work
 dsk continue ID "task"     send the next task into a session that is done or accepted; the worker keeps its context
-        [--allow GLOB]... [--check CMD]... [--max-turns N]     (each replaces the run's; left out, it stays)
+        [--allow GLOB]... [--check CMD]... [--max-turns N]     (each replaces the run's; left out, it stays; a first --allow makes the limit at least 30, the default of a writing run, unless --max-turns is given)
         [--recheck | --no-recheck] [--reviewer | --no-reviewer]   (likewise)
 dsk status [--hook]        this project's open sessions; --hook is the Claude Code Stop hook
 dsk wait [ID ...]          block until those sessions (default: yours in this project, running or just started) have stopped,
@@ -47,4 +47,4 @@ next:    dsk show 7f3a --review | dsk accept 7f3a | dsk reject 7f3a "defects"
 
 ## JSON
 
-With `--json`, `run`, `answer`, `reject`, `continue`, `show` and `wait` print one JSON object per report on stdout and nothing else there; an error is `{"error": "..."}`. The object holds what `status --json` gives for a job (see [Progress](internals.md#progress)) and the rest of the report: `left` (the profiles the session moved away from), `summary`, `answer`, `question`, `error`, `why`, `open`, `notes`, `checks` (a list of `{"cmd", "code"}`), `checked`, `passed_before`, `recheck` and `reviewer` (null unless the round had one; see [Second look and reviewer](internals.md#second-look-and-reviewer)), `files` (a list of `{"path", "added", "deleted"}`), `reverted`, `workdir`, `context` (`used`, `limit`, `compactions`) and `next`. A program should read this and not the text, whose wording may change. The line `dsk ID · running · profile` that a run prints first goes to stderr in both forms.
+With `--json`, `run`, `answer`, `reject`, `continue`, `show` and `wait` print one JSON object per report on stdout and nothing else there; an error is `{"error": "..."}`. The object holds what `status --json` gives for a job (see [Progress](internals.md#progress)) and the rest of the report: `left` (the profiles the session moved away from), `summary`, `answer`, `question`, `error`, `why`, `open`, `notes`, `checks` (a list of `{"cmd", "code"}`), `checked`, `passed_before`, `recheck` and `reviewer` (null unless the round had one; see [Second look and reviewer](internals.md#second-look-and-reviewer)), `files` (a list of `{"path", "added", "deleted"}`), `reverted`, `ignored` (the paths git ignores that the worker wrote with `write` or `edit`), `workdir`, `context` (`used`, `limit`, `compactions`) and `next`. A program should read this and not the text, whose wording may change. The line `dsk ID · running · profile` that a run prints first goes to stderr in both forms.

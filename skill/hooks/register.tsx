@@ -52,6 +52,7 @@ const LABELS = [
   'checks',
   'scope',
   'changed',
+  'ignored',
   'sources',
   'cache',
   'context',
@@ -663,6 +664,10 @@ const card = (kit: Kit, report: Report) => {
         )}
         {field('scope') !== '' && (
           <Text color="warning">{cut(`scope: ${field('scope')}`, 240)}</Text>
+        )}
+        {/* Files the worker wrote that git ignores are in no diff, so the card has to name them. */}
+        {field('ignored') !== '' && (
+          <Text color="warning">{cut(`ignored: ${field('ignored')}`, 240)}</Text>
         )}
         {report.diff !== '' && diffRows(kit, report.diff, CARD_LINES)}
         {report.more !== '' && <Text dimColor>{report.more}</Text>}

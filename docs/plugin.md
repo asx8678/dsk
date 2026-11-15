@@ -4,7 +4,7 @@ The parts of the plugin are listed in the README; this page has the two things t
 
 ## How the form's answers reach dsk
 
-Claude Code hands a plugin's options to its hooks, as `CLAUDE_PLUGIN_OPTION_*` variables, and not to the commands Claude runs through Bash. So `dsk configure --hook` writes them to `options.json` in the plugin's data folder (`~/.claude/plugins/data/dsk-<marketplace>/`, mode 600) and leaves a pointer to it in `~/.config/dsk/plugin.json`. `dsk` builds its configuration from the built-in defaults, then those options, then `~/.config/dsk/config.json`; a key comes from the environment, else `~/.config/dsk/env`, else the options. The data folder is Claude Code's: uninstalling the plugin deletes it, and the keys with it. At session start the same hook says what is still missing; before a prompt it says nothing, and it never fails a session.
+Claude Code hands a plugin's options to its hooks, as `CLAUDE_PLUGIN_OPTION_*` variables, and not to the commands Claude runs through Bash. So `dsk configure --hook` writes them to `options.json` in the plugin's data folder (`~/.claude/plugins/data/dsk-<marketplace>/`, mode 600) and leaves a pointer to it in `~/.config/dsk/plugin.json`. `dsk` builds its configuration from the built-in defaults, then those options, then `~/.config/dsk/config.json`; a key comes from the environment, else `~/.config/dsk/env`, else the options. The sandbox denies reading that file and the `.new` copy written beside it, as it denies `~/.config/dsk`, which holds the pointer. The data folder is Claude Code's: uninstalling the plugin deletes it, and the keys with it. At session start the same hook says what is still missing; before a prompt it says nothing, and it never fails a session.
 
 ## The display
 
