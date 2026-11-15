@@ -1,5 +1,6 @@
 """The cache: the input of each turn of a real session, split into what the provider read from its cache and what
-was new. Every request extends the one before it, so the cached part grows turn by turn."""
+was new. Every request extends the one before it, so the cached part grows turn by turn. A faint copy of the previous
+bar drops into each row, and a tick marks where the previous request ended."""
 import kit
 
 W, H, LOOP = 880, 372, 20
@@ -10,6 +11,7 @@ LABEL = ("Input tokens per turn of a real session of 7 turns, split into read fr
 TURNS = [(5798, 1024), (6297, 5632), (6545, 6144), (6716, 6400), (8216, 6656), (8957, 8192), (13432, 8704)]
 NOTES = {  # what to say beside a turn's bar
     1: "a cold start: 18% from the cache",
+    2: "89%: turn 1's request, read from the cache",
     4: "95% from the cache",
     7: "65%: turn 6's script is new",
 }
@@ -43,10 +45,19 @@ def draw(t):
     st.add(f'<text class="m mu" x="{W - 40}" y="{bottom + 16}" font-size="10.5" text-anchor="end">input tokens</text>')
     for i, (tokens, hit) in enumerate(TURNS, 1):
         y = Y0 + (i - 1) * STEP
-        a = 0.6 + (i - 1) * 0.55
+        a = 0.6 + (i - 1) * 1.1
         rect, path = bar(t, y, tokens, hit)
-        st.add(st.show(a - 0.1, kit.mono(92, y + 12, f"turn {i}", 11.5, "mu", "end"), dx=-6, dy=0),
-               st.grow(a, rect, dur=0.45), st.grow(a + 0.4, path, dur=0.3))
+        st.add(st.show(a - 0.1, kit.mono(92, y + 12, f"turn {i}", 11.5, "mu", "end"), dx=-6, dy=0))
+        if i > 1:
+            before = TURNS[i - 2][0]
+            end = X0 + before * SCALE
+            copy = f'<rect x="0" y="0" width="{before * SCALE:.1f}" height="{THICK}" fill="{t["cool"]}" opacity=".25"/>'
+            st.add(st.travel([(X0, y - STEP), (X0, y)], a - 0.35, 0.3, copy, hold=0.5))
+        st.add(st.grow(a, rect, dur=0.45), st.grow(a + 0.4, path, dur=0.3))
+        if i > 1:
+            tick = (f'<line x1="{end:.1f}" y1="{y - STEP + THICK}" x2="{end:.1f}" y2="{y}" stroke="{t["line2"]}" '
+                    f'stroke-width="1.5"/>')
+            st.add(st.draw(a - 0.35, 14, tick, dur=0.3))
         if i in NOTES:
             # The note sits on a halo in the background colour, so that a gridline does not run through it.
             note = (f'<text class="t mu" x="{X0 + tokens * SCALE + 12:.1f}" y="{y + 12}" font-size="11.5" stroke="{t["bg"]}" '

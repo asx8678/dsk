@@ -50,7 +50,9 @@ def header(st):
 def script(st):
     """A card with one turn's script: what the worker sends, and all that it sends."""
     t, x, y, w, h, size = st.t, 548, 40, 292, 150, 11.5
-    st.add(f'<rect x="{x + .5}" y="{y + .5}" width="{w}" height="{h}" rx="12" fill="{t["surface"]}" stroke="{t["line"]}"/>',
+    card = f'<rect x="{x + .5}" y="{y + .5}" width="{w}" height="{h}" rx="12" fill="{t["surface"]}" stroke="{t["line"]}"/>'
+    frame = f'<rect x="{x + .5}" y="{y + .5}" width="{w}" height="{h}" rx="12" fill="none" stroke="{t["cool"]}" stroke-opacity=".7"/>'
+    st.add(card, st.blink(0.5, 4.1, frame),
            f'<circle cx="{x + 18}" cy="{y + 18}" r="3.5" fill="{t["cool"]}"/>',
            f'<text class="m mu" x="{x + 30}" y="{y + 22}" font-size="10.5" letter-spacing=".04em">ONE TURN · ONE PYTHON SCRIPT</text>',
            f'<line x1="{x}" y1="{y + 34.5}" x2="{x + w}" y2="{y + 34.5}" stroke="{t["line"]}"/>')
@@ -63,6 +65,9 @@ def script(st):
         n = sum(len(text) for text, _ in line)
         cover = f'<rect x="{x + 35:g}" y="{base - 11:g}" width="{n * size * kit.PITCH + 2:g}" height="15" fill="{t["surface"]}"/>'
         st.add(st.type(0.5 + i * 0.9, 0.7, n, cover))
+        caret = f'<rect x="0" y="0" width="6" height="13" rx="1.5" fill="{t["cool"]}"/>'
+        st.add(st.travel([(x + 36, base - 10.5), (x + 36 + n * size * kit.PITCH, base - 10.5)], 0.5 + i * 0.9, 0.7, caret,
+                         hold=1.0 if i == 3 else 0, steps=n))
 
 
 def chip(t, right, mid, status):
@@ -91,7 +96,8 @@ def lanes(st):
     for k, (run, brief, turns, status) in enumerate(LANES):
         y = 240 + k * 46
         start, pops, end = TIMES[k]
-        st.add(f'<rect x="{x + .5}" y="{y + .5}" width="799" height="37" rx="9" fill="{t["surface"]}" stroke="{t["line"]}"/>')
+        lane = f'<rect x="{x + .5}" y="{y + .5}" width="799" height="37" rx="9" fill="{t["surface"]}" stroke="{t["line"]}"/>'
+        st.add(lane)
         st.add(st.blink(start, end, f'<rect x="{x + .5}" y="{y + .5}" width="799" height="37" rx="9" fill="none" stroke="{t["cool"]}" stroke-opacity=".7"/>'))
         st.add(kit.mono(x + 16, y + 24, run, 12.5, "mu"),
                f'<text class="t ink" x="{x + 64}" y="{y + 24}" font-size="13.5">{kit.esc(brief)}</text>')
@@ -108,15 +114,27 @@ def lanes(st):
         if status == "accepted":
             review_icon, review_word = chip(t, x + 784, y + 19, "review")
             accepted_icon, accepted_word = chip(t, x + 784, y + 19, "accepted")
+            icon_x = x + 784 - len("accepted") * 11.5 * kit.PITCH - 12
+            frame = lane.replace(f'fill="{t["surface"]}" stroke="{t["line"]}"',
+                                 f'fill="none" stroke="{t["ok"]}" stroke-opacity=".8"')
+            ring = f'<circle cx="{icon_x:g}" cy="{y + 19}" r="7" fill="none" stroke="{t["ok"]}" stroke-width="1.5"/>'
             st.add(st.blink(end, 6.6, pulse(review_icon) + review_word),
                    st.draw(6.6, 44, accepted_icon, dur=0.6),
-                   st.show(6.6, accepted_word, dx=6, dy=0))
+                   st.show(6.6, accepted_word, dx=6, dy=0),
+                   st.blink(6.6, 7.8, frame),
+                   st.ripple([6.9], ring))
         elif status == "done":
             done_icon, done_word = chip(t, x + 784, y + 19, "done")
-            st.add(st.show(end, done_icon + done_word, dx=6, dy=0))
+            icon_x = x + 784 - len("done") * 11.5 * kit.PITCH - 12
+            ring = f'<circle cx="{icon_x:g}" cy="{y + 19}" r="4" fill="none" stroke="{t["muted"]}" stroke-width="1.5"/>'
+            st.add(st.show(end, done_icon + done_word, dx=6, dy=0),
+                   st.ripple([end + 0.2], ring, swell=2.6))
         else:
             review_icon, review_word = chip(t, x + 784, y + 19, "review")
-            st.add(st.show(end, pulse(review_icon) + review_word, dx=6, dy=0))
+            icon_x = x + 784 - len("review") * 11.5 * kit.PITCH - 12
+            ring = f'<circle cx="{icon_x:g}" cy="{y + 19}" r="4" fill="none" stroke="{t["warm"]}" stroke-width="1.5"/>'
+            st.add(st.show(end, pulse(review_icon) + review_word, dx=6, dy=0),
+                   st.ripple([end + 0.2], ring, swell=2.6))
 
 
 def draw(t):

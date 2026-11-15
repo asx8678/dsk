@@ -91,6 +91,15 @@ Every command prints a short plain-text report on stdout. `--verbose` adds one l
 | `limit` | turn, time or token limit reached | 3 |
 | `error` | API, config or internal error, or an interrupted run | 1 |
 
+<p>
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="assets/states-dark.svg">
+  <img alt="A run and the six ways it stops, each with its exit code and the commands that move it on: a question is answered, a review is rejected with defects, and both times the same session works on, until the lead accepts" src="assets/states-light.svg" width="100%">
+</picture>
+</p>
+
+A stop is not the end of a session. `answer` and `reject ID "defects"` send it back to work, and `continue` gives it the next task; each time the worker keeps its context.
+
 `summary`, `answer`, `notes` and `question` are the worker's claims. Every other line is measured by `dsk`.
 
 A `caution:` line names a check the worker ran itself, and saw pass, before it changed anything: such a check cannot show that the task was done. In one batch of 48 runs that fixed visual defects, the check had passed beforehand in 43. The line appears only when the worker happened to run the check first, so its absence says nothing.
@@ -114,9 +123,27 @@ Every flag, an example report as text and the report as JSON (`--json`): [docs/c
 
 **Gates.** The working tree is recorded as a tree object at start, around every script and check, and at every stop, so only what changes while a script or a check is running is attributed to the worker. What a script changed outside `--allow` is undone by `dsk`, and a copy is kept. `dsk` runs each `--check` itself: a failure goes back to the worker and the run continues. The Stop hook exits 2 while a session started by the current Claude Code session is in `review`.
 
+<p>
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="assets/gates-dark.svg">
+  <img alt="The three gates in order: scope, where the file inside --allow is kept and a change outside it is undone, with a copy kept; the check, run by dsk itself; and review, where the work is held until the lead accepts it" src="assets/gates-light.svg" width="100%">
+</picture>
+</p>
+
+The picture's second row is an example of what the scope gate is for: a formatter started with `sh()` rewrites a file outside `--allow`, and `dsk` puts the file back and keeps a copy of the change.
+
 **Worktrees.** `--worktree` runs the task in a fresh git worktree seeded with your uncommitted state. `accept` applies the worktree as it stands to the main tree with `git apply`: changes land uncommitted, and a conflict is refused as a whole.
 
 **Providers.** A session starts on the first profile in `route`, or with `"route_order": "fastest"` on the fastest one that has a free slot. On 402, or when retries of a network failure, 408, 429 or any 5xx are used up, it continues on the next profile in a new series, and so does a worker that keeps sending the same reply. A profile that reports its credit used up is paused: runs skip it until the pause ends, unless it is the last one in the route.
+
+<p>
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="assets/route-dark.svg">
+  <img alt="A run along a route of three providers: the first has no free slot and is skipped without a request, the second answers 429 through every retry, the third takes over, and the report's first line names the two the run left" src="assets/route-light.svg" width="100%">
+</picture>
+</p>
+
+The run in the picture is an example. The real run further up took the first step of it: `coralbricks` had no free slot, so the run started on `thirdparty`.
 
 The protocol in full is in [docs/internals.md](docs/internals.md); routing, failover, slots and pauses are in [docs/configuration.md](docs/configuration.md#providers).
 
@@ -140,7 +167,7 @@ The cache carries that much because every request extends the one before it byte
 </picture>
 </p>
 
-It is the session that wrote the first generator of this page's images: 7 turns and 55,961 input tokens, 42,752 of them read from the cache. Turn 1 starts cold, and turn 7 carries the long script that turn 6 wrote.
+It is the session that wrote the first generator of this page's images: 7 turns and 55,961 input tokens, 42,752 of them read from the cache. Turn 1 starts cold, and turn 7 carries the long script that turn 6 wrote. A tick between two bars marks where the upper one's request ended, and the cached part of the bar below stops just short of it: that is the previous request, read again.
 
 <details>
 <summary>The numbers behind the chart</summary>
@@ -230,4 +257,4 @@ sh tests/install_test.sh                  # install.sh against a throwaway home 
 - [docs/plugin.md](docs/plugin.md): how the form's answers reach `dsk`, and what the display draws.
 - [docs/build-notes.md](docs/build-notes.md): what differs from the build prompt, and what was measured on the way.
 - [docs/limits.md](docs/limits.md): known limits, and what is left for later.
-- [assets/build.py](assets/build.py): writes this page's images, in a light and a dark theme. From a checkout, open `assets/preview.html` in a browser to see them all move, on both backgrounds.
+- [assets/build.py](assets/build.py): writes this page's images, in a light and a dark theme, and [assets/check.py](assets/check.py) measures them: a text that leaves its card, two that overlap, a line through one. From a checkout, open `assets/preview.html` in a browser to see them all move, on both backgrounds.

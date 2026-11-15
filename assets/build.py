@@ -2,7 +2,8 @@
 theme; `python3 assets/build.py hero flow` writes only those.
 
 Each image is a module with a `draw(t)` that returns the SVG for the theme `t`. kit.py has what the images share
-and the rules they keep.
+and the rules they keep. `python3 assets/check.py` then measures what was written: nobody has to look at an image to
+know that a text left its card or that two things share a place.
 
 The approach (a stdlib generator, light and dark, animation without scripts) follows monotykamary/supercomputer's
 assets/build.py.
@@ -13,7 +14,7 @@ import sys
 
 import kit
 
-IMAGES = ("hero", "run", "flow", "cache", "stats")
+IMAGES = ("hero", "run", "states", "flow", "gates", "route", "stats", "cache")  # in the README's order
 
 
 def main():
