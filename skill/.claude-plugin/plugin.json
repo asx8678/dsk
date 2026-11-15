@@ -1,7 +1,7 @@
 {
   "name": "dsk",
-  "version": "0.10.1",
-  "description": "Claude Code plans, reviews and decides; a DeepSeek worker scouts the code and writes it: the skill, a reviewer agent, the review gate, and an optional live display of the jobs (/dsk on; /dsk lists the jobs, /dsk-config configures it).",
+  "version": "0.10.2",
+  "description": "Claude Code plans, reviews and decides; a DeepSeek worker scouts the code and writes it: the skill, a reviewer agent, the review gate, and an optional live display of the jobs (/dsk on; /dsk lists the jobs, /dsk config configures it).",
   "author": {
     "name": "Adam"
   },
@@ -21,7 +21,7 @@
     "provider": {
       "type": "string",
       "title": "Provider",
-      "description": "official: DeepSeek's own API, which needs only the DeepSeek API key. custom: any OpenAI-compatible endpoint that serves a DeepSeek model, which needs the three custom fields. With custom, every main task (scouting, writing code, reviews) runs on your custom endpoint; official DeepSeek is used only for web search, and only if you also enter a DeepSeek API key. /dsk-config can later put official DeepSeek to work as well, and sets each provider's priority.",
+      "description": "official: DeepSeek's own API, which needs only the DeepSeek API key. custom: any OpenAI-compatible endpoint that serves a DeepSeek model, which needs the three custom fields. With custom, every main task (scouting, writing code, reviews) runs on your custom endpoint; official DeepSeek is used only for web search, and only if you also enter a DeepSeek API key. /dsk config can later put official DeepSeek to work as well, and sets each provider's priority.",
       "options": [
         "official",
         "custom"
