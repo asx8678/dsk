@@ -1310,6 +1310,220 @@ class Review(Cli):
         code, out, _ = self.dsk("accept", sid, cwd=repo)
         self.assertEqual((code, out), (1, f"dsk · error: session {sid} is accepted; this command needs review or stuck or limit\n"))
 
+    HAND_IN = 'write("tests/t.py", "t = 2\\n")\ndone("t is 2")'
+
+    def rechecked(self, replies, *flags):
+        """A write run with thinking on and --recheck: (repo, report, session id)."""
+        repo = self.repo({"tests/t.py": "t = 1\n"})
+        self.api.replies = replies
+        out, sid = self.run_ok("--allow", "tests/**", "--check", "true", "--effort", "high", "--recheck", *flags, "raise t", cwd=repo)
+        return repo, out, sid
+
+    def test_first_passing_done_comes_back_for_a_second_look_and_the_next_one_is_final(self):
+        again = {"code": 'done("t is 2, checked")', "message": {"reasoning_content": "x" * 1200}}
+        repo, out, sid = self.rechecked([script(self.HAND_IN), again])
+        back = self.back(1)
+        self.assertTrue(back.startswith("turn 1 · 29 left\nwrote: tests/t.py\noutput: (none)\n\n" + dsk.RECHECK + "\n\n=== YOUR CHANGE ===\ndiff --git"), back)
+        self.assertTrue(back.endswith("-t = 1\n+t = 2"), back)
+        self.assertIn("· review · a · 2 turns ·", out)
+        self.assertIn("summary: t is 2, checked\n", out)
+        self.assertIn("recheck: asked after turn 1 · 1,200 characters of reasoning · no change\n", out)
+        report = json.loads(self.dsk("show", sid, "--json", cwd=repo)[1])
+        self.assertEqual(report["recheck"], {"turn": 1, "skipped": "", "reasoning": 1200, "changed": []})
+
+    def test_the_same_script_again_after_the_second_look_confirms_the_hand_in_and_is_not_run_twice(self):
+        hand_in = script('sh("echo ran >> tests/runs.txt")\n' + self.HAND_IN)
+        repo, out, sid = self.rechecked([hand_in, hand_in])
+        self.assertIn("· review · a · 2 turns ·", out)
+        self.assertIn("summary: t is 2\n", out)
+        self.assertIn("recheck: asked after turn 1 · no reasoning came back · no change\n", out)
+        self.assertEqual(self.cat(repo, "tests/runs.txt"), "ran\n")
+        s = dsk.Session(sid)
+        self.assertEqual((s.last("result")["text"], len(s.of("checks"))), ("turn 2 · 28 left\n" + dsk.CONFIRMED, 1))
+        # the confirmed turn has its result, so the next round answers its call, and that round gets a second look too
+        self.api.replies = [script('write("tests/t.py", "t = 3\\n")\ndone("t is 3")'), script('done("t is 3 indeed")')]
+        code, out, err = self.dsk("reject", sid, "1. t must be 3", cwd=repo)
+        self.assertEqual(code, 0, out + err)
+        self.assertTrue(self.back(2).startswith("turn 2 · 28 left\n" + dsk.CONFIRMED + "\n\nthe lead reviewed this"))
+        self.assertIn("· review · a · 4 turns ·", out)
+        self.assertIn("recheck: asked after turn 3 · no reasoning came back · no change\n", out)
+
+    def test_a_second_look_that_fixes_something_names_the_file_it_changed(self):
+        first = script('write("tests/t.py", "t = 2\\n")\nwrite("tests/u.py", "u = 1\\n")\ndone("first")')
+        fix = {"code": 'write("tests/t.py", "t = 3\\n")\ndone("second")', "message": {"reasoning_content": "t must be 3"}}
+        repo, out, sid = self.rechecked([first, fix])
+        self.assertIn("summary: second\n", out)
+        self.assertIn("recheck: asked after turn 1 · 11 characters of reasoning · changed tests/t.py\n", out)
+        self.assertEqual(self.cat(repo, "tests/t.py"), "t = 3\n")
+
+    def test_no_second_look_without_a_turn_left_or_without_thinking(self):
+        repo, out, sid = self.rechecked([script(self.HAND_IN)], "--max-turns", "1")
+        self.assertIn("· review · a · 1 turn ·", out)
+        self.assertIn("recheck: skipped: no turn left\n", out)
+        self.api.replies = [script(self.HAND_IN)]
+        out, sid = self.run_ok("--allow", "tests/**", "--recheck", "raise t", cwd=self.repo({"tests/t.py": "t = 1\n"}))
+        self.assertIn("· review · a · 1 turn ·", out)
+        self.assertIn("recheck: skipped: thinking is off\n", out)
+
+    def test_a_second_look_that_runs_out_of_turns_without_a_change_hands_in_what_passed(self):
+        repo, out, sid = self.rechecked([script(self.HAND_IN), script('print(read("tests/t.py"))')], "--max-turns", "2")
+        self.assertIn("· review · a · 2 turns ·", out)
+        self.assertIn("summary: t is 2\n", out)
+        self.assertIn("why:     turn limit reached during the second look, which changed nothing\n", out)
+        self.assertIn("recheck: asked after turn 1 · no reasoning came back · no change\n", out)
+        peek = script('print(read("tests/t.py"))')
+        repo, out, sid = self.rechecked([script(self.HAND_IN), peek, peek, peek], "--profile", "a")
+        self.assertIn("· review · a · 4 turns ·", out)
+        self.assertIn("why:     same reply three times in a row during the second look, which changed nothing\n", out)
+        self.assertIn("summary: t is 2\n", out)
+
+    def test_a_change_too_long_for_the_second_look_is_named_instead_of_shown(self):
+        big = script('write("tests/big.py", "x = 1\\n" * 10000)\ndone("big")')
+        repo, out, sid = self.rechecked([big, big])
+        self.assertRegex(self.back(1), r"\n\nYour change is too long to show here: \d+ diff lines in tests/big\.py\. Read the parts")
+        self.assertNotIn("=== YOUR CHANGE ===", self.back(1))
+
+    def test_the_second_look_is_off_unless_the_flag_or_the_config_asks_and_continue_keeps_it(self):
+        flags = ("--allow", "tests/**", "--effort", "high")
+        self.api.replies = [script(self.HAND_IN)]
+        out, sid = self.run_ok(*flags, "raise t", cwd=self.repo({"tests/t.py": "t = 1\n"}))
+        self.assertNotIn("recheck:", out)
+        self.assertIsNone(json.loads(self.dsk("show", sid, "--json")[1])["recheck"])
+        self.config["recheck"] = True
+        self.write_config()
+        self.api.replies = [script(self.HAND_IN)]
+        self.assertNotIn("recheck:", self.run_ok(*flags, "--no-recheck", "raise t", cwd=self.repo({"tests/t.py": "t = 1\n"}))[0])
+        repo = self.repo({"tests/t.py": "t = 1\n"})
+        self.api.replies = [script(self.HAND_IN)] * 2
+        out, sid = self.run_ok(*flags, "raise t", cwd=repo)
+        self.assertIn("recheck: asked after turn 1 ·", out)
+        self.assertEqual(self.dsk("accept", sid, cwd=repo)[0], 0)
+        self.api.replies = [script('write("tests/t.py", "t = 3\\n")\ndone("t is 3")'), script('done("still 3")')]
+        code, out, err = self.dsk("continue", sid, "now 3", cwd=repo)
+        self.assertEqual(code, 0, out + err)
+        self.assertIn("recheck: asked after turn 3 ·", out)
+        self.assertEqual(self.dsk("accept", sid, cwd=repo)[0], 0)
+        self.api.replies = [script('write("tests/t.py", "t = 4\\n")\ndone("t is 4")')]
+        code, out, err = self.dsk("continue", sid, "--no-recheck", "now 4", cwd=repo)
+        self.assertEqual(code, 0, out + err)
+        self.assertNotIn("recheck:", out)
+
+    @staticmethod
+    def verdict(*findings):
+        """A reviewer's reply that reports these findings, each given as its fields in dsk.FINDING order."""
+        return json.dumps({"findings": [dict(zip(dsk.FINDING, f)) for f in findings]})
+
+    BLOCKER = ("blocker", "tests/t.py", "t = 2", "the task", "t is 3", "t is 2", "set t to 3")
+    FIX = 'write("tests/t.py", "t = 3\\n")\ndone("t is 3", "R1-F1 fixed")'
+
+    def reviewed_run(self, replies, *flags):
+        """A write run with --reviewer: (repo, report, session id)."""
+        repo = self.repo({"tests/t.py": "t = 1\n"})
+        self.api.replies = replies
+        out, sid = self.run_ok("--allow", "tests/**", "--check", "true", "--reviewer", *flags, "raise t to 3", cwd=repo)
+        return repo, out, sid
+
+    def test_a_passing_hand_in_goes_to_a_reviewer_in_a_fresh_request_and_its_findings_go_back(self):
+        repo, out, sid = self.reviewed_run([script(self.HAND_IN), self.verdict(self.BLOCKER), script(self.FIX), self.verdict()])
+        first, second = self.api.bodies()[1], self.api.bodies()[3]
+        self.assertEqual([("tools" in b, "tool_choice" in b, b["reasoning_effort"], b["max_tokens"]) for b in (first, second)],
+                         [(False, False, "none", 4000)] * 2)
+        self.assertEqual([m["role"] for m in first["messages"]], ["system", "user"])
+        self.assertEqual(first["messages"][0]["content"], dsk.REVIEWER)
+        user = first["messages"][1]["content"]
+        self.assertTrue(user.startswith("## Task\nraise t to 3\n\n## Result\n=== DIFF ===\ndiff --git"), user)
+        self.assertTrue(user.endswith("+t = 2\n\n=== FILE: tests/t.py, as it now stands ===\nt = 2"), user)
+        self.assertEqual(self.api.bodies()[2]["messages"][-1]["content"],
+                         "turn 1 · 29 left\nwrote: tests/t.py\noutput: (none)\n\n" + dsk.REVIEWER_FINDINGS
+                         + "\nR1-F1 blocker tests/t.py:1: t = 2\n  input: the task\n  expected: t is 3\n  actual: t is 2\n  fix: set t to 3")
+        self.assertIn("## PRIOR FINDINGS\nR1-F1 blocker tests/t.py:1: t = 2\n", second["messages"][1]["content"])
+        self.assertIn("\nthe author's answer: t is 3 | R1-F1 fixed\n", second["messages"][1]["content"])
+        self.assertIn("· review · a · 2 turns ·", out)
+        self.assertRegex(out, r"\nreview:  call 1: 1 blocker in \d+ s · call 2: nothing in \d+ s · quotes still in the code: 0 of 1\n")
+        self.assertEqual(len(dsk.Session(sid).of("usage")), 2)  # the reviewer's tokens are its own, not the worker's turns
+        packet = self.dsk("show", sid, "--review", cwd=repo)[1]
+        self.assertIn("\nfinding: R1-F1 blocker tests/t.py:1 · input: the task · actual: t is 2\n", packet)
+        report = json.loads(self.dsk("show", sid, "--json", cwd=repo)[1])["reviewer"]
+        self.assertEqual((report["sent"], report["still_there"], len(report["calls"])), (["R1-F1"], [], 2))
+
+    def test_findings_dsk_cannot_check_are_dropped_and_a_minor_one_is_only_reported(self):
+        minor = ("minor", "tests/t.py", "t  =  2", "x", "y", "z", "w")  # other spacing, the same text
+        dropped = [("fatal", "tests/t.py", "t = 2", "x", "y", "z", "w"), ("blocker", "src/a.py", "t = 2", "x", "y", "z", "w"),
+                   ("blocker", "tests/t.py", "t = 9", "x", "y", "z", "w"), ("blocker", "tests/t.py", "t = 2", " ", "y", "z", "w"),
+                   ("blocker", "tests/t.py", "t = 2", "x", "y", "this is not a defect", "No change.")]
+        repo, out, sid = self.reviewed_run([script(self.HAND_IN), self.verdict(minor, *dropped)])
+        self.assertIn("· review · a · 1 turn ·", out)
+        self.assertRegex(out, r"\nreview:  call 1: 1 minor, 5 dropped in \d+ s\n")
+        self.assertEqual(len(self.api.bodies()), 2)  # nothing went back to the worker
+
+    def test_a_cut_off_review_keeps_its_whole_findings_and_repeats_and_extras_are_dropped(self):
+        whole = self.verdict(self.BLOCKER)[:-2]  # the list left open, as a reply cut off at its limit leaves it
+        cut = {"content": whole + ', {"severity": "major", "path": "tests/t.py", "quo', "finish": "length"}
+        repo, out, sid = self.reviewed_run([script(self.HAND_IN), cut, script(self.FIX), self.verdict()])
+        self.assertRegex(out, r"\nreview:  call 1: 1 blocker, cut off in \d+ s · call 2: nothing in \d+ s")
+        lines = "".join(f"v{i} = {i}\n" for i in range(10))
+        many = [("minor", "tests/t.py", f"v{i} = {i}", "x", "y", "z", "w") for i in range(10)]
+        repo, out, sid = self.reviewed_run([script(f'write("tests/t.py", {lines!r})\ndone("ten")'),
+                                            self.verdict(many[0], many[0], *many[1:])])
+        self.assertRegex(out, r"\nreview:  call 1: 8 minor, 3 dropped in \d+ s\n")
+        self.assertEqual([f["line"] for f in dsk.Session(sid).of("reviewer")[0]["findings"]], list(range(1, 9)))
+
+    def test_a_reviewer_that_fails_or_says_no_json_lets_the_hand_in_through(self):
+        repo, out, sid = self.reviewed_run([script(self.HAND_IN), "It looks fine to me."])
+        self.assertIn("· review · a · 1 turn ·", out)
+        self.assertIn("\nreview:  call 1: no verdict, the reply was not one JSON object of findings\n", out)
+        repo, out, sid = self.reviewed_run([script(self.HAND_IN), {"status": 400, "error": "bad request"}])
+        self.assertIn("· review · a · 1 turn ·", out)
+        self.assertIn("\nreview:  call 1: no verdict, HTTP 400\n", out)
+
+    def test_a_round_has_at_most_reviewer_calls_reviews_and_no_review_without_a_turn_left(self):
+        again = ("blocker", "tests/t.py", "t = 3", "a", "b", "c", "d")
+        repo, out, sid = self.reviewed_run([script(self.HAND_IN), self.verdict(self.BLOCKER), script(self.FIX),
+                                            self.verdict(again), script('done("t stays 3")')])
+        self.assertEqual(len(self.api.bodies()), 5)
+        self.assertIn("· review · a · 3 turns ·", out)
+        self.assertRegex(out, r"\nreview:  call 1: 1 blocker in \d+ s · call 2: 1 blocker in \d+ s · quotes still in the code: 1 of 2\n")
+        repo, out, sid = self.reviewed_run([script(self.HAND_IN)], "--max-turns", "1")
+        self.assertIn("\nreview:  skipped: no turn left\n", out)
+
+    def test_the_second_look_comes_before_the_reviewer_and_counts_only_its_own_change(self):
+        repo, out, sid = self.reviewed_run([script(self.HAND_IN), script(self.HAND_IN), self.verdict(self.BLOCKER),
+                                            script(self.FIX), self.verdict()], "--recheck", "--effort", "high")
+        roles = [b["messages"][0]["content"] == dsk.REVIEWER for b in self.api.bodies()]
+        self.assertEqual(roles, [False, False, True, False, True])
+        self.assertIn("recheck: asked after turn 1 · no reasoning came back · no change\n", out)
+        self.assertRegex(out, r"\nreview:  call 1: 1 blocker in \d+ s · call 2: nothing in \d+ s · quotes still in the code: 0 of 1\n")
+
+    def test_compaction_keeps_the_findings_the_worker_is_fixing(self):
+        repo, out, sid = self.reviewed_run([script(self.HAND_IN), self.verdict(self.BLOCKER), script('print(read("tests/t.py"))'),
+                                            script(self.FIX), self.verdict()])
+        recs = dsk.Session(sid).recs
+        cut = [i for i, r in enumerate(recs) if r["t"] == "reviewer"][1]
+        first = dsk.compaction(recs[:cut], ["tests/t.py"], 32000)[1]["m"]["content"]
+        sent = dsk.Session(sid).of("reviewer")[0]["findings"]
+        self.assertIn("\n\n## The reviewer's findings\n" + dsk.findings_text(sent), first)
+        self.assertNotIn("The reviewer's findings", dsk.compaction(recs, ["tests/t.py"], 32000)[1]["m"]["content"])
+
+    def test_the_reviewer_is_off_unless_asked_and_continue_keeps_it(self):
+        repo = self.repo({"tests/t.py": "t = 1\n"})
+        self.api.replies = [script(self.HAND_IN)]
+        out, sid = self.run_ok("--allow", "tests/**", "raise t", cwd=repo)
+        self.assertNotIn("review:", out)
+        self.assertIsNone(json.loads(self.dsk("show", sid, "--json", cwd=repo)[1])["reviewer"])
+        self.assertEqual(self.dsk("accept", sid, cwd=repo)[0], 0)
+        self.api.replies = [script('write("tests/t.py", "t = 3\\n")\ndone("t is 3")'), self.verdict()]
+        code, out, err = self.dsk("continue", sid, "--reviewer", "now 3", cwd=repo)
+        self.assertEqual(code, 0, out + err)
+        self.assertRegex(out, r"\nreview:  call 1: nothing in \d+ s\n")
+        self.assertEqual(self.dsk("accept", sid, cwd=repo)[0], 0)
+        self.api.replies = [script('write("tests/t.py", "t = 4\\n")\ndone("t is 4")'), self.verdict()]
+        code, out, err = self.dsk("continue", sid, "now 4", cwd=repo)
+        self.assertRegex(out, r"\nreview:  call 1: nothing in \d+ s\n")
+        self.assertEqual(self.dsk("accept", sid, cwd=repo)[0], 0)
+        self.api.replies = [script('write("tests/t.py", "t = 5\\n")\ndone("t is 5")')]
+        code, out, err = self.dsk("continue", sid, "--no-reviewer", "now 5", cwd=repo)
+        self.assertNotIn("review:", out)
+
     def test_reject_sends_defects_into_the_same_series_with_a_fresh_turn_budget(self):
         repo, sid = self.delegated()
         self.api.replies = [script('edit("tests/t.py", "t = 2", "t = 3")\ndone("Now it is 3.")')]

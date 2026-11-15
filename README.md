@@ -228,7 +228,7 @@ What is known not to work yet: [docs/limits.md](docs/limits.md).
 
 | | |
 | --- | --- |
-| `run "brief"` | a task: `--allow GLOB`, `--check CMD`, `--file PATH[:A-B]`, `--web`, `--worktree`, `--effort`, `--profile`, `--max-turns`, `--json` |
+| `run "brief"` | a task: `--allow GLOB`, `--check CMD`, `--file PATH[:A-B]`, `--web`, `--worktree`, `--effort`, `--profile`, `--max-turns`, `--recheck`, `--reviewer`, `--json` |
 | `answer ID "text"` | reply to the worker's question; the run continues |
 | `show ID` | the report again: `--review`, `--diff`, `--log`, `--answer`, `--json` |
 | `accept ID` | mark as reviewed; after `--worktree`, apply the changes to the main tree |

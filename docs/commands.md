@@ -5,6 +5,8 @@ Every `dsk` command and flag, what a report looks like as text, and the same rep
 ```
 dsk run [--allow GLOB]... [--check CMD]... [--file PATH[:A-B]]... [--web] [--worktree] [--no-sandbox]
         [--effort off|low|high|max] [--profile NAME]
+        [--recheck | --no-recheck]    (default: `recheck` in the config, else off: a second look at the first hand-in)
+        [--reviewer | --no-reviewer]  (default: `reviewer` in the config, else off: an independent review of each hand-in)
         [--max-turns N]    (default: 30 with --allow, 12 without)
         [--owner ID]       (default: $CLAUDE_CODE_SESSION_ID, which Claude Code sets for every command)
         "brief"            (or --brief FILE)
@@ -18,6 +20,7 @@ dsk reject ID "defects"    send defects back into the same session; the run cont
 dsk reject ID --drop       discard the work
 dsk continue ID "task"     send the next task into a session that is done or accepted; the worker keeps its context
         [--allow GLOB]... [--check CMD]... [--max-turns N]     (each replaces the run's; left out, it stays)
+        [--recheck | --no-recheck] [--reviewer | --no-reviewer]   (likewise)
 dsk status [--hook]        this project's open sessions; --hook is the Claude Code Stop hook
 dsk wait [ID ...]          block until those sessions (default: yours in this project, running or just started) have stopped,
         [--timeout SECONDS]    printing each report as it comes; exit 124 when the time is up
@@ -44,4 +47,4 @@ next:    dsk show 7f3a --review | dsk accept 7f3a | dsk reject 7f3a "defects"
 
 ## JSON
 
-With `--json`, `run`, `answer`, `reject`, `continue`, `show` and `wait` print one JSON object per report on stdout and nothing else there; an error is `{"error": "..."}`. The object holds what `status --json` gives for a job (see [Progress](internals.md#progress)) and the rest of the report: `left` (the profiles the session moved away from), `summary`, `answer`, `question`, `error`, `why`, `open`, `notes`, `checks` (a list of `{"cmd", "code"}`), `checked`, `passed_before`, `files` (a list of `{"path", "added", "deleted"}`), `reverted`, `workdir`, `context` (`used`, `limit`, `compactions`) and `next`. A program should read this and not the text, whose wording may change. The line `dsk ID · running · profile` that a run prints first goes to stderr in both forms.
+With `--json`, `run`, `answer`, `reject`, `continue`, `show` and `wait` print one JSON object per report on stdout and nothing else there; an error is `{"error": "..."}`. The object holds what `status --json` gives for a job (see [Progress](internals.md#progress)) and the rest of the report: `left` (the profiles the session moved away from), `summary`, `answer`, `question`, `error`, `why`, `open`, `notes`, `checks` (a list of `{"cmd", "code"}`), `checked`, `passed_before`, `recheck` and `reviewer` (null unless the round had one; see [Second look and reviewer](internals.md#second-look-and-reviewer)), `files` (a list of `{"path", "added", "deleted"}`), `reverted`, `workdir`, `context` (`used`, `limit`, `compactions`) and `next`. A program should read this and not the text, whose wording may change. The line `dsk ID · running · profile` that a run prints first goes to stderr in both forms.
