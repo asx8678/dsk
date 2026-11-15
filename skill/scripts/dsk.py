@@ -2812,6 +2812,159 @@ def cmd_configure(args, cfg):
     return 0 if ready else 1
 
 
+# ---------------------------------------------------------------- providers: /dsk-add and /dsk-config
+
+PROVIDER_NAME = re.compile(r"[a-z][a-z0-9_-]{0,31}")
+
+
+def write_kept(path, text):
+    """Replaces a file of the user's in one step: a reader sees the old file or the new one, never half of either. An
+    existing file keeps its mode; a new one is readable by its owner alone."""
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    try:
+        mode = os.stat(path).st_mode & 0o777
+    except FileNotFoundError:
+        mode = 0o600
+    with open(os.open(path + ".new", os.O_WRONLY | os.O_CREAT | os.O_TRUNC, mode), "w", encoding="utf-8") as f:
+        f.write(text)
+        f.flush()
+        os.fsync(f.fileno())
+    os.chmod(path + ".new", mode)
+    os.replace(path + ".new", path)
+
+
+def user_config():
+    """~/.config/dsk/config.json as the user wrote it, {} when there is none. Every key in it is kept on a rewrite."""
+    path = os.path.join(xdg("XDG_CONFIG_HOME", "~/.config"), "config.json")
+    try:
+        with open(path, encoding="utf-8") as f:
+            user = json.load(f)
+    except FileNotFoundError:
+        return path, {}
+    except ValueError as e:
+        raise Fail(f"{path}: {e}; fix it by hand, dsk will not rewrite it") from None
+    if not isinstance(user, dict) or not isinstance(user.get("profiles", {}), dict) or not isinstance(user.get("route", []), list):
+        raise Fail(f"{path}: not the shape dsk writes (an object, with profiles an object and route a list); fix it by hand")
+    return path, user
+
+
+def set_key(name, key):
+    """Puts `export NAME='key'` in ~/.config/dsk/env in place of any line that set NAME; every other line stays."""
+    path = os.path.join(xdg("XDG_CONFIG_HOME", "~/.config"), "env")
+    try:
+        with open(path, encoding="utf-8") as f:
+            lines = f.read().splitlines()
+    except FileNotFoundError:
+        lines = ["# API keys for dsk. Source this file from your shell profile, or leave it: dsk reads it as well."]
+
+    def sets(line):
+        try:
+            return any(w.startswith(name + "=") for w in shlex.split(line, comments=True))
+        except ValueError:
+            return False
+
+    write_kept(path, "\n".join([line for line in lines if not sets(line)] + [f"export {name}={shlex.quote(key)}"]) + "\n")
+
+
+def read_key(args):
+    if not args.key_stdin:
+        return None
+    key = sys.stdin.read().strip()
+    if not key or any(c.isspace() for c in key):
+        raise Fail("the API key is empty or holds a space or a line break")
+    return key
+
+
+def check_endpoint(url, model):
+    if url is not None and not re.fullmatch(r"https?://[^\s/]+(/\S*)?", url):
+        raise Fail(f"{url!r} is not an http(s) URL such as https://example.com/v1")
+    if model is not None and (not model.strip() or any(c.isspace() for c in model)):
+        raise Fail("the model name is empty or holds a space")
+
+
+def provider_rows(cfg):
+    """Each profile, the route's first in its order: name, endpoint, model, whether it is on the route, whether its key is set."""
+    route = [n for n in cfg["route"] if n in cfg["profiles"]]
+    return [{"name": n, "base_url": p.get("base_url", ""), "model": p.get("model", ""), "key_env": p.get("key_env", ""),
+             "key": bool(secret(p.get("key_env", ""))), "enabled": n in route,
+             "position": route.index(n) + 1 if n in route else None}
+            for n, p in sorted(cfg["profiles"].items(), key=lambda kv: route.index(kv[0]) if kv[0] in route else len(route))]
+
+
+def cmd_provider(args, cfg):
+    """List, add, change, enable or disable the provider profiles. Writes ~/.config/dsk/config.json, keeping every key in
+    it, and a key to ~/.config/dsk/env, never into the config."""
+    if args.action == "list":
+        rows = provider_rows(cfg)
+        if args.json:
+            print(json.dumps({"providers": rows, "search": bool(secret(cfg["search"]["key_env"]))}))
+        for r in [] if args.json else rows:
+            where = f"{r['position']}." if r["enabled"] else "off"
+            print(f"{where:<4}{r['name']:<14}{r['model']} · {r['base_url']} · key {'set' if r['key'] else 'missing'}")
+        return 0
+    name = (args.name or "").strip()
+    if not name:
+        raise Fail(f"provider {args.action} needs a name")
+    path, user = user_config()
+    profiles, route = user.setdefault("profiles", {}), user.get("route", list(cfg["route"]))
+    if args.action == "add":
+        if not PROVIDER_NAME.fullmatch(name):
+            raise Fail(f"{name!r}: a name is lower-case letters, digits, - and _, starting with a letter, at most 32")
+        if name in cfg["profiles"]:
+            raise Fail(f"there is already a provider named {name}; change it with: dsk provider set {name}")
+        if not args.url or not args.model:
+            raise Fail("provider add needs --url and --model")
+        check_endpoint(args.url, args.model)
+        key = read_key(args)
+        if key is None:
+            raise Fail("provider add needs the API key on standard input, with --key-stdin")
+        key_env = "DSK_" + re.sub(r"[^A-Z0-9]", "_", name.upper()) + "_API_KEY"
+        set_key(key_env, key)  # the key first: a profile that names a key never written would fail every run
+        profiles[name] = {"base_url": args.url.rstrip("/"), "key_env": key_env, "model": args.model,
+                          "compact_at": 24000, "extra": {}}
+        user["route"] = [*route, name]
+        write_kept(path, json.dumps(user, indent=2) + "\n")
+        print(f"dsk · added {name} · {args.model} · {args.url.rstrip('/')} · it runs after {', '.join(route) or 'nothing'}")
+        return 0
+    if name not in cfg["profiles"]:
+        raise Fail(f"no provider named {name}; dsk provider list shows them")
+    if args.action == "set":
+        check_endpoint(args.url, args.model)
+        key = read_key(args)
+        profile = dict(profiles.get(name) or cfg["profiles"][name])  # a profile in config.json replaces the built-in whole
+        changed = [field for field, value in (("base_url", args.url and args.url.rstrip("/")), ("model", args.model))
+                   if value is not None and profile.get(field) != value]
+        for field, value in (("base_url", args.url and args.url.rstrip("/")), ("model", args.model)):
+            if value is not None:
+                profile[field] = value
+        if key is not None:
+            set_key(profile["key_env"], key)
+            changed.append("key")
+            if os.environ.get(profile["key_env"]):
+                print(f"note: {profile['key_env']} is also set in the environment, which wins over ~/.config/dsk/env")
+        if any(f != "key" for f in changed):
+            profiles[name] = profile
+            write_kept(path, json.dumps(user, indent=2) + "\n")
+        print(f"dsk · {name} · " + (f"changed {', '.join(changed)}" if changed else "nothing to change"))
+        return 0
+    enabled = name in route
+    if args.action == "disable":
+        if not enabled:
+            print(f"dsk · {name} is already disabled")
+            return 0
+        if [n for n in route if n != name and n in cfg["profiles"]] == []:
+            raise Fail(f"{name} is the only enabled provider; enable or add another first")
+        user["route"] = [n for n in route if n != name]
+    elif enabled:
+        print(f"dsk · {name} is already enabled")
+        return 0
+    else:
+        user["route"] = [*route, name]
+    write_kept(path, json.dumps(user, indent=2) + "\n")
+    print(f"dsk · {name} {args.action}d · route: {' → '.join(user['route'])}")
+    return 0
+
+
 def cmd_web(args, cfg):
     status, data = web_tool(cfg, args.command, args.target, getattr(args, "count", 5))
     if status != 200:
@@ -2985,10 +3138,18 @@ def main():
     configure.add_argument("--hook", action="store_true", help="act as a Claude Code hook: store the plugin's options first")
     configure.add_argument("--announce", action="store_true", help="with --hook: say what is still missing")
     configure.add_argument("--data", metavar="DIR", help="with --hook: the plugin's data folder")
+    provider = command("provider", "list, add, change, enable or disable the provider profiles")
+    provider.add_argument("action", choices=["list", "add", "set", "enable", "disable"])
+    provider.add_argument("name", nargs="?")
+    provider.add_argument("--url", help="add, set: the base URL of the OpenAI-compatible API")
+    provider.add_argument("--model", help="add, set: the model id as the endpoint lists it")
+    provider.add_argument("--key-stdin", action="store_true", help="add, set: read the API key from standard input")
+    provider.add_argument("--json", action="store_true", help="list: as JSON")
     commands = {"run": cmd_run, "answer": cmd_answer, "show": cmd_show, "continue": cmd_continue,
                 "accept": cmd_accept, "reject": cmd_reject,
                 "status": cmd_status, "wait": cmd_wait, "stats": cmd_stats, "search": cmd_web, "fetch": cmd_web,
-                "doctor": cmd_doctor, "configure": cmd_configure, "bench": cmd_bench}
+                "doctor": cmd_doctor, "configure": cmd_configure, "bench": cmd_bench,
+                "provider": cmd_provider}
     args = parser.parse_args()
     VERBOSE = args.verbose
     JSON = args.command in ("run", "answer", "continue", "reject", "show", "wait") and args.json
