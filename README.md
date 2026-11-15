@@ -77,6 +77,7 @@ Two commands, typed like any other slash command:
 | `/dsk update` | Fetches the newest dsk from this repository and installs it, then says which version you had and which you have now. Restart Claude Code, or run `/reload-plugins`, to load it |
 | `/dsk-config` | Opens the settings pane: dsk's version, on or off, and the providers. Everything under [Providers and models](#providers-and-models) is done here |
 
+- **As you type `/dsk`,** the suggestions list `/dsk on`, `/dsk off` and `/dsk update` beneath `/dsk` and `/dsk-config`, and a word begun after `/dsk ` is completed (`/dsk u` offers `update`).
 - **The version** is shown at the top of `/dsk-config`, by `/dsk update`, in the first line of `dsk configure`, and once at the start of the first session after an install or an update (`dsk 0.9.1 → 0.10.0 updated.`).
 - **`/dsk update` by hand** is these two commands, which also work from a shell; your keys and `~/.config/dsk` stay:
 
