@@ -660,6 +660,31 @@ class Providers(Cli):
         listed = json.loads(self.dsk("provider", "list", "--json")[1])["providers"]
         self.assertEqual([r["name"] for r in listed if r["enabled"]], ["z", name])
 
+    def test_rename_keeps_the_key_the_route_and_a_built_in_stays_renamed(self):
+        with open(f"{self.tmp}/config/dsk/config.json") as f:
+            cfg0 = json.load(f)
+        self.dsk("provider", "add", "z", "--url", "https://z.example/v1", "--model", "zm", "--key-stdin", stdin="k1")
+        self.assertEqual(self.dsk("provider", "rename", "z", "y")[0], 0)
+        cfg, env = self.files()
+        self.assertNotIn("z", cfg["profiles"])
+        self.assertEqual(cfg["profiles"]["y"]["key_env"], "DSK_Z_API_KEY")
+        self.assertEqual(cfg["route"], [*cfg0["route"], "y"])
+        self.assertEqual({k: v for k, v in cfg["profiles"].items() if k != "y"}, cfg0["profiles"])
+        self.assertEqual(self.dsk("provider", "rename", "y", cfg0["route"][0])[0], 1)  # taken
+        self.assertEqual(self.dsk("provider", "add", "z", "--url", "https://q/v1", "--model", "m", "--key-stdin",
+                                  stdin="k")[0], 1)  # an old name still serves running jobs
+        self.assertEqual(self.dsk("provider", "up", "y")[0], 0)
+        self.assertEqual(self.files()[0]["route"][-2:], ["y", cfg0["route"][-1]])
+        # official is built in, not in config.json: its rename is recorded, and it comes back under the new name
+        self.assertEqual(self.dsk("provider", "rename", "official", "deep")[0], 0)
+        listed = json.loads(self.dsk("provider", "list", "--json")[1])["providers"]
+        names = [r["name"] for r in listed]
+        self.assertIn("deep", names)
+        self.assertNotIn("official", names)
+        self.assertEqual(self.dsk("provider", "rename", "deep", "official")[0], 0)
+        self.assertNotIn("official", self.files()[0].get("renamed", {}))
+        self.assertIn("official", [r["name"] for r in json.loads(self.dsk("provider", "list", "--json")[1])["providers"]])
+
     def test_a_config_it_cannot_read_is_left_alone(self):
         path = f"{self.tmp}/config/dsk/config.json"
         with open(path, "w") as f:
