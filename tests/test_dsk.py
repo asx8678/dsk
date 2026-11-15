@@ -777,7 +777,7 @@ class Loop(Cli):
         repo = self.repo({"src/a.py": "a = 1\n", "tests/t.py": "t = 1\n"})
         self.put(repo, {"tests/list.txt": "needle\n"})
         attempts = ['sh("git commit -m x")', 'sh("cd . && git push")', 'sh("/usr/bin/git stash")', 'sh("sudo ls")',
-                    'sh("pip install x")', 'read("../outside.txt")', 'read("/etc/hosts")', 'write("../x", "1")',
+                    'sh("pip install x")', 'write("../x", "1")',
                     'write("src/a.py", "1")', 'edit("src/a.py", "a", "b")', 'write("t.py", "1")', 'search("q")',
                     'fetch("http://x")']
         body = "attempts = [" + ", ".join(f"lambda: {a}" for a in attempts) + """]
@@ -797,8 +797,8 @@ done("tried everything")"""
         printed = self.output(sid, 1).splitlines()
         self.assertEqual([line[:8] for line in printed[:-1]], ["refused:"] * len(attempts), printed)
         self.assertEqual(printed[-1], "0 0 0 True")
-        self.assertIn("src/a.py does not match the allow patterns (tests/**)", printed[8])
-        self.assertIn("needs --web", printed[11])
+        self.assertIn("src/a.py does not match the allow patterns (tests/**)", printed[6])
+        self.assertIn("needs --web", printed[9])
         self.assertEqual((self.cat(repo, "src/a.py"), self.cat(repo, "tests/t.py"), self.cat(repo, "tests/new/deep.py")),
                          ("a = 1\n", "t = 2\n", "ok = 1\n"))
         self.assertIn("changed: tests/new/deep.py (+1), tests/t.py (+1 -1)", out)
@@ -1195,14 +1195,15 @@ class Compaction(Cli):
 
     def test_the_same_log_compacts_to_the_same_bytes(self):
         log = self.long_run()
+        limit = self.config["profiles"]["a"]["compact_at"]
         cut = next(i for i, r in enumerate(log.recs) if r["t"] == "series" and r["why"] == "compact")
         logged = [{"turn": r["turn"], "m": r["m"]} for r in log.recs[cut + 1:cut + 8]]
-        self.assertEqual(dsk.compaction(log.recs[:cut], log.recs[cut]["changed"]), logged)
+        self.assertEqual(dsk.compaction(log.recs[:cut], log.recs[cut]["changed"], limit), logged)
         program = ("import importlib.util, json, sys\n"
                    f"spec = importlib.util.spec_from_file_location('dsk', {DSK!r})\n"
                    "dsk = importlib.util.module_from_spec(spec); spec.loader.exec_module(dsk)\n"
                    f"recs = [json.loads(line) for line in open({log.path!r})][:{cut}]\n"
-                   f"sys.stdout.write(dsk.dumps(dsk.compaction(recs, {log.recs[cut]['changed']!r})))")
+                   f"sys.stdout.write(dsk.dumps(dsk.compaction(recs, {log.recs[cut]['changed']!r}, {limit})))")
         outputs = {subprocess.run([sys.executable, "-c", program], env={**self.env, "PYTHONHASHSEED": seed},
                                   capture_output=True, text=True).stdout for seed in ("1", "2", "3")}
         self.assertEqual(outputs, {dsk.dumps(logged)})

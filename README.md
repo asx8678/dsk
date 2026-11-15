@@ -232,7 +232,7 @@ What is known not to work yet: [docs/limits.md](docs/limits.md).
 | `answer ID "text"` | reply to the worker's question; the run continues |
 | `show ID` | the report again: `--review`, `--diff`, `--log`, `--answer`, `--json` |
 | `accept ID` | mark as reviewed; after `--worktree`, apply the changes to the main tree |
-| `reject ID "defects"`, `reject ID --drop` | send defects back into the same session; discard the work |
+| `reject ID "defects"`, `reject ID --drop` | send defects back into the same session (`--max-turns` for that round); discard the work |
 | `continue ID "task"` | the next task into a session that is done or accepted; the worker keeps its context |
 | `status`, `wait [ID ...]` | this project's open sessions; block until sessions have stopped |
 | `stats [ID ...]` | what sessions measured: outcomes, where the turns went, tokens, time, per profile |
