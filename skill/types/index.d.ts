@@ -44,6 +44,33 @@ export type Calls = Record<string, number>
 /** What the pane shows in place of its list: one job's diff or its turns. */
 export type View = { id: string; kind: 'diff' | 'log'; text: string }
 
+/** One provider profile, as `dsk provider list --json` prints it. */
+export type Provider = {
+  name: string
+  base_url: string
+  model: string
+  key_env: string
+  /** Whether its key is set; the key itself is never read here. */
+  key: boolean
+  /** Whether runs use it: it is on the route. */
+  enabled: boolean
+  /** Its place on the route, from 1; null when disabled. */
+  position: number | null
+}
+
+/** What the providers pane of /dsk-config and /dsk-add shows. The form's text is not here: no key is stored. */
+export type Providers = {
+  list: Provider[]
+  /** Whether web search has its DeepSeek key. */
+  search: boolean
+  mode: 'list' | 'add' | 'edit'
+  /** The provider the form changes. */
+  editing: string
+  /** What dsk said last, and whether it was an error. */
+  note: string
+  isError: boolean
+}
+
 declare module 'claude-code' {
   interface PluginState {
     dsk: {
@@ -54,6 +81,7 @@ declare module 'claude-code' {
       // Whether the display is loaded in this session: `/dsk-jobs on` and `off`.
       isOn: boolean
       view: Shaped<View | null>
+      providers: Shaped<Providers>
     }
   }
 }

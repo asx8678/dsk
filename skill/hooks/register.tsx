@@ -1,7 +1,7 @@
 import { atom, read, update } from 'claude-code'
 import type { Color, Elements, EngineInterface, Register, RenderNode, Timer } from 'claude-code'
 
-import type { Board, Job } from '../types'
+import type { Board, Job, Provider, Providers } from '../types'
 
 const PANE = 'dsk-jobs'
 const COMMAND = 'dsk-jobs'
@@ -113,6 +113,13 @@ const calls = atom({ plugin: 'dsk', key: 'calls' } as const, {}, { shape: 'calls
 const frame = atom({ plugin: 'dsk', key: 'frame' } as const, 0)
 const isOn = atom({ plugin: 'dsk', key: 'isOn' } as const, false)
 const view = atom({ plugin: 'dsk', key: 'view' } as const, null, { shape: 'view-1' })
+const providers = atom(
+  { plugin: 'dsk', key: 'providers' } as const,
+  { list: [], search: false, mode: 'list', editing: '', note: '', isError: false } as Providers,
+  { shape: 'providers-1' },
+)
+// The pane of /dsk-config and /dsk-add.
+const SETUP = 'dsk-providers'
 
 type Kit = Pick<Elements['terminal'], 'Box' | 'Text' | 'Code' | 'Button'>
 type Call = { verb: string; id: string | undefined; said: string }
@@ -683,10 +690,13 @@ const card = (kit: Kit, report: Report) => {
  * What dsk prints for these arguments, and whether it succeeded: this plugin's
  * own copy first, then the one on PATH. Undefined when neither can be run.
  */
-const dsk = async ($: EngineInterface, args: readonly string[]) => {
+const dsk = async ($: EngineInterface, args: readonly string[], stdin?: string) => {
   for (const program of [`${$.plugin.root}/scripts/dsk.py`, 'dsk']) {
     try {
-      const ran = await $.process.run([program, ...args], { timeoutMs: 10_000 })
+      const ran = await $.process.run(
+        [program, ...args],
+        stdin === undefined ? { timeoutMs: 10_000 } : { timeoutMs: 10_000, stdin },
+      )
 
       return { isOk: ran.exitCode === 0, text: ran.stdout }
     } catch {
@@ -696,6 +706,94 @@ const dsk = async ($: EngineInterface, args: readonly string[]) => {
 
   return undefined
 }
+
+// What the provider form holds while it is typed. Kept here and not in the
+// session's state, so an API key is never stored by the engine; it goes to dsk
+// on standard input alone.
+let draft = { name: '', url: '', model: '', key: '' }
+
+/** Reads the providers again (`dsk provider list --json`) and sets what the pane shows. */
+const refresh = async ($: EngineInterface, patch: Partial<Providers> = {}) => {
+  const ran = await dsk($, ['provider', 'list', '--json'])
+  let read: Pick<Providers, 'list' | 'search'> | undefined
+
+  try {
+    const parsed: unknown = JSON.parse(ran?.text ?? '')
+
+    if (isRecord(parsed) && Array.isArray(parsed.providers)) {
+      read = { list: parsed.providers as Provider[], search: parsed.search === true }
+    }
+  } catch {
+    // Not JSON: dsk said why, and the pane shows it.
+  }
+
+  const failed =
+    read === undefined
+      ? { note: (ran?.text ?? '').trim() || 'dsk did not answer. Is it on PATH and up to date?', isError: true }
+      : {}
+  await update($, providers, now => ({ ...now, ...read, ...patch, ...failed }))
+}
+
+/** Opens the form: empty to add a provider, or filled with one to change it. */
+const openForm = async ($: EngineInterface, editing?: Provider) => {
+  draft = { name: editing?.name ?? '', url: editing?.base_url ?? '', model: editing?.model ?? '', key: '' }
+  await update($, providers, (now): Providers => ({
+    ...now,
+    mode: editing === undefined ? 'add' : 'edit',
+    editing: editing?.name ?? '',
+    note: '',
+    isError: false,
+  }))
+}
+
+/** Sends the form to `dsk provider add` or `set`; on success, back to the list. */
+const save = async ($: EngineInterface) => {
+  const now = await read($, providers)
+  const field = { name: draft.name.trim(), url: draft.url.trim(), model: draft.model.trim(), key: draft.key.trim() }
+  const missing = [
+    ...(now.mode === 'add' && field.name === '' ? ['name'] : []),
+    ...(field.url === '' ? ['API URL'] : []),
+    ...(field.model === '' ? ['model name'] : []),
+    ...(now.mode === 'add' && field.key === '' ? ['API key'] : []),
+  ]
+
+  if (missing.length > 0) {
+    await update($, providers, was => ({ ...was, note: `Still needed: ${missing.join(', ')}.`, isError: true }))
+
+    return
+  }
+
+  const old = now.list.find(one => one.name === now.editing)
+  const args =
+    now.mode === 'add'
+      ? ['provider', 'add', field.name, '--url', field.url, '--model', field.model]
+      : [
+          'provider',
+          'set',
+          now.editing,
+          ...(old?.base_url === field.url ? [] : ['--url', field.url]),
+          ...(old?.model === field.model ? [] : ['--model', field.model]),
+        ]
+  const ran = await dsk($, field.key === '' ? args : [...args, '--key-stdin'], field.key === '' ? undefined : field.key)
+  const said = (ran?.text ?? '').trim() || 'dsk did not answer. Is it on PATH and up to date?'
+
+  if (ran?.isOk !== true) {
+    await update($, providers, was => ({ ...was, note: said, isError: true }))
+
+    return
+  }
+
+  draft = { name: '', url: '', model: '', key: '' }
+  await refresh($, { mode: 'list', editing: '', note: said, isError: false })
+}
+
+/** Takes a provider off the route, or puts it back as the last one tried. */
+const toggle = async ($: EngineInterface, one: Provider) => {
+  const ran = await dsk($, ['provider', one.enabled ? 'disable' : 'enable', one.name])
+  await refresh($, { note: (ran?.text ?? '').trim(), isError: ran?.isOk !== true })
+}
+
+const hidden = (key: string) => (key === '' ? '' : `•••• ${key.slice(-4)}`)
 
 // What the timers and the hooks share. A reload starts these over, and the
 // session's start fills them in again.
@@ -850,6 +948,16 @@ export const register: Register = on => {
       argumentHint: '[on|off]',
       immediate: true,
     })
+    await $.command.register({
+      name: 'dsk-add',
+      description: 'Add another DeepSeek provider: its API URL, model name and API key',
+      immediate: true,
+    })
+    await $.command.register({
+      name: 'dsk-config',
+      description: 'Show the dsk providers and models; add, change, enable or disable them',
+      immediate: true,
+    })
     // The choice made with `/dsk-jobs on` or `off` holds for the sessions after it.
     // Unloaded is how a session starts, so there is nothing to take down.
     if ((await $.store.get('on')) === true) {
@@ -859,6 +967,162 @@ export const register: Register = on => {
     }
 
     return next(e)
+  })
+
+  on('command.run', { command: 'dsk-add' }, async $ => {
+    await refresh($)
+    await openForm($)
+    await $.ui.open({ id: SETUP, title: 'dsk providers', focus: true })
+
+    return {
+      text: 'Fill in the name, API URL, model name and API key in the dsk providers pane, then press save. It runs after the providers you have.',
+    }
+  })
+
+  on('command.run', { command: 'dsk-config' }, async $ => {
+    await refresh($, { mode: 'list', editing: '' })
+    await $.ui.open({ id: SETUP, title: 'dsk providers', focus: true })
+    const now = await read($, providers)
+    const used = now.list.filter(one => one.enabled).map(one => `${one.name} (${one.model})`)
+    const off = now.list.filter(one => !one.enabled).map(one => one.name)
+
+    return {
+      text: now.isError
+        ? now.note
+        : `dsk tries ${used.join(' → ') || 'nothing'}${off.length > 0 ? `; disabled: ${off.join(', ')}` : ''}. Web search: ${now.search ? 'on' : 'off, no DeepSeek key'}. Edit, enable or disable them, or add one, in the dsk providers pane.`,
+    }
+  })
+
+  on('ui.render', { component: 'Pane', requestId: SETUP }, async ($, e) => {
+    const { Box, Text, Button, Input } = $.ui.resolve(e)
+    const now = await read($, providers)
+    const note =
+      now.note === '' ? null : (
+        <Text color={now.isError ? 'error' : 'success'} wrap="wrap">
+          {now.note}
+        </Text>
+      )
+
+    if (now.mode !== 'list') {
+      const isAdd = now.mode === 'add'
+
+      return (
+        <Box flexDirection="column">
+          <Text bold>{isAdd ? 'Add a DeepSeek provider' : `Change ${now.editing}`}</Text>
+          <Text dimColor wrap="wrap">
+            Any OpenAI-compatible API that serves a DeepSeek model. Type in each field; Enter or save keeps it.
+          </Text>
+          <Text> </Text>
+          {isAdd && (
+            <Input
+              key="provider-name"
+              label="Name       "
+              placeholder="lower-case, such as myhost"
+              value={draft.name}
+              autoFocus
+              onInput={value => {
+                draft.name = value
+              }}
+              onSubmit={value => {
+                draft.name = value
+              }}
+            />
+          )}
+          <Input
+            key="provider-url"
+            label="API URL    "
+            placeholder="https://example.com/v1"
+            value={draft.url}
+            onInput={value => {
+              draft.url = value
+            }}
+            onSubmit={value => {
+              draft.url = value
+            }}
+          />
+          <Input
+            key="provider-model"
+            label="Model name "
+            placeholder="the model id as the endpoint lists it"
+            value={draft.model}
+            onInput={value => {
+              draft.model = value
+            }}
+            onSubmit={value => {
+              draft.model = value
+            }}
+          />
+          <Input
+            key="provider-key"
+            label="API key    "
+            placeholder={isAdd ? "the endpoint's API key" : 'leave empty to keep the key it has'}
+            value={draft.key}
+            onInput={value => {
+              draft.key = value
+            }}
+            onSubmit={value => {
+              draft.key = value
+            }}
+          />
+          {draft.key !== '' && <Text dimColor>{`key entered: ${hidden(draft.key.trim())}`}</Text>}
+          <Text> </Text>
+          <Box>
+            <Button key="provider-save" label="save" onPress={() => save($)} />
+            <Text> </Text>
+            <Button
+              key="provider-cancel"
+              label="cancel"
+              onPress={async () => {
+                draft = { name: '', url: '', model: '', key: '' }
+                await update($, providers, (was): Providers => ({ ...was, mode: 'list', editing: '', note: '', isError: false }))
+              }}
+            />
+          </Box>
+          {note}
+          <Text dimColor wrap="wrap">
+            The key goes to ~/.config/dsk/env, readable by you alone; the rest to ~/.config/dsk/config.json.
+          </Text>
+        </Box>
+      )
+    }
+
+    return (
+      <Box flexDirection="column">
+        <Text bold>dsk providers</Text>
+        <Text dimColor wrap="wrap">
+          A run tries the enabled ones from the top; the next takes over when one fails.
+        </Text>
+        <Text> </Text>
+        {now.list.map(one => (
+          <Box flexDirection="column">
+            <Box>
+              <Text color={one.enabled ? undefined : 'inactive'} bold={one.enabled}>
+                {`${one.enabled ? `${one.position}.` : 'off'} ${one.name}`}
+              </Text>
+              <Text dimColor wrap="truncate-end">
+                {` · ${one.model} · ${one.base_url} · key ${one.key ? 'set' : 'missing'}`}
+              </Text>
+            </Box>
+            <Box>
+              <Text>{'    '}</Text>
+              <Button key={`edit-${one.name}`} label="edit" onPress={() => openForm($, one)} />
+              <Text> </Text>
+              <Button
+                key={`toggle-${one.name}`}
+                label={one.enabled ? 'disable' : 'enable'}
+                onPress={() => toggle($, one)}
+              />
+            </Box>
+          </Box>
+        ))}
+        <Text> </Text>
+        <Box>
+          <Button key="provider-add" label="add provider" onPress={() => openForm($)} />
+        </Box>
+        <Text dimColor>{`Web search (--web): ${now.search ? 'on' : 'off, it needs a DeepSeek API key'}`}</Text>
+        {note}
+      </Box>
+    )
   })
 
   on('command.run', { command: 'dsk-jobs' }, async ($, e) => {

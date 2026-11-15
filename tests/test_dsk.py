@@ -604,6 +604,72 @@ class Plugin(Cli):
             ast.parse(f.read(), feature_version=(3, 9))
 
 
+class Providers(Cli):
+    """`dsk provider`: what /dsk-add and /dsk-config run. It rewrites the user's config.json and env, so it must keep
+    everything it was not asked to change."""
+
+    def files(self):
+        with open(f"{self.tmp}/config/dsk/config.json") as f:
+            cfg = json.load(f)
+        with open(f"{self.tmp}/config/dsk/env") as f:
+            return cfg, f.read()
+
+    def test_add_keeps_every_other_setting_and_key_and_the_file_modes(self):
+        path = f"{self.tmp}/config/dsk/config.json"
+        with open(path) as f:
+            before = json.load(f)
+        before["effort"] = "max"
+        with open(path, "w") as f:
+            json.dump(before, f)
+        with open(f"{self.tmp}/config/dsk/env", "w") as f:
+            f.write("# mine\nexport KEEP=1\n")
+        os.chmod(f"{self.tmp}/config/dsk/env", 0o640)
+        code, out, err = self.dsk("provider", "add", "new-one", "--url", self.api.url + "/n/", "--model", "nm", "--key-stdin",
+                                  stdin="sk-new\n")
+        self.assertEqual(code, 0, out + err)
+        cfg, env = self.files()
+        self.assertEqual({k: v for k, v in cfg.items() if k not in ("route", "profiles")},
+                         {k: v for k, v in before.items() if k not in ("route", "profiles")})
+        self.assertEqual({k: v for k, v in cfg["profiles"].items() if k != "new-one"}, before["profiles"])
+        self.assertEqual(cfg["route"], [*before["route"], "new-one"])
+        self.assertEqual(cfg["profiles"]["new-one"]["base_url"], self.api.url + "/n")
+        self.assertNotIn("sk-new", json.dumps(cfg))
+        self.assertEqual(env, "# mine\nexport KEEP=1\nexport DSK_NEW_ONE_API_KEY=sk-new\n")
+        self.assertEqual(os.stat(f"{self.tmp}/config/dsk/env").st_mode & 0o777, 0o640)
+        self.assertEqual(self.dsk("provider", "add", "new-one", "--url", "https://x/v1", "--model", "m", "--key-stdin",
+                                  stdin="k")[0], 1)  # a second add of a name changes nothing
+        self.assertEqual(self.files()[0], cfg)
+
+    def test_set_replaces_only_its_own_key_line_and_disable_never_empties_the_route(self):
+        with open(f"{self.tmp}/config/dsk/config.json") as f:
+            route = json.load(f)["route"]
+        name = route[0]
+        self.dsk("provider", "add", "z", "--url", "https://z.example/v1", "--model", "zm", "--key-stdin", stdin="k1")
+        code, out, _ = self.dsk("provider", "set", "z", "--model", "zm2", "--key-stdin", stdin="k2")
+        self.assertEqual(code, 0, out)
+        cfg, env = self.files()
+        self.assertEqual(env.count("DSK_Z_API_KEY="), 1)
+        self.assertIn("export DSK_Z_API_KEY=k2\n", env)
+        self.assertEqual(cfg["profiles"]["z"]["model"], "zm2")
+        for other in route:
+            self.assertEqual(self.dsk("provider", "disable", other)[0], 0)
+        self.assertEqual(self.files()[0]["route"], ["z"])
+        self.assertEqual(self.dsk("provider", "disable", "z")[0], 1)
+        self.assertEqual(self.dsk("provider", "enable", name)[0], 0)
+        self.assertEqual(self.files()[0]["route"], ["z", name])
+        listed = json.loads(self.dsk("provider", "list", "--json")[1])["providers"]
+        self.assertEqual([r["name"] for r in listed if r["enabled"]], ["z", name])
+
+    def test_a_config_it_cannot_read_is_left_alone(self):
+        path = f"{self.tmp}/config/dsk/config.json"
+        with open(path, "w") as f:
+            f.write("{broken")
+        code, out, _ = self.dsk("provider", "add", "q", "--url", "https://q/v1", "--model", "m", "--key-stdin", stdin="k")
+        self.assertEqual(code, 1)
+        with open(path) as f:
+            self.assertEqual(f.read(), "{broken")
+
+
 class Speed(Cli):
     """The provider speed benchmark, and the fastest-first route order it feeds."""
 

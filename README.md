@@ -44,6 +44,7 @@ Claude Code then asks which provider runs the worker, and for what that provider
 
 - **Keys** are masked as you type and kept in Claude Code's secure store.
 - **To change an answer,** `/plugin configure dsk@asx8678` opens the same form again; restart Claude Code after changing it.
+- **More providers:** `/dsk-add` opens a pane that asks for a name, API URL, model name and API key, and adds that provider after the ones you have. `/dsk-config` lists every provider in the order runs try them, with its model, endpoint and whether its key is set, and lets you edit, enable, disable or add one. Both write `~/.config/dsk/config.json` (every other setting in it is kept) and put the key in `~/.config/dsk/env`, readable by you alone. The same is there from the shell: `dsk provider list|add|set|enable|disable`.
 - **To check it,** `dsk doctor` tests the key and the model against the provider, and `dsk configure` shows how dsk is set up. Until a provider is set, each session starts by saying what is missing.
 - **It needs** Python 3.13 or newer on `PATH`, as `python3` or as `python3.13`, `python3.14` or `python3.15`.
 
