@@ -41,7 +41,7 @@ Say in your closing message which of the two you used.
 
 ```
 dsk run [--allow GLOB]... [--check CMD]... [--file PATH]... [--web] [--worktree]
-        [--effort low|high|max] [--max-turns N] [--profile NAME] ("brief" | --brief FILE)
+        [--effort off|low|high|max] [--max-turns N] [--profile NAME] ("brief" | --brief FILE)
 ```
 
 - **Brief:** two to five lines saying what to produce and what done looks like. Structure goes in the flags; project facts go in `DSK.md`. Name files and functions by path: the worker asks when a task cannot be done as written, but when a name fits two things it picks the likelier one without saying so.
@@ -52,7 +52,7 @@ dsk run [--allow GLOB]... [--check CMD]... [--file PATH]... [--web] [--worktree]
 - **`--file`:** attach what the worker must read (`-` is stdin), so it spends no turn fetching it. A file of up to 4,000 characters stays attached for the whole run; a larger one is dropped if a long run is compacted, so keep instructions in the brief or in a small file.
 - **`--web`:** search and fetch, for research. Leave it off for tasks that also run commands in a repository with secrets.
 - **Owner:** `dsk` takes your session from `CLAUDE_CODE_SESSION_ID`, which Claude Code sets for every command, so the Stop hook knows whose run it is. Pass `--owner` only to say otherwise.
-- **`--effort`:** only for briefs that need judgment. The default is no thinking.
+- **`--effort`:** how hard the worker thinks: `off`, `low`, `high` or `max`. A run that names none takes `effort` from the user's config (`dsk configure` shows it when it is not `off`), and no thinking when the config has none. When the config sets an effort, that is the user's choice for every run: leave the flag out, and do not lower it to save time. When the config sets none, add `--effort` only for briefs that need judgment. A session keeps the effort it started with through `continue`, `reject` and `answer`.
 - **`--max-turns`:** 30 by default for a run with `--allow`, 12 for a read-only one. A run that uses them up stops as `limit`, and so does one past the time or token limit in the config. A reject or a continue starts a fresh turn and token budget; an answer does not. Leave the default unless you want a short probe: of 25 runs capped at 18 turns, 6 used every one.
 - **Provider:** without `--profile`, a run starts on the fastest provider that has a free place, and it can move to another one mid-run. The first line of the report then reads `zro after coralbricks`. `dsk reject`, `dsk answer` and `dsk continue` take `--profile NAME` to move the session to a particular one; like `dsk run --profile`, that holds it there, with no failover.
 - **What the worker can read:** its `read()`, `glob()` and `grep()` see only the working directory, plus a scratch folder of its own for throwaway files. Attach anything outside it with `--file`, or copy it into the tree first. `glob()` lists a file git ignores only when the pattern names its folder, as in `shots/*.png`.
