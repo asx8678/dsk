@@ -7,6 +7,8 @@
 - The display has been tested as a drawn tree, not as painted pixels: nobody has yet checked a screenshot of it.
 - The plugin's install has been run from the shell in a scratch home (marketplace add, install, `--config`, `configure`), and its hooks by hand with the variables Claude Code documents, against the real official API and a real custom endpoint. It has not yet been installed from GitHub into a live session, so the form itself and the hooks as Claude Code fires them are unseen.
 
+- The sandbox is macOS only. On Linux, scripts and checks run as before, and the report says `sandbox: off`. It does not limit the network, and git-ignored files inside the tree stay writable. A check that writes somewhere the profile does not allow fails under it, as the worker's script would; add that folder to `sandbox_write`. macOS will not start a sandbox inside another one with a different profile, so a `dsk` run inside one (Claude Code's own sandbox, or a check of a sandboxed run that calls `dsk`) goes on without its own and says `sandbox: off: sandbox-exec could not apply the profile`; the outer sandbox still holds. The same rule breaks tools that start a sandbox of their own: plain `swift build` fails under it with `sandbox_apply: Operation not permitted`, and `swift build --disable-sandbox` works. For other such tools, `dsk run --no-sandbox` turns it off for one task. Checks from real sessions that ran under it: Go build, vet and run, two node checks (one drives a browser), Python unittest, `assets/check.py`, and a check script kept in another session's scratchpad.
+
 ## Later, not now
 
-`dsk map` (one read-only brief over many items in parallel), a container mode.
+`dsk map` (one read-only brief over many items in parallel), a Linux sandbox (bwrap), a container mode.
