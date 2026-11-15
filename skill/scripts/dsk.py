@@ -78,6 +78,16 @@ DEFAULTS = {
                 "helm upgrade", "helm uninstall", "pip install", "npm install"],
     "env_pass": [],
     "effort": "off",  # the thinking effort of a `dsk run` that names none: a key of MAX_TOKENS
+    "recheck": False,  # whether a `dsk run` that names neither --recheck nor --no-recheck gets the second look
+    # reviewer: whether a `dsk run` that names neither --reviewer nor --no-reviewer gets the independent review;
+    # reviewer_effort is its thinking effort, and reviewer_calls how many reviews one round may have. In a replay of
+    # logged hand-ins, every review with thinking on (low, high or max) was still reasoning after 600 seconds.
+    "reviewer": False,
+    "reviewer_effort": "off",
+    "reviewer_calls": 2,
+    # reviewer_tokens caps a review's reply, reasoning included. In the replay, the 41 reviews that ended by
+    # themselves used 263 to 3,485 tokens and at most 68 s; the 18 that looped ran to 16,000 tokens and 160 to 308 s.
+    "reviewer_tokens": 4000,
     "backoff": [2, 6, 18],
     # route_order: "listed" tries the route as written; "fastest" tries the measured fastest first, measuring
     # first whenever a profile of the route has no measurement younger than bench_minutes
@@ -86,9 +96,9 @@ DEFAULTS = {
     # output_chars and read_chars: how much of what a turn printed goes back to the worker, for a turn that only reads
     # files and for any other
     # idle_seconds is under the gateways' ~125 s timeout; reply_seconds was the old socket timeout, which capped a
-    # whole reply
+    # whole reply; reviewer_seconds caps one review, whose tokens are not counted in run_tokens
     "limits": {"turn_seconds": 600, "run_seconds": 3600, "run_tokens": 2000000, "output_chars": 6000, "read_chars": 24000,
-               "idle_seconds": 90, "reply_seconds": 600},
+               "idle_seconds": 90, "reply_seconds": 600, "reviewer_seconds": 300},
 }
 
 
@@ -301,16 +311,17 @@ def messages(recs):
     return [r["m"] for r in series_msgs(recs)]
 
 
-def request_body(profile, effort, msgs, heat=0):
+def request_body(profile, effort, msgs, heat=0, tools=True, max_tokens=None):
     """The only place a chat request is serialized: fixed key order, one static tool, nothing volatile. `heat` is
-    the temperature of a run without thinking: 0, except right after a reply that repeated itself (see HEAT)."""
-    body = {"model": profile["model"], "messages": msgs, "tools": TOOLS, "max_tokens": MAX_TOKENS[effort],
-            "stream": True, "stream_options": {"include_usage": True}}
+    the temperature of a run without thinking: 0, except right after a reply that repeated itself (see HEAT).
+    `tools=False` is the reviewer's request, which has neither the tool nor a tool_choice, and its own `max_tokens`."""
+    body = {"model": profile["model"], "messages": msgs, "tools": TOOLS if tools else None,
+            "max_tokens": max_tokens or MAX_TOKENS[effort], "stream": True, "stream_options": {"include_usage": True}}
     if effort == "off":  # both spellings of "no thinking": some gateways honour only `reasoning_effort`
-        body |= {"tool_choice": "required", "thinking": {"type": "disabled"}, "reasoning_effort": "none",
-                 "temperature": heat}
+        body |= {"tool_choice": "required" if tools else None, "thinking": {"type": "disabled"},
+                 "reasoning_effort": "none", "temperature": heat}
     else:  # thinking mode rejects a forced tool call
-        body |= {"tool_choice": "auto", "thinking": {"type": "enabled"}, "reasoning_effort": effort}
+        body |= {"tool_choice": "auto" if tools else None, "thinking": {"type": "enabled"}, "reasoning_effort": effort}
     body |= profile.get("extra", {})  # a null in `extra` removes a key the provider rejects
     if body.get("stream") is False:  # a profile that cannot stream gets no `stream_options` either
         body.pop("stream_options", None)
@@ -675,6 +686,55 @@ STALE = ("note: this is your previous script with only a number changed, and it 
 SAME_FAILURE = ("note: `{cmd}` has failed the same way {n} times in a row, so your last changes did not touch what it "
                 "tests. Read the code of that check to see exactly what it looks at, or undo your last changes and "
                 "go another way.")
+# The second look (--recheck): the first done() of a round that passes its checks comes back once with this text and
+# the diff of the change. The diff is there because the code is often gone from the conversation by then: in a
+# replay of 45 logged hand-ins, the first reply read or ran something again in 33 cases without it, in 16 with it.
+RECHECK = ("second look: the checks pass. Before this is handed in, check the work once more in your reasoning, from "
+           "the diff of your change below.\n"
+           "1. For each requirement of the task (each numbered acceptance item if it has them, and each defect of the "
+           "lead's review if there is one), trace the changed code with one normal input and one edge input (empty, "
+           "zero, very large, missing, wrong type), and compare what it does with what the requirement says.\n"
+           "2. Then question that check: what did it assume, and which input or state would break the assumption?\n"
+           "Reply with one script. If something is wrong, fix it there, run the checks and call done(). If everything "
+           "holds, call done() again: sending the same script once more is fine. Read or run something else first "
+           "only where the diff cannot settle a point.")
+RECHECK_DIFF = "=== YOUR CHANGE ===\n{diff}"
+RECHECK_LONG = ("Your change is too long to show here: {lines} diff lines in {files}. Read the parts you need again "
+                "before you check them.")
+CONFIRMED = "confirmed: the same hand-in again, taken as final"
+# The independent reviewer (--reviewer): after a hand-in passes its checks and its second look, one request in a
+# fresh context, with no tools and none of the worker's conversation: this prompt, then the task and the change.
+# Its findings go back to the worker as a failed check does. dsk keeps only findings it can check: a known severity,
+# a file of the change, every field filled in, and a quote that is in that file; it finds the line itself.
+REVIEWER = """You are an independent reviewer of a change that another engineer handed in. You did not write it and you do not see the author's reasoning. Assume the author checked nothing.
+
+The message gives you the task as the author received it, and the result: the diff of the change, and files in full where they fit. You have no tools: you cannot run, read or search anything, and everything you get is in this message. Your whole answer is one JSON object.
+
+Your job: report the defects in this change that you can prove, the most severe first, at most 8.
+
+Rules
+1. Proof or silence. Report a finding only with its proof: a concrete input, call or situation, what the task requires for it, and what the code does, from your own trace. No style remarks, no "consider", no "might".
+2. Every finding names its place: "path", exactly as given, and "quote", copied character for character from that file as it now stands: one line of it or part of one line, at most 200 characters. For something missing, quote the line where it should be.
+3. Scope. Report defects in what this change added or changed, and defects that make a requirement of the task fail. Do not review untouched code.
+4. Go through the requirements of the task in order. For each one, trace the code with one normal input and one edge input (empty, zero, negative, very large, missing key, wrong type). Keep each trace short: only the values that decide the outcome.
+5. Severity. "blocker": a requirement of the task fails, or data or state is damaged. "major": a wrong result for a realistic input that the task does not name. "minor": any other defect you can prove.
+6. PRIOR FINDINGS, when present, were reported on an earlier version, each with the author's answer. Report one again only if the defect is still there, with a quote from the file as it now stands.
+7. If you find nothing you can prove, return an empty list.
+
+Output: exactly one JSON object and nothing else, in this shape:
+{"findings": [{"severity": "blocker|major|minor", "path": "<file path>", "quote": "<exact text from the file>", "input": "<a concrete input, call or situation>", "expected": "<what the task requires>", "actual": "<what the code does>", "fix": "<one line>"}]}"""
+REVIEWER_FINDINGS = ("review: an independent reviewer read your change and reports these defects, each with its proof. "
+                     "For each one, fix it; or, if it is wrong, leave the code as it is and say why in the second "
+                     "argument of done(). Then run the checks and call done().")
+SEVERITY = ("blocker", "major", "minor")
+FINDING = ("severity", "path", "quote", "input", "expected", "actual", "fix")
+# A replay of 45 logged hand-ins: without thinking, 9 of the first 11 reviews ran to the output limit, most of them
+# repeating the same few findings dozens of times (one listed 186 findings at 8 places). So dsk keeps the first
+# MAX_FINDINGS distinct ones, and takes every finding that arrived whole from a reply that was cut off.
+MAX_FINDINGS = 8
+# A finding whose own fix says there is nothing to fix: the reviewer traced it, found no defect, and still filed it
+# as a blocker or major (2 of 6 alarms read from the replay).
+NO_FIX = {"n/a", "na", "none", "no change", "no change needed", "no fix", "no fix needed", "nothing", "-"}
 # The temperature of the request after 0, 1, and 2 or more replies in a row that got the worker nowhere. Three logged
 # loops of identical replies were sent to their provider again, four times each at each setting: the same script
 # came back 11 times of 12 at 0, twice at 0.7 and never at 1.0. So a repeat is answered warm, and warmer if that
@@ -1249,6 +1309,253 @@ def changes(s):
     return end, [entry.split("\t") for entry in stat.split("\0") if entry and entry.split("\t")[2] in touched]
 
 
+def second_look(s, cfg, turn, over):
+    """After a done() whose checks pass: the text that sends the hand-in back for a second look, or '' when none is
+    due. One per round, and only for a change: an answer has no diff to check. `over` is the limit the round has
+    reached, if any: a hand-in that passes must not end as `limit` because dsk asked for one more turn."""
+    if not scope(s).get("recheck") or s.since("round", "recheck"):
+        return ""
+    end, changed = changes(s)
+    if not changed:
+        return ""
+    if s.head["effort"] == "off":  # the second look happens in the worker's reasoning, and a run without thinking has none
+        s.add("recheck", turn=turn, skipped="thinking is off")
+        return ""
+    if over:
+        s.add("recheck", turn=turn, skipped=f"no {over} left")
+        return ""
+    s.add("recheck", turn=turn, tree=end)
+    paths = [path for _, _, path in changed]
+    diff = git(s.head["root"], "diff", "--no-renames", scope(s)["start"], end, "--", *[":(literal)" + p for p in paths])
+    # Half the window at most, as for the attached files: the conversation still has to fit beside it.
+    fits = len(diff) <= cfg["profiles"][s.profile].get("compact_at", 32000) * 3 // 2
+    shown = RECHECK_DIFF.format(diff=diff.rstrip("\n")) if fits else \
+        RECHECK_LONG.format(lines=len(diff.splitlines()), files=", ".join(paths))
+    return RECHECK + "\n\n" + shown
+
+
+def rechecked(s):
+    """The second look of the round in flight, measured from the log: None when none was due, else the turn it was
+    asked after or why it was skipped, the characters of reasoning in the reply that followed (None before there is
+    one), and the worker's files that changed after it."""
+    asked = next(iter(s.since("round", "recheck")), None) if s.of("round") else None
+    if not asked:
+        return None
+    st = s.last("state")
+    reply = next((r["m"] for r in s.of("msg") if r["turn"] == asked["turn"] + 1 and r["m"]["role"] == "assistant"), None)
+    # What the second look changed ends where the reviewer, if any, took over.
+    until = next((r["tree"] for r in s.since("round", "reviewer") if r.get("tree")), None) or st.get("end")
+    moved = set()
+    if asked.get("tree") and until:
+        moved = set(git(s.head["root"], "diff", "--name-only", "--no-renames", "-z", asked["tree"], until).split("\0"))
+    return {"turn": asked["turn"], "skipped": asked.get("skipped", ""),
+            "reasoning": None if reply is None else len(reply.get("reasoning_content") or ""),
+            "changed": [path for _, _, path in st.get("changed") or [] if path in moved]}
+
+
+def blob(root, tree_id, path):
+    """A file's text in a tree object, or None when the tree has no such file."""
+    try:
+        return git(root, "show", f"{tree_id}:{path}")
+    except Fail:
+        return None
+
+
+def locate(text, quote):
+    """The line where `quote` starts in `text`, with every run of whitespace compared as one space, or None. The
+    reviewer names no line numbers: models miscount them, so dsk finds the line itself."""
+    want = " ".join(quote.split())
+    flat, starts = "", []
+    for n, line in enumerate(text.splitlines(), 1):
+        piece = " ".join(line.split())
+        if piece:
+            starts.append((len(flat), n))
+            flat += piece + " "
+    at = flat.find(want) if want else -1
+    return max(n for pos, n in starts if pos <= at) if at >= 0 else None
+
+
+def json_object(text):
+    """The one JSON object a reply holds, with or without a code fence around it, or None."""
+    text = (text or "").strip()
+    first, last = text.find("{"), text.rfind("}")
+    try:
+        found = json.loads(text[first:last + 1]) if 0 <= first < last else None
+    except ValueError:
+        return None
+    return found if isinstance(found, dict) else None
+
+
+def findings_in(text):
+    """The list of findings in a reviewer's reply, or, when the reply broke off inside that list, every finding that
+    arrived whole. None when the reply has no such list."""
+    whole = json_object(text)
+    if whole is not None:
+        return whole["findings"] if isinstance(whole.get("findings"), list) else None
+    text = text or ""
+    start = re.search(r'"findings"\s*:\s*\[', text)
+    if not start:
+        return None
+    found, at, decoder = [], start.end(), json.JSONDecoder()
+    while True:
+        at = len(text) - len(text[at:].lstrip(" \t\r\n,"))
+        if at >= len(text) or text[at] != "{":
+            return found
+        try:
+            item, at = decoder.raw_decode(text, at)
+        except ValueError:  # the finding the reply broke off in
+            return found
+        found.append(item)
+
+
+def findings_text(findings):
+    """Findings as the worker gets them: what to do with them, then each one with its proof."""
+    out = [REVIEWER_FINDINGS]
+    for f in findings:
+        out += [f"{f['id']} {f['severity']} {f['path']}:{f['line']}: {f['quote']}", f"  input: {f['input']}",
+                f"  expected: {f['expected']}", f"  actual: {f['actual']}", f"  fix: {f['fix']}"]
+    return "\n".join(out)
+
+
+def review_input(s, cfg, end, changed, prior, answer):
+    """The reviewer's user message: the task (with the lead's defects, in a round a reject started), DSK.md and the
+    attached files, the diff, the whole text of each changed file that is not new, and from the second review on the
+    findings sent back before, with the author's answer. Whole files only, while the message fits the profile's
+    window at 3 characters a token. Returns (text, [the files left out]), or (None, why) when the diff alone is too big."""
+    head, root, start = s.head, s.head["root"], scope(s)["start"]
+    cap = cfg["profiles"][s.profile].get("compact_at", 32000) * 3
+    rejected = s.last("base", "reject")
+    parts = ["## Task\n" + (scope(s).get("task") or head["brief"])]
+    if rejected and rejected["t"] == "reject":
+        parts.append("## The lead's review of an earlier version, which this version answers\n" + rejected["text"])
+    paths = [path for _, _, path in changed]
+    diff = git(root, "diff", "--no-renames", start, end, "--", *[":(literal)" + p for p in paths])
+    result = ["## Result\n=== DIFF ===\n" + diff.rstrip("\n")]
+    if prior:
+        said = " | ".join(filter(None, [answer.get("arg", ""), answer.get("open", "")]))
+        result.append("## PRIOR FINDINGS\n" + "\n".join(findings_text(prior).splitlines()[1:])
+                      + f"\nthe author's answer: {said or '(none)'}")
+    used = sum(map(len, parts + result))
+    if used > cap:
+        return None, "the diff is too large for one review"
+    context, whole, left = [], [], []
+    for path, text in ([("DSK.md", head["dsk_md"])] if head.get("dsk_md") else []) + head["files"]:
+        block = f'<attached path="{path}">\n{text}\n</attached>'
+        if used + len(block) <= cap:
+            context.append(block)
+            used += len(block)
+        else:
+            left.append(path)
+    for added, _, path in changed:
+        if added == "-" or blob(root, start, path) is None:  # a binary file, or a new one: the diff shows it whole
+            continue
+        text = blob(root, end, path)
+        block = text is not None and f"=== FILE: {path}, as it now stands ===\n{text.rstrip(chr(10))}"
+        if block and used + len(block) <= cap:
+            whole.append(block)
+            used += len(block)
+        elif block:
+            left.append(path)
+    return "\n\n".join(parts + context + result + whole), left
+
+
+def checked_findings(s, end, changed, raw, number):
+    """The findings dsk can check, each with an id and the line its quote starts on, and how many it dropped: a
+    finding needs a known severity, a file of the change, every field filled in, and a quote that is in that file.
+    A finding at a place already reported, one whose fix is no fix (NO_FIX), and any past the first MAX_FINDINGS,
+    is dropped too."""
+    texts = {}
+    for added, _, path in changed:
+        text = None if added == "-" else blob(s.head["root"], end, path)
+        if text is not None:
+            texts[path] = text
+    kept, dropped, places = [], 0, set()
+    for f in raw:
+        ok = (isinstance(f, dict) and f.get("severity") in SEVERITY and f.get("path") in texts
+              and all(isinstance(f.get(k), str) and f[k].strip() for k in FINDING)
+              and " ".join(f["fix"].lower().split()).strip(" .") not in NO_FIX)
+        line = ok and locate(texts[f["path"]], f["quote"])
+        place = line and (f["path"], " ".join(f["quote"].split()))
+        if not line or place in places or len(kept) == MAX_FINDINGS:
+            dropped += 1
+            continue
+        places.add(place)
+        kept.append({"id": f"R{number}-F{len(kept) + 1}", **{k: " ".join(f[k].split())[:500] for k in FINDING},
+                     "line": line})
+    return kept, dropped
+
+
+def independent_review(s, cfg, turn, over, done):
+    """After a hand-in passes its checks and its second look: one review in a fresh context, with no tools and none
+    of the worker's conversation. Returns the text that sends the blocker and major findings back to the worker, or
+    '' to hand in. A review that fails (an HTTP error, a reply cut off at reviewer_seconds, a reply that is not one
+    JSON object) is recorded and the hand-in goes ahead: the reviewer adds a check, it cannot fail a run by itself.
+    The call is logged as a `reviewer` record, never as msg, req or usage: those are the worker's series."""
+    if not scope(s).get("reviewer"):
+        return ""
+    calls = s.since("round", "reviewer")
+    if len(calls) >= cfg.get("reviewer_calls", 2) or any("skipped" in r for r in calls):
+        return ""
+    end, changed = changes(s)
+    if not changed:
+        return ""
+    if over:
+        s.add("reviewer", turn=turn, skipped=f"no {over} left")
+        return ""
+    prior = [f for r in calls for f in r.get("findings", []) if f["severity"] != "minor"]
+    text, left = review_input(s, cfg, end, changed, prior, done)
+    name, profile, effort = s.profile, cfg["profiles"][s.profile], cfg.get("reviewer_effort", "low")
+    if text is None or not claim_slot(cfg, name):  # the process holds a slot there already, unless a failover moved it
+        s.add("reviewer", turn=turn, skipped=left if text is None else f"no free slot on {name}")
+        return ""
+    number, began = len(calls) + 1, time.time()
+    s.add("doing", turn=turn, arg=f"independent review on {name}", review=True)
+    msgs = [{"role": "system", "content": REVIEWER}, {"role": "user", "content": text}]
+    status, data = post(profile["base_url"].rstrip("/") + "/chat/completions", api_key(profile),
+                        request_body(profile, effort, msgs, tools=False, max_tokens=cfg.get("reviewer_tokens", 4000)), cfg["backoff"],
+                        headers(profile, f"dsk-{s.id}-reviewer"), patient=False, idle=cfg["limits"]["idle_seconds"],
+                        deadline=cfg["limits"]["reviewer_seconds"])
+    rec = {"turn": turn, "tree": end, "profile": name, "effort": effort, "seconds": round(time.time() - began, 1),
+           "chars": len(text), "left_out": left}
+    if status != 200:
+        s.add("reviewer", **rec, error=f"HTTP {status}")
+        return ""
+    try:
+        choice, usage = data["choices"][0], data.get("usage") or {}
+        message = choice.get("message") or {}
+    except (KeyError, IndexError, TypeError, AttributeError):
+        s.add("reviewer", **rec, error="an unexpected response")
+        return ""
+    kept_as = os.path.join(s.dir, f"reviewer.{len(s.of('reviewer')) + 1}.json")  # numbered across rounds, not reused
+    with open(kept_as, "w", encoding="utf-8") as f:  # what it said, in full
+        json.dump({"finish": choice.get("finish_reason"), "content": message.get("content"),
+                   "reasoning": message.get("reasoning_content") or message.get("reasoning")}, f, ensure_ascii=False)
+    hit = usage.get("prompt_cache_hit_tokens", (usage.get("prompt_tokens_details") or {}).get("cached_tokens"))
+    rec |= {"prompt": usage.get("prompt_tokens") or 0, "hit": hit, "out": usage.get("completion_tokens") or 0}
+    raw, cut = findings_in(message.get("content")), choice.get("finish_reason") == "length"
+    if raw is None:
+        s.add("reviewer", **rec, error=f"cut off after {rec['seconds']:.0f} s" if cut else "the reply was not one JSON object of findings")
+        return ""
+    kept, dropped = checked_findings(s, end, changed, raw, number)
+    s.add("reviewer", **rec, findings=kept, dropped=dropped, cut=cut)
+    sent = [f for f in kept if f["severity"] != "minor"]
+    return findings_text(sent) if sent else ""
+
+
+def reviewed(s):
+    """The independent reviews of the round in flight, measured from the log: None when none was due, else each
+    call as recorded, and of the findings sent back, those whose quote is still in the file at the last stop."""
+    calls = s.since("round", "reviewer") if s.of("round") else []
+    if not calls:
+        return None
+    st, root = s.last("state"), s.head["root"]
+    sent = [f for r in calls for f in r.get("findings", []) if f["severity"] != "minor"]
+    texts = {f["path"]: blob(root, st["end"], f["path"]) for f in sent} if st.get("end") else {}
+    return {"calls": [{k: v for k, v in r.items() if k not in ("t", "at")} for r in calls],
+            "sent": [f["id"] for f in sent],
+            "still_there": [f["id"] for f in sent if texts.get(f["path"]) and locate(texts[f["path"]], f["quote"])]}
+
+
 def answer_text(s, summary=""):
     """The long answer written to @answer, or else the done() summary."""
     path = os.path.join(s.dir, "answer")
@@ -1314,6 +1621,10 @@ def compaction(recs, changed, compact_at=32000):
     head = {**recs[0], **base, "brief": base["task"]} if base else dict(recs[0])
     head["max_turns"] = round_limit(recs)  # a round the lead started with a reject may have a limit of its own
     review = f"## The lead's review\nThe lead reviewed your work on this task and rejected it. Fix these defects:\n{rejected['text']}" if rejected else ""
+    verdict = next((r for r in reversed(recs[start:]) if r["t"] == "reviewer"), None)  # the reviewer's last word
+    sent = [f for f in (verdict or {}).get("findings", []) if f["severity"] != "minor"]
+    if sent:
+        review = "\n\n".join(filter(None, [review, "## The reviewer's findings\n" + findings_text(sent)]))
     files = [(i, path, text) for i, (path, text) in enumerate(recs[0]["files"])]
     keep = {i for i, path, text in files if len(text) <= KEEP}  # a file up to KEEP always stays
     turns = [r["m"] for r in msgs if r["turn"] >= turn - 1]
@@ -1429,10 +1740,24 @@ def loop(s, cfg, extra=""):
 
     def bad(status, **info):
         """Halt at a bad stop, with the checks run first when the worker changed files and they are configured."""
+        # A second look that ends here without changing anything leaves the hand-in that passed its checks a turn
+        # or more ago: that is handed in as it was, and `why` says that the second look did not finish.
+        # Not after the reviewer sent findings back: then the hand-in has defects that nobody has answered.
+        look = next(iter(s.since("round", "recheck")), None) if s.of("round") and not s.since("round", "reviewer") else None
+        if look and look.get("tree") and look["tree"] == tree(s):
+            handed = next(r for r in reversed(s.of("ledger")) if r["turn"] == look["turn"] and r["fn"] == "done")
+            return halt(s, summary=handed["arg"], open=handed["open"],
+                        why=f"{info['why']} during the second look, which changed nothing")
         run = bool(changes(s)[1]) and bool(scope(s)["checks"])
         if run:
             gates(s, cfg, env)  # its result is no use to a worker that is being stopped: only the record matters
         return halt(s, status, checked=run, **info)
+
+    def over():
+        """The limit this round has reached, counting the turn in flight: `turn`, `time`, `token`, or ''."""
+        spent = sum(u["prompt"] + u["out"] for u in s.since("round", "usage"))
+        return "turn" if not left else "time" if time.time() - started > limits["run_seconds"] else \
+            "token" if spent > limits["run_tokens"] else ""
 
     while True:
         pending = s.last("result", "msg")
@@ -1453,17 +1778,24 @@ def loop(s, cfg, extra=""):
         s.add("msg", turn=turn, m=CUT_OFF if finish == "length" else reply)
         left = max(0, round_limit(s.recs) - len(s.since("round", "result")) - 1)
         now = said(reply)
+        asked = s.last("recheck")
+        # The second look says that the same script once more is a fine answer: it confirms the hand-in, so it is
+        # no repeat. Nothing is run twice: the script ran and its checks passed a turn ago, and nothing moved since.
+        confirms = bool(asked) and "skipped" not in asked and asked["turn"] == turn - 1 and now == previous
         # Alternating between two scripts gets a worker no further than repeating one, so both count the same way.
         alternates = len(said_here) >= 3 and now == said_here[-2] and said_here[-1] == said_here[-3] and said_here[-1] != now
         said_here.append(now)
-        repeats = repeats + 1 if now == previous or alternates else 0
+        repeats = repeats + 1 if (now == previous or alternates) and not confirms else 0
         stale = False
-        if repeats:  # a worker that has its answer and only forgot to call done() gets one warning, not a stop
+        if confirms:
+            body, failed = CONFIRMED, ""
+            stop = next(r for r in reversed(s.of("ledger")) if r["turn"] == turn - 1 and r["fn"] == "done")
+        elif repeats:  # a worker that has its answer and only forgot to call done() gets one warning, not a stop
             body, failed, stop = (ALTERNATING if alternates else REPEAT), "repeat", None
         else:
             body, failed, stop = take_turn(s, cfg, env, turn, reply, finish)
         acts = [a for a in s.of("ledger") if a["turn"] == turn]
-        if not repeats and not failed:
+        if not repeats and not failed and not confirms:
             seen = " ".join(s.printed.split())
             # The repeat check above misses a script sent again with one number changed. One worker spent its last
             # 15 turns printing ever shorter slices of the same lines; so a turn that is the previous script but for
@@ -1483,7 +1815,10 @@ def loop(s, cfg, extra=""):
         failures = failures + 1 if failed else 0
         text, finished = f"turn {turn} · {left} left\n{body}", False
         if stop and stop["fn"] == "done":
-            problem = gates(s, cfg, env)
+            # A confirmed hand-in ran and passed its checks a turn ago, and nothing moved since: only the reviewer,
+            # if any, is still to come. Each step's text, when it has one, goes back to the worker instead.
+            problem = "" if confirms else gates(s, cfg, env) or second_look(s, cfg, turn, over())
+            problem = problem or independent_review(s, cfg, turn, over(), stop)
             text, finished = text + ("\n\n" + problem if problem else ""), not problem
         kind = turn_kind({"turn": turn, "fail": failed}, acts)
         reads = reads + 1 if writing and kind == "read" else 0  # a run that only reads never gets its work done
@@ -1511,11 +1846,9 @@ def loop(s, cfg, extra=""):
                            "three replies in a row that showed nothing new")
         if failures >= 3:
             return bad("stuck", why="three failing turns in a row")
-        spent = sum(u["prompt"] + u["out"] for u in s.since("round", "usage"))
-        over = "turn" if not left else "time" if time.time() - started > limits["run_seconds"] else \
-            "token" if spent > limits["run_tokens"] else ""
-        if over:
-            return bad("limit", why=f"{over} limit reached")
+        limit = over()
+        if limit:
+            return bad("limit", why=f"{limit} limit reached")
 
 
 # ---------------------------------------------------------------- reports
@@ -1617,6 +1950,28 @@ def report(s, review=False, cfg=None):
         caution = before and f"{'; '.join(before)} passed before the worker changed anything, so " \
                              f"{'it does' if len(before) == 1 else 'they do'} not show that the task was done"
     line("caution", caution)
+    look = rechecked(s)
+    if look:
+        thought = "no reply yet" if look["reasoning"] is None else "no reasoning came back" if not look["reasoning"] \
+            else f"{look['reasoning']:,} characters of reasoning"
+        line("recheck", f"skipped: {look['skipped']}" if look["skipped"] else " · ".join(
+            [f"asked after turn {look['turn']}", thought, "changed " + ", ".join(look["changed"]) if look["changed"] else "no change"]))
+    verdicts = reviewed(s)
+    if verdicts:
+        parts = []
+        for n, c in enumerate(verdicts["calls"], 1):
+            if c.get("skipped") or c.get("error"):
+                parts.append(f"skipped: {c['skipped']}" if c.get("skipped") else f"call {n}: no verdict, {c['error']}")
+                continue
+            count = {k: sum(f["severity"] == k for f in c["findings"]) for k in SEVERITY}
+            found = ", ".join(f"{count[k]} {k}" for k in SEVERITY if count[k]) or "nothing"
+            parts.append(f"call {n}: {found}" + (f", {c['dropped']} dropped" if c["dropped"] else "")
+                         + (", cut off" if c.get("cut") else "") + f" in {c['seconds']:.0f} s")
+        if verdicts["sent"] and st.get("end"):
+            parts.append(f"quotes still in the code: {len(verdicts['still_there'])} of {len(verdicts['sent'])}")
+        line("review", " · ".join(parts))
+        for f in [f for c in verdicts["calls"] for f in c.get("findings", [])] if partial else []:
+            line("finding", f"{f['id']} {f['severity']} {f['path']}:{f['line']} · input: {f['input']} · actual: {f['actual']}")
     reverted = list(dict.fromkeys(path for g in s.of("gate") for path in g["reverted"]))
     line("scope", reverted and f"reverted {', '.join(reverted)} (copies in {os.path.join(s.dir, 'reverted')})")
     line("changed", ", ".join(f"{path} ({'binary' if a == '-' else f'+{a}' + (f' -{d}' if d != '0' else '')})"
@@ -1671,6 +2026,8 @@ def report_json(s, cfg):
             "checks": [{"cmd": cmd, "code": code} for cmd, code in checks["results"]],
             "checked": st.get("checked"),
             "passed_before": [cmd for cmd in passed_before(s) if cmd in passing] if st.get("changed") else [],
+            "recheck": rechecked(s),
+            "reviewer": reviewed(s),
             "files": [{"path": path, "added": None if a == "-" else int(a), "deleted": None if d == "-" else int(d)}
                       for a, d, path in st.get("changed") or []],
             "reverted": list(dict.fromkeys(path for g in s.of("gate") for path in g["reverted"])),
@@ -1818,6 +2175,8 @@ def cmd_run(args, cfg):
         raise
     head = s.add("head", id=s.id, root=root or workdir, workdir=workdir, worktree=args.worktree, start=start,
                  allow=args.allow, checks=args.check, web=args.web, effort=effort,
+                 recheck=bool(cfg.get("recheck")) if args.recheck is None else args.recheck,
+                 reviewer=bool(cfg.get("reviewer")) if args.reviewer is None else args.reviewer,
                  max_turns=args.max_turns or (30 if args.allow else 12),  # leads gave writing runs 25 to 40
                  scratch=True, sandbox=sandbox, unsandboxed=unsandboxed,
                  output_chars=cfg["limits"]["output_chars"], read_chars=cfg["limits"]["read_chars"],
@@ -1882,6 +2241,8 @@ def cmd_continue(args, cfg):
         raise Fail("--allow needs a git repository")
     allow, checks = args.allow or scope(s)["allow"], args.check or scope(s)["checks"]
     turns = args.max_turns or scope(s)["max_turns"]
+    recheck = scope(s).get("recheck", False) if args.recheck is None else args.recheck
+    reviewer = scope(s).get("reviewer", False) if args.reviewer is None else args.reviewer
     if head["worktree"] and not os.path.isdir(head["workdir"]):
         # accept applied the last round and removed the worktree, so build a fresh one from the tree as it is now
         remove_worktree(head)
@@ -1894,7 +2255,7 @@ def cmd_continue(args, cfg):
     if os.path.exists(answer):  # the last round's @answer would answer for this one, in the report and in the gate
         os.replace(answer, f"{answer}.{len(s.of('base')) + 1}")
     start = tree(s) if head["start"] else None
-    s.add("base", start=start, allow=allow, checks=checks, max_turns=turns, task=text)
+    s.add("base", start=start, allow=allow, checks=checks, max_turns=turns, task=text, recheck=recheck, reviewer=reviewer)
     s.add("round")
     extra = ("\n\nthe lead has the next task for this session. What you did before stands.\n\n"
              + run_header({"allow": allow, "checks": checks, "max_turns": turns,
@@ -2064,8 +2425,9 @@ def job(s, cfg):
     tail = s.recs[max(i for i, r in enumerate(s.recs) if r["t"] in ("req", "state")):]  # the turn in flight
     acts = [r for r in tail if r["t"] == "ledger"]
     checking = any(r["fn"] == "done" for r in acts) and not any(r["t"] == "checks" for r in tail)
-    phase = "model" if not any(r["t"] == "usage" for r in tail) else "checks" if checking else "script"
     last = next((r for r in reversed(tail) if r["t"] in ("doing", "ledger", "checks", "result")), {"t": ""})
+    checking = checking or last.get("review", False)  # the independent review runs after the checks
+    phase = "model" if not any(r["t"] == "usage" for r in tail) else "checks" if checking else "script"
     prices = [cfg["profiles"].get(u["profile"], {}).get("price") for u in usage]  # dollars per million tokens
     cost = None if not all(prices) else sum(((u["prompt"] - (u["hit"] or 0)) * p["in"] + (u["hit"] or 0) * p["cached"]
                                              + u["out"] * p["out"]) / 1e6 for u, p in zip(usage, prices))
@@ -2480,6 +2842,12 @@ def main():
     run.add_argument("--no-sandbox", action="store_true",
                      help="run this task's scripts and checks without the macOS sandbox, for tools that start their own")
     run.add_argument("--effort", choices=list(MAX_TOKENS), help="thinking effort (default: `effort` in the config, else off)")
+    run.add_argument("--recheck", action=argparse.BooleanOptionalAction,
+                     help="send the first done() that passes its checks back once, for a second look in the worker's "
+                          "reasoning (default: `recheck` in the config, else off)")
+    run.add_argument("--reviewer", action=argparse.BooleanOptionalAction,
+                     help="have a hand-in that passes its checks read by an independent reviewer, a fresh request "
+                          "with no tools, and send its findings back (default: `reviewer` in the config, else off)")
     run.add_argument("--profile", help="use this provider profile only")
     run.add_argument("--max-turns", type=int, help="turns the run may take (default: 30 with --allow, 12 without)")
     run.add_argument("--owner", default=os.environ.get("CLAUDE_CODE_SESSION_ID", ""),
@@ -2501,6 +2869,10 @@ def main():
     cont.add_argument("--allow", action="append", default=[], metavar="GLOB", help="paths the worker may change")
     cont.add_argument("--check", action="append", default=[], metavar="CMD", help="acceptance test, run by dsk")
     cont.add_argument("--max-turns", type=int, help="turns this round may take")
+    cont.add_argument("--recheck", action=argparse.BooleanOptionalAction,
+                      help="the second look for this round (left out, it stays as it was)")
+    cont.add_argument("--reviewer", action=argparse.BooleanOptionalAction,
+                      help="the independent reviewer for this round (left out, it stays as it was)")
     cont.add_argument("--profile", metavar="NAME", help="run this round on this provider profile")
     cont.add_argument("--json", action="store_true", help="print the report as one JSON object")
     command("accept", "mark as reviewed; after --worktree, apply the changes", "id")

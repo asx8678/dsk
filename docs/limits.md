@@ -9,6 +9,8 @@
 
 - The sandbox is macOS only. On Linux, scripts and checks run as before, and the report says `sandbox: off`. It does not limit the network, and git-ignored files inside the tree stay writable. A check that writes somewhere the profile does not allow fails under it, as the worker's script would; add that folder to `sandbox_write`. macOS will not start a sandbox inside another one with a different profile, so a `dsk` run inside one (Claude Code's own sandbox, or a check of a sandboxed run that calls `dsk`) goes on without its own and says `sandbox: off: sandbox-exec could not apply the profile`; the outer sandbox still holds. The same rule breaks tools that start a sandbox of their own: plain `swift build` fails under it with `sandbox_apply: Operation not permitted`, and `swift build --disable-sandbox` works. For other such tools, `dsk run --no-sandbox` turns it off for one task. Checks from real sessions that ran under it: Go build, vet and run, two node checks (one drives a browser), Python unittest, `assets/check.py`, and a check script kept in another session's scratchpad.
 
+- The second look's confirm path (the same script sent again) and the reviewer's round trip (findings back to the worker, a second call with the author's answer) are covered by tests against the scripted server, but have not yet run against a real provider: the one live run probed, then handed in again with its summary reworded, which runs as a new hand-in, and its review found nothing.
+
 ## Later, not now
 
 `dsk map` (one read-only brief over many items in parallel), a Linux sandbox (bwrap), a container mode.
