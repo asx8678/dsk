@@ -415,6 +415,7 @@ def later_profiles(s):
 def chat(s, cfg, heat=0):
     """Send the current series and return (assistant message, finish_reason). Fails over along the route."""
     while True:
+        compact(s, cfg)  # a failover may have moved the series to a profile that compacts sooner
         name, profile = s.profile, cfg["profiles"][s.profile]
         later = later_profiles(s)
         if later and paused(name):  # its credit ran out (see pause): skip it, but always try the last profile
@@ -1155,10 +1156,13 @@ def compaction(recs, changed, compact_at=32000):
 
 
 def compact(s, cfg):
-    """Start a compacted series once the last request has grown past the profile's `compact_at`."""
-    last, msgs = s.last("usage", "series"), series_msgs(s.recs)
+    """Start a compacted series once the last request has grown past the `compact_at` of the profile the next one
+    goes to. A failover keeps the messages, so a request measured on the profile before it counts too: one run
+    failed over from a profile that compacts at 48k to one that compacts at 24k, and sent that one 37k."""
+    start = max(i for i, r in enumerate(s.recs) if r["t"] == "series" and r["why"] != "failover")
+    last, msgs = next((r for r in reversed(s.recs[start:]) if r["t"] == "usage"), None), series_msgs(s.recs)
     limit = cfg["profiles"][s.profile].get("compact_at", 32000)
-    if last["t"] != "usage" or last["prompt"] <= limit or min(r["turn"] for r in msgs if r["turn"]) > s.turn - 2:
+    if not last or last["prompt"] <= limit or min(r["turn"] for r in msgs if r["turn"]) > s.turn - 2:
         return
     changed = [path for _, _, path in changes(s)[1]]
     fresh = compaction(s.recs, changed, limit)
