@@ -118,7 +118,7 @@ type Start = { on?: boolean }
 const start = async ($: Engine, on: On, jobs: readonly Job[], options: Start = {}) => {
   const clock = mock.clock(on, { now: 160_000 })
   const ran: string[][] = []
-  const world: { jobs: readonly Job[]; show?: string } = { jobs }
+  const world: { jobs: readonly Job[]; show?: string; providers?: unknown } = { jobs }
   const lines: (string | undefined)[] = []
   const toasts: string[] = []
   const closed: string[] = []
@@ -132,7 +132,7 @@ const start = async ($: Engine, on: On, jobs: readonly Job[], options: Start = {
     return { value: undefined }
   })
   // Nothing sits beneath the plugin: each hook here stands for the engine.
-  on('command.register', () => ({ value: { command: 'dsk-jobs' } }))
+  on('command.register', () => ({ value: { command: 'dsk' } }))
   on('ui.open', () => ({ value: { isPlaced: true } }))
   on('ui.close', (_, e) => {
     closed.push(e.id)
@@ -154,11 +154,15 @@ const start = async ($: Engine, on: On, jobs: readonly Job[], options: Start = {
   on('tool.call', () => ({ result: {} }))
   on('process.run', (_, e) => {
     ran.push([...e.argv])
-    const [, verb, , flag] = e.argv
+    const [, verb, action, flag] = e.argv
     const stdout =
       verb === 'status'
         ? JSON.stringify({ jobs: world.jobs })
-        : (world.show ?? (flag === '--diff' ? DIFF : LOG))
+        : verb === 'provider'
+          ? action === 'list'
+            ? JSON.stringify(world.providers)
+            : `dsk · ${e.argv.slice(2).join(' ')}`
+          : (world.show ?? (flag === '--diff' ? DIFF : LOG))
     // dsk exits 1 when it cannot show a job, with why on standard output.
     const exitCode = verb !== 'status' && world.show !== undefined ? 1 : 0
 
@@ -232,16 +236,16 @@ const rowsOf = async (ui: { findAll: (query: { type: string }) => Promise<{ text
   return rows
 }
 
-/** Runs `/dsk-jobs` as the person typing it does. */
+/** Runs `/dsk` as the person typing it does. */
 const typed = ($: Engine, args: string) =>
   $.command.run({
-    command: 'dsk-jobs',
+    command: 'dsk',
     args,
     origin: { kind: 'composer' },
     presentation: { isFullscreen: true, columns: 120 },
   })
 
-test('the display stays unloaded until /dsk-jobs on, and the choice is kept', async ($, on) => {
+test('the display stays unloaded until /dsk on, and the choice is kept', async ($, on) => {
   const { ran, lines, closed, kept } = await start($, on, [RUNNING], { on: false })
 
   // Unloaded: dsk is not read, and every site is the engine's own.
@@ -253,10 +257,10 @@ test('the display stays unloaded until /dsk-jobs on, and the choice is kept', as
   expect((await row.find({ type: 'Text' }))?.text).toBe('Bash(dsk run "Write apps/todo/ with tests")')
   await row.unmount()
   expect((await typed($, ''))?.text).toBe(
-    'The dsk display is not loaded. /dsk-jobs on loads it.',
+    'dsk is off. /dsk on turns it on.',
   )
 
-  expect((await typed($, 'on'))?.text).toMatch(/^dsk display loaded/)
+  expect((await typed($, 'on'))?.text).toMatch(/^dsk is on/)
   expect(ran[0]?.slice(-2)).toEqual(['status', '--json'])
   expect(ran[0]?.[0]).toMatch(/\/scripts\/dsk\.py$/)
   expect(kept).toEqual({ on: true })
@@ -265,7 +269,7 @@ test('the display stays unloaded until /dsk-jobs on, and the choice is kept', as
   await loaded.unmount()
   expect(lines.at(-1)).toBe('✻ dsk 1 running · ↑ 5.3k · ↓ 2.9k · 60% cached')
 
-  expect((await typed($, 'off'))?.text).toMatch(/^dsk display unloaded/)
+  expect((await typed($, 'off'))?.text).toMatch(/^dsk is off/)
   expect(kept).toEqual({ on: false })
   expect(lines.at(-1)).toBeUndefined()
   expect(closed).toEqual(['dsk-jobs'])
@@ -286,7 +290,7 @@ test('the band draws a running job as a branch, on every surface', async ($, on)
       // The job: what it is for and its id, then what it does, three turns of twelve as a bar.
       '  └─ Write apps/todo/ with tests · ed3f',
       '     ⎿  Working… ██       3/12 · ↑ 5.3k · ↓ 2.9k · 60% cached · sh python3 -m unittest',
-      '  ⏺ 1 waiting for you · /dsk-jobs',
+      '  ⏺ 1 waiting for you · /dsk',
     ])
     await ui.unmount()
   }
@@ -315,7 +319,7 @@ test('a job says what it runs now, when it is quiet, and where it failed over fr
     '  │  ⎿  Checking… ██       3/12 · ↑ 5.3k · ↓ 2.9k · 60% cached',
     '  └─ Job a004 · a004',
     '     ⎿  Working… ██       3/12 · ↑ 5.3k · ↓ 2.9k · 60% cached',
-    '  … and 2 more running · /dsk-jobs',
+    '  … and 2 more running · /dsk',
   ])
   await ui.unmount()
 })
@@ -650,7 +654,7 @@ test('the status line follows what runs, the mark moves, and a stop is said', as
   await clock.advance(2000)
 
   expect(toasts).toEqual(['✘ dsk ed3f stuck · same reply twice in a row'])
-  expect(lines.at(-1)).toBe('⏺ dsk 1 waiting for you · /dsk-jobs')
+  expect(lines.at(-1)).toBe('⏺ dsk 1 waiting for you · /dsk')
 
   // Dropped, nothing is left to say, and the next idle reading clears the line.
   world.jobs = [{ ...RUNNING, status: 'dropped', phase: '' }]
@@ -658,4 +662,44 @@ test('the status line follows what runs, the mark moves, and a stop is said', as
 
   expect(lines.at(-1)).toBeUndefined()
   expect(lines).toHaveLength(3)
+})
+
+test('the config pane sets a provider priority, and what official DeepSeek is used for', async ($, on) => {
+  const { ran, world } = await start($, on, [])
+  const one = { base_url: 'https://x/v1', model: 'm', key_env: 'K', key: true, enabled: true, official: false }
+  world.providers = {
+    providers: [
+      { ...one, name: 'mine', position: 1 },
+      { ...one, name: 'other', position: 2 },
+      { ...one, name: 'official', enabled: false, position: null, official: true },
+    ],
+    search: true,
+    order: 'listed',
+  }
+  await $.command.run({
+    command: 'dsk-config',
+    args: '',
+    origin: { kind: 'composer' },
+    presentation: { isFullscreen: true, columns: 120 },
+  })
+  const ui = await $.ui.mount({
+    ...PANE,
+    requestId: 'dsk-providers',
+    props: { ...PANE.props, title: 'dsk config' },
+    surface: 'terminal',
+  })
+  const rows = await rowsOf(ui)
+  expect(rows).toContain('The work goes to mine → other: the first that answers; the next takes over when one fails. Priority sets which is tried 1st, 2nd and so on.')
+  expect(rows).toContain('Web search only')
+
+  await ui.select({ key: 'place-other', value: '1' })
+  expect(ran.at(-2)?.slice(1)).toEqual(['provider', 'move', 'other', '1'])
+  await ui.select({ key: 'use-official', value: 'work' })
+  expect(ran.at(-2)?.slice(1)).toEqual(['provider', 'enable', 'official'])
+  // A pick of what already holds runs nothing.
+  const before = ran.length
+  await ui.select({ key: 'place-mine', value: '1' })
+  await ui.select({ key: 'use-official', value: 'search' })
+  expect(ran.length).toBe(before)
+  await ui.unmount()
 })

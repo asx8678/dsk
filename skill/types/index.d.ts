@@ -56,13 +56,17 @@ export type Provider = {
   enabled: boolean
   /** Its place on the route, from 1; null when disabled. */
   position: number | null
+  /** Whether it is DeepSeek's own API, which web search uses: off the route it serves search alone. */
+  official: boolean
 }
 
-/** What the providers pane of /dsk-config and /dsk-add shows. The form's text is not here: no key is stored. */
+/** What the providers pane of /dsk-config shows. The form's text is not here: no key is stored. */
 export type Providers = {
   list: Provider[]
   /** Whether web search has its DeepSeek key. */
   search: boolean
+  /** Whether `route_order` is `fastest`: the measured fastest is tried first, not the first listed. */
+  isFastest: boolean
   mode: 'list' | 'add' | 'edit'
   /** The provider the form changes. */
   editing: string
@@ -78,7 +82,7 @@ declare module 'claude-code' {
       calls: Shaped<Calls>
       // Which step of the working mark is drawn, moved on by a timer while a job runs.
       frame: number
-      // Whether the display is loaded in this session: `/dsk-jobs on` and `off`.
+      // Whether the display is loaded in this session: `/dsk on` and `off`.
       isOn: boolean
       view: Shaped<View | null>
       providers: Shaped<Providers>

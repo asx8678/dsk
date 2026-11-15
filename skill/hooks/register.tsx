@@ -4,7 +4,7 @@ import type { Color, Elements, EngineInterface, Register, RenderNode, Timer } fr
 import type { Board, Job, Provider, Providers } from '../types'
 
 const PANE = 'dsk-jobs'
-const COMMAND = 'dsk-jobs'
+const COMMAND = 'dsk'
 const PERIOD_MS = 2000
 // While nothing runs, one reading per this many periods.
 const IDLE_PERIODS = 8
@@ -115,10 +115,10 @@ const isOn = atom({ plugin: 'dsk', key: 'isOn' } as const, false)
 const view = atom({ plugin: 'dsk', key: 'view' } as const, null, { shape: 'view-1' })
 const providers = atom(
   { plugin: 'dsk', key: 'providers' } as const,
-  { list: [], search: false, mode: 'list', editing: '', note: '', isError: false } as Providers,
-  { shape: 'providers-1' },
+  { list: [], search: false, isFastest: false, mode: 'list', editing: '', note: '', isError: false } as Providers,
+  { shape: 'providers-2' },
 )
-// The pane of /dsk-config and /dsk-add.
+// The pane of /dsk-config.
 const SETUP = 'dsk-providers'
 
 type Kit = Pick<Elements['terminal'], 'Box' | 'Text' | 'Code' | 'Button'>
@@ -715,13 +715,17 @@ let draft = { name: '', url: '', model: '', key: '' }
 /** Reads the providers again (`dsk provider list --json`) and sets what the pane shows. */
 const refresh = async ($: EngineInterface, patch: Partial<Providers> = {}) => {
   const ran = await dsk($, ['provider', 'list', '--json'])
-  let read: Pick<Providers, 'list' | 'search'> | undefined
+  let read: Pick<Providers, 'list' | 'search' | 'isFastest'> | undefined
 
   try {
     const parsed: unknown = JSON.parse(ran?.text ?? '')
 
     if (isRecord(parsed) && Array.isArray(parsed.providers)) {
-      read = { list: parsed.providers as Provider[], search: parsed.search === true }
+      read = {
+        list: parsed.providers as Provider[],
+        search: parsed.search === true,
+        isFastest: parsed.order === 'fastest',
+      }
     }
   } catch {
     // Not JSON: dsk said why, and the pane shows it.
@@ -819,11 +823,18 @@ const save = async ($: EngineInterface) => {
   })
 }
 
-/** Moves an enabled provider one place earlier on the route. */
-const moveUp = async ($: EngineInterface, one: Provider) => {
-  const ran = await dsk($, ['provider', 'up', one.name])
+/** Gives an enabled provider its place on the route: 1 is tried first. */
+const moveTo = async ($: EngineInterface, one: Provider, place: string) => {
+  if (place === String(one.position)) {
+    return
+  }
+
+  const ran = await dsk($, ['provider', 'move', one.name, place])
   await refresh($, { note: (ran?.text ?? '').trim(), isError: ran?.isOk !== true })
 }
+
+const ORDINALS = ['1st', '2nd', '3rd']
+const ordinal = (place: number) => ORDINALS[place - 1] ?? `${place}th`
 
 /** Back to the list without saving. */
 const cancel = async ($: EngineInterface) => {
@@ -831,9 +842,16 @@ const cancel = async ($: EngineInterface) => {
   await update($, providers, (was): Providers => ({ ...was, mode: 'list', editing: '', note: '', isError: false }))
 }
 
-/** Takes a provider off the route, or puts it back as the last one tried. */
-const toggle = async ($: EngineInterface, one: Provider) => {
-  const ran = await dsk($, ['provider', one.enabled ? 'disable' : 'enable', one.name])
+/**
+ * Takes a provider off the route, or puts it back: ahead of official DeepSeek, or last. For official DeepSeek
+ * that is the choice between web search alone and work as well.
+ */
+const toggle = async ($: EngineInterface, one: Provider, on = !one.enabled) => {
+  if (on === one.enabled) {
+    return
+  }
+
+  const ran = await dsk($, ['provider', on ? 'enable' : 'disable', one.name])
   await refresh($, { note: (ran?.text ?? '').trim(), isError: ran?.isOk !== true })
 }
 
@@ -975,6 +993,113 @@ const load = async ($: EngineInterface, on: boolean) => {
   await $.ui.close({ id: PANE })
 }
 
+/** This dsk's version, from its manifest; '' when it cannot be read. */
+const version = async ($: EngineInterface) => {
+  let root: string | undefined
+
+  // A test engine may load the plugin without a directory, and refuse $.plugin.
+  try {
+    root = $.plugin.root
+  } catch {
+    return ''
+  }
+
+  for (const path of [`${root}/.claude-plugin/plugin.json`, `${root}/plugin.json`]) {
+    try {
+      const parsed: unknown = JSON.parse(await $.fs.read(path))
+
+      if (isRecord(parsed) && typeof parsed.version === 'string') {
+        return parsed.version
+      }
+    } catch {
+      // Not there: try the next.
+    }
+  }
+
+  return ''
+}
+let shownVersion = ''
+
+/** Runs the claude command; its output, or why it could not run. */
+const claude = async ($: EngineInterface, args: readonly string[]) => {
+  try {
+    const ran = await $.process.run(['claude', ...args], { timeoutMs: 180_000 })
+
+    return { isOk: ran.exitCode === 0, text: `${ran.stdout}\n${ran.stderr}`.trim() }
+  } catch (error) {
+    return { isOk: false, text: `claude could not run: ${String(error)}` }
+  }
+}
+
+/**
+ * `/dsk update`: fetches the marketplace dsk came from, then updates dsk from it.
+ * The new version loads after a restart or /reload-plugins.
+ */
+const upgrade = async ($: EngineInterface) => {
+  const listed = await claude($, ['plugin', 'list', '--json'])
+  let entry: { id: string; version: string } | undefined
+
+  try {
+    const all: unknown = JSON.parse(listed.text)
+
+    if (Array.isArray(all)) {
+      const found = all.filter(
+        (one): one is { id: string; version?: string; installPath?: string } =>
+          isRecord(one) && typeof one.id === 'string' && one.id.startsWith('dsk@'),
+      )
+      const mine =
+        found.find(one => typeof one.installPath === 'string' && $.plugin.root.startsWith(one.installPath)) ??
+        found[0]
+
+      if (mine !== undefined) {
+        entry = { id: mine.id, version: typeof mine.version === 'string' ? mine.version : '?' }
+      }
+    }
+  } catch {
+    // Not JSON: said below.
+  }
+
+  if (entry === undefined || entry.id === 'dsk@skills-dir') {
+    return entry === undefined
+      ? `No installed dsk plugin found by \`claude plugin list\`. ${cut(listed.text, 300)}`
+      : 'This dsk runs from a checkout (dsk@skills-dir): git pull there updates it.'
+  }
+
+  const marketplace = entry.id.slice('dsk@'.length)
+  const fetched = await claude($, ['plugin', 'marketplace', 'update', marketplace])
+
+  if (!fetched.isOk) {
+    return `Could not fetch the ${marketplace} marketplace: ${cut(fetched.text, 400)}`
+  }
+
+  const updated = await claude($, ['plugin', 'update', entry.id])
+
+  if (!updated.isOk) {
+    return `Could not update ${entry.id}: ${cut(updated.text, 400)}`
+  }
+
+  const after = await claude($, ['plugin', 'list', '--json'])
+  let now = ''
+
+  try {
+    const all: unknown = JSON.parse(after.text)
+    const one = Array.isArray(all) ? all.find(it => isRecord(it) && it.id === entry.id) : undefined
+    now = isRecord(one) && typeof one.version === 'string' ? one.version : ''
+  } catch {
+    // Said as unknown below.
+  }
+
+  return now === '' || now === entry.version
+    ? `dsk ${entry.version} is the latest version.${now === '' ? ` ${cut(updated.text, 300)}` : ''}`
+    : `dsk ${entry.version} → ${now} updated. Restart Claude Code or run /reload-plugins to load it.`
+}
+
+/** Turns dsk on or off here, and keeps the choice for the sessions after this one. */
+const power = async ($: EngineInterface, on: boolean) => {
+  await $.store.set('on', on)
+  await load($, on)
+}
+
 /** Puts one job's diff or its turns in the pane, in place of the list. */
 const show = async ($: EngineInterface, id: string, kind: 'diff' | 'log') => {
   // What dsk says when it cannot show the job (its repository is gone) is shown in its place.
@@ -986,23 +1111,19 @@ export const register: Register = on => {
   on('session.start', async ($, e, next) => {
     me = await $.session.id()
     cwd = e.cwd
+    shownVersion = await version()
     await $.command.register({
-      name: 'dsk-jobs',
-      description: 'Load or unload the dsk job display, or open its list of jobs',
-      argumentHint: '[on|off]',
-      immediate: true,
-    })
-    await $.command.register({
-      name: 'dsk-add',
-      description: 'Add another DeepSeek provider: its API URL, model name and API key',
+      name: COMMAND,
+      description: 'Open the list of dsk jobs; /dsk on or off turns dsk on or off; /dsk update updates it',
+      argumentHint: '[on|off|update]',
       immediate: true,
     })
     await $.command.register({
       name: 'dsk-config',
-      description: 'Show the dsk providers and models; add, change, enable or disable them',
+      description: 'Configure dsk: turn it on or off; add, change, enable or disable providers',
       immediate: true,
     })
-    // The choice made with `/dsk-jobs on` or `off` holds for the sessions after it.
+    // The choice made with `/dsk on` or `off` holds for the sessions after it.
     // Unloaded is how a session starts, so there is nothing to take down.
     if ((await $.store.get('on')) === true) {
       await load($, true)
@@ -1013,32 +1134,24 @@ export const register: Register = on => {
     return next(e)
   })
 
-  on('command.run', { command: 'dsk-add' }, async $ => {
-    await refresh($)
-    await openForm($)
-    await $.ui.open({ id: SETUP, title: 'dsk providers', focus: true })
-
-    return {
-      text: 'Fill in the name, API URL, model name and API key in the dsk providers pane; Enter in the last field or save adds it. It runs after the providers you have, and /dsk-config moves it up.',
-    }
-  })
-
   on('command.run', { command: 'dsk-config' }, async $ => {
     await refresh($, { mode: 'list', editing: '' })
-    await $.ui.open({ id: SETUP, title: 'dsk providers', focus: true })
+    await $.ui.open({ id: SETUP, title: 'dsk config', focus: true })
     const now = await read($, providers)
     const used = now.list.filter(one => one.enabled).map(one => `${one.name} (${one.model})`)
-    const off = now.list.filter(one => !one.enabled).map(one => one.name)
+    const searchOnly = now.list.filter(one => !one.enabled && one.official).map(one => one.name)
+    const off = now.list.filter(one => !one.enabled && !one.official).map(one => one.name)
+    const state = `dsk${shownVersion === '' ? '' : ` ${shownVersion}`} is ${isLoaded ? 'on' : 'off'}. `
 
     return {
       text: now.isError
         ? now.note
-        : `dsk tries ${used.join(' → ') || 'nothing'}${off.length > 0 ? `; disabled: ${off.join(', ')}` : ''}. Web search: ${now.search ? 'on' : 'off, no DeepSeek key'}. Rename, edit, reorder, enable or disable them, or add one, in the dsk providers pane.`,
+        : `${state}The work goes to ${used.join(' → ') || 'nothing'}${searchOnly.length > 0 ? `; web search only: ${searchOnly.join(', ')}` : ''}${off.length > 0 ? `; disabled: ${off.join(', ')}` : ''}. Web search: ${now.search ? 'on' : 'off, no DeepSeek key'}. In the dsk config pane: add, edit or rename a provider, set its priority, enable or disable it, and choose whether official DeepSeek serves web search only or work as well.`,
     }
   })
 
   on('ui.render', { component: 'Pane', requestId: SETUP }, async ($, e) => {
-    const { Box, Text, Button, Input } = $.ui.resolve(e)
+    const { Box, Text, Button, Input, Select } = $.ui.resolve(e)
     const now = await read($, providers)
     const note =
       now.note === '' ? null : (
@@ -1129,49 +1242,101 @@ export const register: Register = on => {
       )
     }
 
+    const shownOn = await read($, isOn)
     const used = now.list.filter(one => one.enabled)
-    const off = now.list.filter(one => !one.enabled)
+    const searchOnly = now.list.filter(one => !one.enabled && one.official)
+    const off = now.list.filter(one => !one.enabled && !one.official)
+    const places = used.map((_, index) => ({ value: String(index + 1), label: ordinal(index + 1) }))
     const row = (one: Provider) => (
       <Box flexDirection="column">
         <Box>
-          <Text color={one.enabled ? (one.key ? 'success' : 'warning') : 'inactive'}>
-            {one.enabled ? (one.key ? '● ' : '▲ ') : '○ '}
+          <Text color={one.enabled ? (one.key ? 'success' : 'warning') : one.official && one.key ? 'claude' : 'inactive'}>
+            {one.enabled ? (one.key ? '● ' : '▲ ') : one.official ? '◇ ' : '○ '}
           </Text>
           <Text color={one.enabled ? undefined : 'inactive'} bold={one.enabled}>
             {`${one.enabled ? `${one.position}. ` : ''}${one.name}`}
           </Text>
           <Text dimColor wrap="truncate-end">{`  ${one.model} · ${one.base_url}`}</Text>
         </Box>
-        <Box>
+        <Box flexWrap="wrap">
           <Text>{'    '}</Text>
           {!one.key && <Text color="warning">{`no key in ${one.key_env} · `}</Text>}
           <Button key={`edit-${one.name}`} label="edit" onPress={() => openForm($, one)} />
           <Text> </Text>
-          {one.enabled && (one.position ?? 1) > 1 && (
+          {one.enabled && used.length > 1 && (
             <Box>
-              <Button key={`up-${one.name}`} label="move up" onPress={() => moveUp($, one)} />
+              <Select
+                key={`place-${one.name}`}
+                label="priority"
+                options={places}
+                value={String(one.position ?? 1)}
+                onSelect={place => moveTo($, one, place)}
+              />
               <Text> </Text>
             </Box>
           )}
-          <Button
-            key={`toggle-${one.name}`}
-            label={one.enabled ? 'disable' : 'enable'}
-            onPress={() => toggle($, one)}
-          />
+          {one.official ? (
+            <Select
+              key={`use-${one.name}`}
+              label="use for"
+              options={[
+                { value: 'work', label: 'web search and work' },
+                { value: 'search', label: 'web search only' },
+              ]}
+              value={one.enabled ? 'work' : 'search'}
+              onSelect={use => toggle($, one, use === 'work')}
+            />
+          ) : (
+            <Button
+              key={`toggle-${one.name}`}
+              label={one.enabled ? 'disable' : 'enable'}
+              onPress={() => toggle($, one)}
+            />
+          )}
         </Box>
       </Box>
     )
 
     return (
       <Box flexDirection="column">
-        <Text bold>dsk providers</Text>
+        <Box>
+          <Text bold>{`dsk${shownVersion === '' ? '' : ` ${shownVersion}`} `}</Text>
+          <Text color={shownOn ? 'success' : 'inactive'} bold>
+            {shownOn ? '● on' : '○ off'}
+          </Text>
+          <Text>  </Text>
+          <Button
+            key="dsk-power"
+            label={shownOn ? 'turn off' : 'turn on'}
+            onPress={() => power($, !shownOn)}
+          />
+        </Box>
         <Text dimColor wrap="wrap">
-          {used.length > 0
-            ? `A run goes to ${used.map(one => one.name).join(' → ')}: the first that answers; the next takes over when one fails.`
-            : 'No provider is enabled: add one or enable one below.'}
+          {shownOn
+            ? 'On: running jobs show above the prompt and /dsk lists them. It stays on in the sessions you start after this one.'
+            : 'Off: nothing is read or drawn. It stays off in the sessions you start after this one.'}
         </Text>
         <Text> </Text>
+        <Text bold>Providers</Text>
+        <Text dimColor wrap="wrap">
+          {used.length > 0
+            ? `The work goes to ${used.map(one => one.name).join(' → ')}: the first that answers; the next takes over when one fails.${used.length > 1 ? ' Priority sets which is tried 1st, 2nd and so on.' : ''}`
+            : 'No provider is enabled: add one or enable one below.'}
+        </Text>
+        {now.isFastest && used.length > 1 && (
+          <Text color="warning" wrap="wrap">
+            route_order is fastest in config.json: the measured fastest is tried first, whatever the priority below says.
+          </Text>
+        )}
+        <Text> </Text>
         {used.map(row)}
+        {searchOnly.length > 0 && (
+          <Box flexDirection="column">
+            <Text> </Text>
+            <Text dimColor>Web search only</Text>
+            {searchOnly.map(row)}
+          </Box>
+        )}
         {off.length > 0 && (
           <Box flexDirection="column">
             <Text> </Text>
@@ -1183,34 +1348,40 @@ export const register: Register = on => {
         <Box>
           <Button key="provider-add" label="+ add provider" onPress={() => openForm($)} />
         </Box>
-        <Text color={now.search ? undefined : 'warning'} dimColor={now.search}>
-          {`Web search (--web): ${now.search ? 'on' : 'off, it needs a DeepSeek API key (DEEPSEEK_API_KEY)'}`}
+        <Text dimColor wrap="wrap">
+          A provider you add is tried before official DeepSeek; priority changes that.
+        </Text>
+        <Text color={now.search ? undefined : 'warning'} dimColor={now.search} wrap="wrap">
+          {`Web search (--web): ${now.search ? 'on, through official DeepSeek' : 'off, it needs a DeepSeek API key (DEEPSEEK_API_KEY)'}`}
         </Text>
         {note}
       </Box>
     )
   })
 
-  on('command.run', { command: 'dsk-jobs' }, async ($, e) => {
+  on('command.run', { command: COMMAND }, async ($, e) => {
     const word = (e.args ?? '').trim().toLowerCase()
 
     if (word === 'on' || word === 'off') {
-      await $.store.set('on', word === 'on')
-      await load($, word === 'on')
+      await power($, word === 'on')
 
       return {
         text:
           word === 'on'
-            ? `dsk display loaded, here and in the sessions you start after this one. Running jobs show above the prompt, /${COMMAND} lists them all, /${COMMAND} off unloads it.`
-            : `dsk display unloaded, here and in the sessions you start after this one. /${COMMAND} on loads it again.`,
+            ? `dsk is on, here and in the sessions you start after this one. Running jobs show above the prompt, /${COMMAND} lists them all, /${COMMAND} off turns it off, /dsk-config configures it.`
+            : `dsk is off, here and in the sessions you start after this one. /${COMMAND} on turns it on again.`,
       }
+    }
+
+    if (word === 'update') {
+      return { text: await upgrade($) }
     }
 
     if (word !== '' || !isLoaded) {
       return {
         text: isLoaded
-          ? `Usage: /${COMMAND} lists the jobs, /${COMMAND} off unloads the display.`
-          : `The dsk display is not loaded. /${COMMAND} on loads it.`,
+          ? `Usage: /${COMMAND} lists the jobs, /${COMMAND} off turns dsk off, /${COMMAND} update updates it, /dsk-config configures it.`
+          : `dsk is off. /${COMMAND} on turns it on.`,
       }
     }
 
@@ -1413,7 +1584,7 @@ export const register: Register = on => {
         <Text dimColor>
           {now.at === 0
             ? 'No reading from `dsk status --json` yet. Is dsk on PATH and up to date?'
-            : `The dsk display is not loaded. /${COMMAND} on loads it.`}
+            : `dsk is off. /${COMMAND} on turns it on.`}
         </Text>
       )
     }

@@ -524,7 +524,7 @@ class Plugin(Cli):
                          {"options": f"{self.data}/options.json", "id": "dsk@acme"})
         self.assertEqual(os.stat(f"{self.data}/options.json").st_mode & 0o777, 0o600)
         code, out, _ = self.dsk("configure")
-        self.assertEqual((code, out.splitlines()), (0, ["dsk · ready · official · https://api.deepseek.com · deepseek-flash",
+        self.assertEqual((code, out.splitlines()), (0, [f"dsk {dsk.version()} · ready · official · https://api.deepseek.com · deepseek-flash",
                                                         "official: https://api.deepseek.com · deepseek-flash · key set"]))
         before = os.stat(f"{self.data}/options.json").st_mtime_ns
         self.hook(provider="official", deepseek_api_key="sk-official")  # before the next prompt: nothing changed, nothing written
@@ -543,13 +543,15 @@ class Plugin(Cli):
         self.hook(**custom, deepseek_api_key="sk-official")  # with a DeepSeek key as well, runs still go only to custom
         self.assertEqual(self.dsk("configure")[1].splitlines()[1:], [f"custom:  {self.api.url}/c · my-model · key set"])
         self.hook(**{**custom, "provider": "official"}, deepseek_api_key="sk-official")  # the picker decides which one runs
-        self.assertEqual(self.dsk("configure")[1].splitlines()[0], "dsk · ready · official · https://api.deepseek.com · deepseek-flash")
+        self.assertEqual(self.dsk("configure")[1].splitlines()[0], f"dsk {dsk.version()} · ready · official · https://api.deepseek.com · deepseek-flash")
 
     def test_what_is_missing_is_said_at_session_start_and_a_hook_never_blocks(self):
         code, out = self.hook("--announce")
         said = json.loads(out)
         self.assertEqual(code, 0)
-        self.assertEqual(said["systemMessage"], "dsk is not set up yet: it has no DeepSeek API key. Run /plugin configure dsk@acme "
+        # the first session on a version names it, once: after an install or an update
+        self.assertEqual(said["systemMessage"], f"dsk {dsk.version()} installed. "
+                         "dsk is not set up yet: it has no DeepSeek API key. Run /plugin configure dsk@acme "
                          "and enter your DeepSeek API key, or pick provider `custom` and enter its endpoint URL, model name and API key. "
                          "Then restart Claude Code.")
         self.assertEqual(said["hookSpecificOutput"]["hookEventName"], "SessionStart")
@@ -558,7 +560,7 @@ class Plugin(Cli):
         code, out = self.hook("--announce", provider="custom", custom_base_url="https://example.invalid/v1")
         self.assertIn("dsk is not set up yet: provider custom still needs its model name, API key. ", json.loads(out)["systemMessage"])
         code, out, _ = self.dsk("configure")
-        self.assertEqual((code, out.splitlines()[0]), (1, "dsk · not set up · provider custom still needs its model name, API key"))
+        self.assertEqual((code, out.splitlines()[0]), (1, f"dsk {dsk.version()} · not set up · provider custom still needs its model name, API key"))
         self.assertIn("next:    in Claude Code, /plugin configure dsk@acme: enter your DeepSeek API key", out)
         code, out, _ = self.dsk("run", "task")
         self.assertEqual(code, 1)
@@ -578,14 +580,14 @@ class Plugin(Cli):
         self.run_ok("task")
         self.assertEqual(self.api.chats()[0]["key"], "Bearer sk-from-the-env-file")
         self.write_config()  # the route and profiles a hand-written config.json names stand
-        self.assertEqual(self.dsk("configure")[1].splitlines()[0], f"dsk · ready · a · {self.api.url}/a · model-a")
+        self.assertEqual(self.dsk("configure")[1].splitlines()[0], f"dsk {dsk.version()} · ready · a · {self.api.url}/a · model-a")
 
     def test_a_removed_plugin_takes_its_keys_with_it(self):
         self.hook(provider="official", deepseek_api_key="sk-official")
         self.assertEqual(self.dsk("configure")[0], 0)
         shutil.rmtree(self.data)  # Claude Code deletes the data folder when the plugin is uninstalled
         code, out, _ = self.dsk("configure")
-        self.assertEqual((code, out.splitlines()[0]), (1, "dsk · not set up · it has no DeepSeek API key"))
+        self.assertEqual((code, out.splitlines()[0]), (1, f"dsk {dsk.version()} · not set up · it has no DeepSeek API key"))
 
     @unittest.skipUnless(dsk.sandbox_works("(version 1)(allow default)(deny file-write* (literal \"/nonexistent\"))"),
                          "no sandbox here: not macOS, or already inside a sandbox, which macOS will not nest")
@@ -605,7 +607,7 @@ class Plugin(Cli):
 
 
 class Providers(Cli):
-    """`dsk provider`: what /dsk-add and /dsk-config run. It rewrites the user's config.json and env, so it must keep
+    """`dsk provider`: what /dsk-config runs. It rewrites the user's config.json and env, so it must keep
     everything it was not asked to change."""
 
     def files(self):
@@ -684,6 +686,43 @@ class Providers(Cli):
         self.assertEqual(self.dsk("provider", "rename", "deep", "official")[0], 0)
         self.assertNotIn("official", self.files()[0].get("renamed", {}))
         self.assertIn("official", [r["name"] for r in json.loads(self.dsk("provider", "list", "--json")[1])["providers"]])
+
+    def test_move_sets_the_place_and_a_provider_goes_ahead_of_official_deepseek(self):
+        path = f"{self.tmp}/config/dsk/config.json"
+        with open(path) as f:
+            before = json.load(f)
+        before["effort"] = "max"
+        before["route"] = [*before["route"], "official", "ghost"]  # ghost has no profile: it must keep its place
+        before["search"] = {"base_url": "https://api.deepseek.com/", "key_env": "DEEPSEEK_API_KEY"}  # as built in
+        with open(path, "w") as f:
+            json.dump(before, f)
+        first = before["route"][0]
+        listed = {r["name"]: r for r in json.loads(self.dsk("provider", "list", "--json")[1])["providers"]}
+        self.assertEqual([n for n, r in listed.items() if r["official"]], ["official"])
+        # an added provider goes ahead of official DeepSeek, after the others
+        self.dsk("provider", "add", "z", "--url", "https://z.example/v1", "--model", "zm", "--key-stdin", stdin="k1")
+        at = before["route"].index("official")
+        self.assertEqual(self.files()[0]["route"], [*before["route"][:at], "z", "official", "ghost"])
+        code, out, _ = self.dsk("provider", "move", "official", "1")
+        self.assertEqual(code, 0, out)
+        cfg, _ = self.files()
+        self.assertEqual(cfg["route"], ["official", *before["route"][:at], "z", "ghost"])
+        self.assertEqual({k: v for k, v in cfg.items() if k not in ("route", "profiles")},
+                         {k: v for k, v in before.items() if k not in ("route", "profiles")})
+        self.assertEqual({k: v for k, v in cfg["profiles"].items() if k != "z"}, before["profiles"])
+        self.assertEqual(self.dsk("provider", "move", "z", "2")[0], 0)
+        self.assertEqual(self.files()[0]["route"][:2], ["official", "z"])
+        for bad in ("0", "9", "x"):  # a place that is not on the route changes nothing
+            self.assertEqual(self.dsk("provider", "move", "z", bad)[0], 1)
+        self.assertEqual(self.dsk("provider", "move", "z")[0], 1)
+        self.assertEqual(self.files()[0]["route"][:2], ["official", "z"])
+        # official off the route serves web search alone; back on, it goes last, and another goes ahead of it
+        self.assertIn("still serves web search", self.dsk("provider", "disable", "official")[1])
+        self.assertEqual(self.dsk("provider", "disable", first)[0], 0)
+        self.assertEqual(self.dsk("provider", "enable", "official")[0], 0)
+        self.assertEqual(self.dsk("provider", "enable", first)[0], 0)
+        route = [n for n in self.files()[0]["route"] if n != "ghost"]
+        self.assertEqual(route[-2:], [first, "official"])
 
     def test_a_config_it_cannot_read_is_left_alone(self):
         path = f"{self.tmp}/config/dsk/config.json"
