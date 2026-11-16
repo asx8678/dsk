@@ -97,9 +97,9 @@ HOME="$home" "$checkout/install.sh" --nonsense >/dev/null 2>&1 || status=$?
 rm -f "$home/.local/bin/dsk"
 install_dsk --local
 cache="$home/.claude/plugins/cache/asx8678/dsk"
-mkdir -p "$cache/0.0.1/scripts"
-printf '#!/bin/sh\necho orphan\n' >"$cache/0.0.1/scripts/dsk.py"
-chmod 755 "$cache/0.0.1/scripts/dsk.py"
+mkdir -p "$cache/0.0.1/bin"
+printf '#!/bin/sh\necho orphan\n' >"$cache/0.0.1/bin/dsk"
+chmod 755 "$cache/0.0.1/bin/dsk"
 : >"$cache/0.0.1/.orphaned_at"   # written last, so that this folder is the newest one in the cache
 HOME="$home" "$home/.local/bin/dsk" --help >"$home/out" 2>&1 || fail "the dsk command failed with an orphaned folder in the cache"
 if grep -q orphan "$home/out"; then fail "the dsk command ran the folder marked .orphaned_at"; fi
