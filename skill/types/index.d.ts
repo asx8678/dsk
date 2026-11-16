@@ -58,6 +58,8 @@ export type Provider = {
   position: number | null
   /** Whether it is DeepSeek's own API, which web search uses: off the route it serves search alone. */
   official: boolean
+  /** What the last speed test measured, in seconds; null when it has no time, absent from a dsk before 0.10.3. */
+  seconds?: number | null
 }
 
 /** What the providers pane of /dsk config shows. The form's text is not here: no key is stored. */
@@ -67,8 +69,9 @@ export type Providers = {
   search: boolean
   /** Whether `route_order` is `fastest`: the measured fastest is tried first, not the first listed. */
   isFastest: boolean
-  mode: 'list' | 'add' | 'edit'
-  /** The provider the form changes. */
+  /** The list, one provider and what can be done with it, or the form that adds or changes one. */
+  mode: 'list' | 'provider' | 'add' | 'edit'
+  /** The provider that is open or that the form changes; in the list, the one last open, where the ring starts. */
   editing: string
   /** What dsk said last, and whether it was an error. */
   note: string

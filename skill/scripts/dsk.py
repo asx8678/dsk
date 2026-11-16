@@ -2935,13 +2935,23 @@ def ordinal(n):
     return f"{n}{'th' if 10 <= n % 100 <= 20 else {1: 'st', 2: 'nd', 3: 'rd'}.get(n % 10, 'th')}"
 
 
+def own_order(cfg, user):
+    """A place chosen by hand counts from then on: with `route_order` fastest, set it to listed in the config about
+    to be written, and return the words that say so, '' when there was nothing to change."""
+    if cfg.get("route_order", "listed") != "fastest":
+        return ""
+    user["route_order"] = "listed"
+    return " · order: your priority now, not fastest first (dsk provider order fastest brings that back)"
+
+
 def provider_rows(cfg):
     """Each profile, the route's first in its order: name, endpoint, model, whether it is on the route, whether its key
-    is set, and whether it is official DeepSeek, which web search uses."""
-    route = [n for n in cfg["route"] if n in cfg["profiles"]]
+    is set, whether it is official DeepSeek, which web search uses, and the seconds `dsk bench` last measured."""
+    route, found = [n for n in cfg["route"] if n in cfg["profiles"]], speeds()
     return [{"name": n, "base_url": p.get("base_url", ""), "model": p.get("model", ""), "key_env": p.get("key_env", ""),
              "key": bool(secret(p.get("key_env", ""))), "enabled": n in route,
-             "position": route.index(n) + 1 if n in route else None, "official": is_official(cfg, n)}
+             "position": route.index(n) + 1 if n in route else None, "official": is_official(cfg, n),
+             "seconds": (found.get(n) or {}).get("seconds")}
             for n, p in sorted(cfg["profiles"].items(), key=lambda kv: route.index(kv[0]) if kv[0] in route else len(route))]
 
 
@@ -2959,12 +2969,25 @@ def cmd_provider(args, cfg):
         if not args.json:
             print(f"web search: {'on' if search else 'off, it needs ' + cfg['search']['key_env']}")
             if cfg.get("route_order") == "fastest":
-                print("order: route_order is fastest, so the measured fastest is tried first, not the first listed")
+                print("order: fastest first, so the speed test decides, not the order listed "
+                      "(dsk provider order listed, or a dsk provider move, makes your priority count)")
         return 0
     name = (args.name or "").strip()
-    if not name:
+    if not name and args.action != "order":  # order says what it takes by itself
         raise Fail(f"provider {args.action} needs a name")
     path, user = user_config()
+    if args.action == "order":
+        if name not in ("listed", "fastest"):
+            raise Fail("provider order takes listed (your priority) or fastest (the speed test decides), "
+                       "as in: dsk provider order fastest")
+        if cfg.get("route_order", "listed") == name:
+            print(f"dsk · order: already {name}")
+            return 0
+        user["route_order"] = name
+        write_kept(path, json.dumps(user, indent=2) + "\n")
+        print("dsk · order: fastest first, the speed test decides which provider is tried first" if name == "fastest"
+              else f"dsk · order: your priority · route: {' → '.join(cfg['route'])}")
+        return 0
     profiles, route = user.setdefault("profiles", {}), list(cfg["route"])  # with renames applied
     if args.action == "add":
         if not PROVIDER_NAME.fullmatch(name):
@@ -3018,9 +3041,9 @@ def cmd_provider(args, cfg):
             print(f"dsk · {name} is already tried first")
             return 0
         route[at - 1], route[at] = route[at], route[at - 1]
-        user["route"] = route
+        user["route"], own = route, own_order(cfg, user)
         write_kept(path, json.dumps(user, indent=2) + "\n")
-        print(f"dsk · {name} moved up · route: {' → '.join(route)}")
+        print(f"dsk · {name} moved up · route: {' → '.join(route)}{own}")
         return 0
     if args.action == "move":
         route = list(cfg["route"])
@@ -3039,9 +3062,9 @@ def cmd_provider(args, cfg):
         known.remove(name)
         known.insert(to - 1, name)
         order = iter(known)  # a name on the route that has no profile keeps its place
-        user["route"] = [next(order) if n in cfg["profiles"] else n for n in route]
+        user["route"], own = [next(order) if n in cfg["profiles"] else n for n in route], own_order(cfg, user)
         write_kept(path, json.dumps(user, indent=2) + "\n")
-        print(f"dsk · {name} is now tried {ordinal(to)} · route: {' → '.join(user['route'])}")
+        print(f"dsk · {name} is now tried {ordinal(to)} · route: {' → '.join(user['route'])}{own}")
         return 0
     if args.action == "set":
         check_endpoint(args.url, args.model)
@@ -3255,8 +3278,8 @@ def main():
     configure.add_argument("--announce", action="store_true", help="with --hook: say what is still missing")
     configure.add_argument("--data", metavar="DIR", help="with --hook: the plugin's data folder")
     provider = command("provider", "list, add, change, rename, reorder, enable or disable the provider profiles")
-    provider.add_argument("action", choices=["list", "add", "set", "rename", "up", "move", "enable", "disable"])
-    provider.add_argument("name", nargs="?")
+    provider.add_argument("action", choices=["list", "add", "set", "rename", "up", "move", "order", "enable", "disable"])
+    provider.add_argument("name", nargs="?", help="the provider; order: listed (your priority) or fastest")
     provider.add_argument("new", nargs="?", help="rename: the new name; move: the new place on the route, from 1")
     provider.add_argument("--url", help="add, set: the base URL of the OpenAI-compatible API")
     provider.add_argument("--model", help="add, set: the model id as the endpoint lists it")
