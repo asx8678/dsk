@@ -134,6 +134,7 @@ const start = async ($: Engine, on: On, jobs: readonly Job[], options: Start = {
   // Nothing sits beneath the plugin: each hook here stands for the engine.
   on('command.register', () => ({ value: { command: 'dsk' } }))
   on('ui.open', () => ({ value: { isPlaced: true } }))
+  on('ui.focus', () => ({}))
   on('ui.close', (_, e) => {
     closed.push(e.id)
 
@@ -664,7 +665,7 @@ test('the status line follows what runs, the mark moves, and a stop is said', as
   expect(lines).toHaveLength(3)
 })
 
-test('the config pane sets a provider priority, and what official DeepSeek is used for', async ($, on) => {
+test('the config pane opens a provider to set its priority, what official DeepSeek is used for, and the route order', async ($, on) => {
   const { ran, world } = await start($, on, [])
   const one = { base_url: 'https://x/v1', model: 'm', key_env: 'K', key: true, enabled: true, official: false }
   world.providers = {
@@ -689,17 +690,23 @@ test('the config pane sets a provider priority, and what official DeepSeek is us
     surface: 'terminal',
   })
   const rows = await rowsOf(ui)
-  expect(rows).toContain('The work goes to mine → other: the first that answers; the next takes over when one fails. Priority sets which is tried 1st, 2nd and so on.')
-  expect(rows).toContain('Web search only')
+  expect(rows).toContain('The first that answers does the work; the next takes over when one fails.')
+  expect(rows.some(row => row.startsWith('web search only · '))).toBe(true)
 
-  await ui.select({ key: 'place-other', value: '1' })
+  // A row opens its provider, and an action there gives it its place.
+  await ui.press({ key: 'row-other' })
+  await ui.press({ key: 'act-first' })
   expect(ran.at(-2)?.slice(1)).toEqual(['provider', 'move', 'other', '1'])
-  await ui.select({ key: 'use-official', value: 'work' })
-  expect(ran.at(-2)?.slice(1)).toEqual(['provider', 'enable', 'official'])
-  // A pick of what already holds runs nothing.
+  // A move past the end of the route runs nothing.
   const before = ran.length
-  await ui.select({ key: 'place-mine', value: '1' })
-  await ui.select({ key: 'use-official', value: 'search' })
+  await ui.press({ key: 'act-down' })
   expect(ran.length).toBe(before)
+  await ui.press({ key: 'act-back' })
+  await ui.press({ key: 'row-official' })
+  await ui.press({ key: 'act-toggle' })
+  expect(ran.at(-2)?.slice(1)).toEqual(['provider', 'enable', 'official'])
+  await ui.press({ key: 'act-back' })
+  await ui.press({ key: 'route-order' })
+  expect(ran.at(-2)?.slice(1)).toEqual(['provider', 'order', 'fastest'])
   await ui.unmount()
 })

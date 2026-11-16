@@ -120,6 +120,18 @@ const providers = atom(
 )
 // The pane of /dsk config.
 const SETUP = 'dsk-providers'
+/**
+ * How the settings pane asks to be seated: with the keys, closed by Escape as a dialog is, and as tall as its rows
+ * for `count` providers, so that all of it shows where the layout has the room: the arrows then walk its rows.
+ */
+const seat = (count: number) => ({
+  id: SETUP,
+  title: 'dsk config',
+  focus: true as const,
+  closeOnEscape: true as const,
+  rows: 14 + count,
+})
+
 // What /dsk takes after its name, each with the line the typeahead shows beside it.
 const WORDS = [
   { word: 'on', description: 'Turn dsk on: running jobs show above the prompt' },
@@ -745,6 +757,22 @@ const refresh = async ($: EngineInterface, patch: Partial<Providers> = {}) => {
   await update($, providers, now => ({ ...now, ...read, ...patch, ...failed }))
 }
 
+/** What dsk answered, without the name it starts every line with; what to say when it did not answer. */
+const said = (ran: { isOk: boolean; text: string } | undefined) =>
+  (ran?.text ?? '').trim().replace(/^dsk · /, '') || 'dsk did not answer. Is it on PATH and up to date?'
+
+/**
+ * Puts the pane's ring on one of its controls. The ring holds a place in the drawing, not a control: once another
+ * view is drawn, that place is some other control, and Enter would press it.
+ */
+const land = async ($: EngineInterface, key: string) => {
+  try {
+    await $.ui.focus({ requestId: SETUP, key })
+  } catch {
+    // A surface that keeps no ring has nothing to move.
+  }
+}
+
 /** Opens the form: empty to add a provider, or filled with one to change it. */
 const openForm = async ($: EngineInterface, editing?: Provider) => {
   draft = { name: editing?.name ?? '', url: editing?.base_url ?? '', model: editing?.model ?? '', key: '' }
@@ -755,9 +783,37 @@ const openForm = async ($: EngineInterface, editing?: Provider) => {
     note: '',
     isError: false,
   }))
+  await land($, editing === undefined ? 'provider-name' : 'provider-url')
 }
 
-/** Sends the form to `dsk provider add` or `set`; on success, back to the list. */
+/** The action a provider's view starts on: the first that would change something, else the edit. */
+const startOn = (one: Provider, used: number) =>
+  !one.enabled || used < 2 ? 'act-edit' : one.position === 1 ? 'act-down' : 'act-first'
+
+/** Shows one provider and what can be done with it, in place of the list. */
+const openProvider = async ($: EngineInterface, one: Provider) => {
+  const now = await read($, providers)
+  await update($, providers, (was): Providers => ({ ...was, mode: 'provider', editing: one.name, note: '', isError: false }))
+  await land($, startOn(one, now.list.filter(it => it.enabled).length))
+}
+
+/**
+ * Back to the list from a provider or the form, the ring on the provider that was open. `regain` asks for the keys
+ * first, for when Escape has handed them to the prompt: the ring moves once the pane holds them again.
+ */
+const toList = async ($: EngineInterface, regain = false) => {
+  const now = await read($, providers)
+  draft = { name: '', url: '', model: '', key: '' }
+  await update($, providers, (was): Providers => ({ ...was, mode: 'list', note: '', isError: false }))
+
+  if (regain) {
+    await $.ui.open(seat(now.list.length))
+  }
+
+  await land($, now.list.some(one => one.name === now.editing) ? `row-${now.editing}` : 'provider-add')
+}
+
+/** Sends the form to `dsk provider add` or `set`; on success, to the list for a new provider, else back to its view. */
 const save = async ($: EngineInterface) => {
   const now = await read($, providers)
   const field = { name: draft.name.trim(), url: draft.url.trim(), model: draft.model.trim(), key: draft.key.trim() }
@@ -774,11 +830,9 @@ const save = async ($: EngineInterface) => {
     return
   }
 
-  const failed = async (said: string) => {
-    await update($, providers, was => ({ ...was, note: said, isError: true }))
+  const failed = async (text: string) => {
+    await update($, providers, was => ({ ...was, note: text, isError: true }))
   }
-  const answer = (ran: { isOk: boolean; text: string } | undefined) =>
-    (ran?.text ?? '').trim() || 'dsk did not answer. Is it on PATH and up to date?'
   const old = now.list.find(one => one.name === now.editing)
   const saidAll: string[] = []
 
@@ -788,12 +842,12 @@ const save = async ($: EngineInterface) => {
     const renamed = await dsk($, ['provider', 'rename', now.editing, field.name])
 
     if (renamed?.isOk !== true) {
-      await failed(answer(renamed))
+      await failed(said(renamed))
 
       return
     }
 
-    saidAll.push(answer(renamed))
+    saidAll.push(said(renamed))
     await update($, providers, was => ({ ...was, editing: field.name }))
   }
 
@@ -813,40 +867,63 @@ const save = async ($: EngineInterface) => {
     const ran = await dsk($, field.key === '' ? args : [...args, '--key-stdin'], field.key === '' ? undefined : field.key)
 
     if (ran?.isOk !== true) {
-      await refresh($, { note: [...saidAll, answer(ran)].join('\n'), isError: true })
+      await refresh($, { note: [...saidAll, said(ran)].join('\n'), isError: true })
 
       return
     }
 
-    saidAll.push(answer(ran))
+    saidAll.push(said(ran))
   }
 
   draft = { name: '', url: '', model: '', key: '' }
   await refresh($, {
-    mode: 'list',
-    editing: '',
+    mode: now.mode === 'add' ? 'list' : 'provider',
+    editing: field.name,
     note: saidAll.join('\n') || `${field.name}: nothing to change`,
     isError: false,
   })
-}
-
-/** Gives an enabled provider its place on the route: 1 is tried first. */
-const moveTo = async ($: EngineInterface, one: Provider, place: string) => {
-  if (place === String(one.position)) {
-    return
-  }
-
-  const ran = await dsk($, ['provider', 'move', one.name, place])
-  await refresh($, { note: (ran?.text ?? '').trim(), isError: ran?.isOk !== true })
+  await land($, now.mode === 'add' ? `row-${field.name}` : 'act-edit')
 }
 
 const ORDINALS = ['1st', '2nd', '3rd']
 const ordinal = (place: number) => ORDINALS[place - 1] ?? `${place}th`
 
-/** Back to the list without saving. */
+/**
+ * Gives an enabled provider its place among the `last` on the route: 1 is tried first. A place it already has, or
+ * one past either end, runs nothing and says where it stands. dsk makes a place chosen here the order from then on,
+ * whatever the speed test measured.
+ */
+const moveTo = async ($: EngineInterface, one: Provider, place: number, last: number) => {
+  const at = one.position ?? 1
+
+  if (place === at || place < 1 || place > last) {
+    const where = at === 1 ? 'first' : at === last ? 'last' : ordinal(at)
+    await update($, providers, was => ({ ...was, note: `${one.name} is already tried ${where}.`, isError: false }))
+
+    return
+  }
+
+  const ran = await dsk($, ['provider', 'move', one.name, String(place)])
+  await refresh($, { note: said(ran), isError: ran?.isOk !== true })
+}
+
+/** Sets what decides who is tried first: the priority as listed, or the speed test. */
+const orderBy = async ($: EngineInterface, order: 'listed' | 'fastest') => {
+  const ran = await dsk($, ['provider', 'order', order])
+  await refresh($, { note: said(ran), isError: ran?.isOk !== true })
+}
+
+/** Leaves the form without saving: back to the provider it was changing, or to the list. */
 const cancel = async ($: EngineInterface) => {
+  const now = await read($, providers)
   draft = { name: '', url: '', model: '', key: '' }
-  await update($, providers, (was): Providers => ({ ...was, mode: 'list', editing: '', note: '', isError: false }))
+  await update($, providers, (was): Providers => ({
+    ...was,
+    mode: now.mode === 'edit' ? 'provider' : 'list',
+    note: '',
+    isError: false,
+  }))
+  await land($, now.mode === 'edit' ? 'act-edit' : 'provider-add')
 }
 
 /**
@@ -859,7 +936,9 @@ const toggle = async ($: EngineInterface, one: Provider, on = !one.enabled) => {
   }
 
   const ran = await dsk($, ['provider', on ? 'enable' : 'disable', one.name])
-  await refresh($, { note: (ran?.text ?? '').trim(), isError: ran?.isOk !== true })
+  await refresh($, { note: said(ran), isError: ran?.isOk !== true })
+  // Its view lists other actions now: the ring stays on the one just pressed.
+  await land($, 'act-toggle')
 }
 
 const hidden = (key: string) => (key === '' ? '' : `•••• ${key.slice(-4)}`)
@@ -1116,9 +1195,9 @@ const show = async ($: EngineInterface, id: string, kind: 'diff' | 'log') => {
 
 /** Opens the settings pane, and says in a line how dsk is set up. */
 const configure = async ($: EngineInterface) => {
-  await refresh($, { mode: 'list', editing: '' })
-  await $.ui.open({ id: SETUP, title: 'dsk config', focus: true })
+  await refresh($, { mode: 'list', editing: '', note: '', isError: false })
   const now = await read($, providers)
+  await $.ui.open(seat(now.list.length))
   const used = now.list.filter(one => one.enabled).map(one => `${one.name} (${one.model})`)
   const searchOnly = now.list.filter(one => !one.enabled && one.official).map(one => one.name)
   const off = now.list.filter(one => !one.enabled && !one.official).map(one => one.name)
@@ -1127,7 +1206,7 @@ const configure = async ($: EngineInterface) => {
   return {
     text: now.isError
       ? now.note
-      : `${state}The work goes to ${used.join(' → ') || 'nothing'}${searchOnly.length > 0 ? `; web search only: ${searchOnly.join(', ')}` : ''}${off.length > 0 ? `; disabled: ${off.join(', ')}` : ''}. Web search: ${now.search ? 'on' : 'off, no DeepSeek key'}. In the dsk config pane: add, edit or rename a provider, set its priority, enable or disable it, and choose whether official DeepSeek serves web search only or work as well.`,
+      : `${state}The work goes to ${used.join(' → ') || 'nothing'}${searchOnly.length > 0 ? `; web search only: ${searchOnly.join(', ')}` : ''}${off.length > 0 ? `; disabled: ${off.join(', ')}` : ''}. Web search: ${now.search ? 'on' : 'off, no DeepSeek key'}. In the dsk config pane: ↑/↓ and Enter open a provider to set its priority, edit, enable or disable it; Route order chooses between your priority and the fastest first; Esc closes it.`,
   }
 }
 
@@ -1153,17 +1232,50 @@ export const register: Register = on => {
     return next(e)
   })
 
+  // The settings: a list, one provider's view with what can be done to it, and the form. Every row is one control
+  // and nothing sits beside anything: the engine gives a pane's controls Tab, the up and down arrows and Enter, and
+  // hands the left and right arrows to the prompt, where the left one opens the agents view over the pane.
   on('ui.render', { component: 'Pane', requestId: SETUP }, async ($, e) => {
-    const { Box, Text, Button, Input, Select } = $.ui.resolve(e)
+    const { Box, Text, Button, Input } = $.ui.resolve(e)
     const now = await read($, providers)
+    const columns = Math.max(30, e.props.bodyColumns)
     const note =
       now.note === '' ? null : (
         <Text color={now.isError ? 'error' : 'success'} wrap="wrap">
-          {now.note}
+          {`${now.isError ? '✘' : '✔'} ${now.note}`}
         </Text>
       )
+    // Rows a text takes once wrapped to the pane, counted high so the keys line never promises too much.
+    const tall = (text: string) => Math.ceil((text.length + 8) / columns)
+    // The keys that move the ring. The engine walks a pane's controls with the arrows only while all of it shows;
+    // in one cut short the arrows scroll, and Tab walks.
+    const moves = (rows: number) =>
+      rows <= e.props.scroll.bodyRows ? '↑/↓ to move' : 'Tab to move · ↑/↓ to scroll'
+    // One row of a menu, two cells in: its hotkey when it has one, then its words, all of it one control.
+    const item = (
+      key: string,
+      label: string,
+      parts: RenderNode[],
+      onPress: () => unknown,
+      more: { hotkey?: string; isStart?: boolean; isDim?: boolean } = {},
+    ) => (
+      <Box>
+        <Text>{'  '}</Text>
+        <Button
+          key={key}
+          label={label}
+          plain
+          {...(more.hotkey === undefined ? {} : { hotkey: more.hotkey })}
+          {...(more.isStart === true ? { autoFocus: true as const } : {})}
+          {...(more.isDim === true ? { dimColor: true } : {})}
+          onPress={onPress}
+        >
+          {parts}
+        </Button>
+      </Box>
+    )
 
-    if (now.mode !== 'list') {
+    if (now.mode === 'add' || now.mode === 'edit') {
       const isAdd = now.mode === 'add'
       const was = now.list.find(one => one.name === now.editing)
 
@@ -1172,8 +1284,8 @@ export const register: Register = on => {
           <Text bold>{isAdd ? 'Add a provider' : `Edit ${now.editing}`}</Text>
           <Text dimColor wrap="wrap">
             {isAdd
-              ? 'Any OpenAI-compatible API that serves a DeepSeek model. Tab or ↓ moves to the next field; Enter in the last one saves.'
-              : `Change any field; an empty API key keeps the one in ${was?.key_env ?? 'its variable'}. Enter in the last field saves.`}
+              ? 'Any OpenAI-compatible API that serves a DeepSeek model.'
+              : `Change any field; an empty API key keeps the one in ${was?.key_env ?? 'its variable'}.`}
           </Text>
           <Text> </Text>
           <Input
@@ -1232,134 +1344,245 @@ export const register: Register = on => {
             <Text dimColor wrap="wrap">{`Renames ${now.editing} to ${draft.name.trim()}; its key and place on the route stay. Running jobs carry on.`}</Text>
           )}
           <Text> </Text>
-          <Box>
-            <Button key="provider-save" label={isAdd ? 'add' : 'save'} onPress={() => save($)} />
-            <Text> </Text>
-            <Button key="provider-cancel" label="cancel" onPress={() => cancel($)} />
-          </Box>
+          {item('provider-save', isAdd ? 'Add' : 'Save', [isAdd ? 'Add the provider' : 'Save the changes'], () => save($))}
+          {item('provider-cancel', 'Cancel', ['Cancel'], () => cancel($))}
+          <Text> </Text>
           {note}
           <Text dimColor wrap="wrap">
             The key goes to ~/.config/dsk/env, readable by you alone; the rest to ~/.config/dsk/config.json.
           </Text>
+          <Text dimColor wrap="wrap">Tab to the next field · Enter in the last field to save · Esc to go back</Text>
+        </Box>
+      )
+    }
+
+    const used = now.list.filter(one => one.enabled)
+
+    if (now.mode === 'provider') {
+      const one = now.list.find(it => it.name === now.editing)
+
+      if (one === undefined) {
+        return (
+          <Box flexDirection="column">
+            <Text color="warning" wrap="wrap">{`There is no provider named ${now.editing} any more.`}</Text>
+            {item('act-back', 'Back', ['Back to the list'], () => toList($), { hotkey: 'b', isStart: true })}
+          </Box>
+        )
+      }
+
+      const last = used.length
+      const at = one.position ?? 0
+      const canMove = one.enabled && last > 1
+      const start = startOn(one, last)
+      // An action that would change nothing stays in its place, dim, so the ring keeps its row from press to press.
+      const act = (key: string, hotkey: string, text: string, onPress: () => unknown, why = '') =>
+        item(key, text, why === '' ? [text] : [text, <Text dimColor>{`  ${why}`}</Text>], onPress, {
+          hotkey,
+          isStart: key === start,
+          isDim: why !== '',
+        })
+      // One Text a line: parts side by side in a Box squeeze each other in a narrow pane.
+      const fact = (label: string, value: string, color?: Color) => (
+        <Text wrap="truncate-end">
+          <Text dimColor>{`  ${label.padEnd(9)}`}</Text>
+          <Text color={color}>{value}</Text>
+        </Text>
+      )
+      const route = used.map(it => it.name).join(' → ')
+      const state: { mark: string; color: Color; text: string } = one.enabled
+        ? {
+            mark: one.key ? '●' : '▲',
+            color: one.key ? 'success' : 'warning',
+            text:
+              last < 2
+                ? 'does the work, the only provider on the route'
+                : now.isFastest
+                  ? `on the route, your ${ordinal(at)} of ${last}; the speed test decides who is tried first`
+                  : `on the route, tried ${ordinal(at)} of ${last}`,
+          }
+        : one.official
+          ? { mark: '◇', color: 'claude', text: 'web search only, it does no work' }
+          : { mark: '○', color: 'inactive', text: 'disabled' }
+      // The rows of this view: its name, state and facts, the route, the actions, what dsk said, and the keys.
+      const need =
+        1 + tall(state.text) + 1 + 3 + (typeof one.seconds === 'number' ? 1 : 0) +
+        (canMove ? tall(`Route ${route}`) + (now.isFastest ? 2 : 0) : 0) +
+        1 + (canMove ? 6 : 3) + 1 + (now.note === '' ? 0 : now.note.split('\n').reduce((sum, line) => sum + tall(line), 0)) + 2
+
+      return (
+        <Box flexDirection="column">
+          <Text bold>{one.name}</Text>
+          <Text wrap="wrap">
+            <Text color={state.color}>{`${state.mark} `}</Text>
+            <Text dimColor>{state.text}</Text>
+          </Text>
+          <Text> </Text>
+          {fact('Model', one.model)}
+          {fact('API URL', one.base_url)}
+          {fact('API key', one.key ? `set, in ${one.key_env}` : `missing: ${one.key_env} is not set, Edit sets it`, one.key ? undefined : 'warning')}
+          {typeof one.seconds === 'number' && fact('Speed', `${one.seconds.toFixed(2)}s at the last speed test`)}
+          {canMove && (
+            <Text wrap="wrap">
+              <Text dimColor>{`  ${'Route'.padEnd(9)}`}</Text>
+              {used.flatMap((it, index) => [
+                ...(index === 0 ? [] : [<Text dimColor> → </Text>]),
+                <Text color={it.name === one.name ? 'suggestion' : undefined} bold={it.name === one.name} dimColor={it.name !== one.name}>
+                  {it.name}
+                </Text>,
+              ])}
+            </Text>
+          )}
+          {canMove && now.isFastest && (
+            <Text dimColor wrap="wrap">
+              {'  A place given here makes your priority count again, in place of the speed test.'}
+            </Text>
+          )}
+          <Text> </Text>
+          {canMove && act('act-first', 'f', 'Try first', () => moveTo($, one, 1, last), at === 1 ? 'it is first' : '')}
+          {canMove && act('act-up', 'u', 'Move up', () => moveTo($, one, at - 1, last), at === 1 ? 'it is first' : '')}
+          {canMove && act('act-down', 'd', 'Move down', () => moveTo($, one, at + 1, last), at === last ? 'it is last' : '')}
+          {act('act-edit', 'e', 'Edit name, URL, model or key', () => openForm($, one))}
+          {act(
+            'act-toggle',
+            one.enabled ? 'x' : 'n',
+            one.official
+              ? one.enabled
+                ? 'Use for web search only'
+                : 'Use for work as well'
+              : one.enabled
+                ? 'Disable'
+                : 'Enable',
+            () => toggle($, one),
+          )}
+          {item('act-back', 'Back', ['Back to the list'], () => toList($), { hotkey: 'b' })}
+          <Text> </Text>
+          {note}
+          <Text dimColor wrap="wrap">{`Enter to select · ${moves(need)} · Esc to go back`}</Text>
         </Box>
       )
     }
 
     const shownOn = await read($, isOn)
-    const used = now.list.filter(one => one.enabled)
     const searchOnly = now.list.filter(one => !one.enabled && one.official)
     const off = now.list.filter(one => !one.enabled && !one.official)
-    const places = used.map((_, index) => ({ value: String(index + 1), label: ordinal(index + 1) }))
-    const row = (one: Provider) => (
-      <Box flexDirection="column">
-        <Box>
-          <Text color={one.enabled ? (one.key ? 'success' : 'warning') : one.official && one.key ? 'claude' : 'inactive'}>
-            {one.enabled ? (one.key ? '● ' : '▲ ') : one.official ? '◇ ' : '○ '}
-          </Text>
-          <Text color={one.enabled ? undefined : 'inactive'} bold={one.enabled}>
-            {`${one.enabled ? `${one.position}. ` : ''}${one.name}`}
-          </Text>
-          <Text dimColor wrap="truncate-end">{`  ${one.model} · ${one.base_url}`}</Text>
-        </Box>
-        <Box flexWrap="wrap">
-          <Text>{'    '}</Text>
-          {!one.key && <Text color="warning">{`no key in ${one.key_env} · `}</Text>}
-          <Button key={`edit-${one.name}`} label="edit" onPress={() => openForm($, one)} />
-          <Text> </Text>
-          {one.enabled && used.length > 1 && (
-            <Box>
-              <Select
-                key={`place-${one.name}`}
-                label="priority"
-                options={places}
-                value={String(one.position ?? 1)}
-                onSelect={place => moveTo($, one, place)}
-              />
-              <Text> </Text>
-            </Box>
-          )}
-          {one.official ? (
-            <Select
-              key={`use-${one.name}`}
-              label="use for"
-              options={[
-                { value: 'work', label: 'web search and work' },
-                { value: 'search', label: 'web search only' },
-              ]}
-              value={one.enabled ? 'work' : 'search'}
-              onSelect={use => toggle($, one, use === 'work')}
-            />
-          ) : (
-            <Button
-              key={`toggle-${one.name}`}
-              label={one.enabled ? 'disable' : 'enable'}
-              onPress={() => toggle($, one)}
-            />
-          )}
-        </Box>
-      </Box>
-    )
+    const wide = Math.min(18, Math.max(8, ...now.list.map(one => one.name.length)))
+    // Where the ring starts when the pane takes the keys: the provider last open, else the first one. Not the
+    // rows above them, where a stray Enter would turn something off.
+    const start = now.list.some(one => one.name === now.editing)
+      ? `row-${now.editing}`
+      : now.list[0] === undefined
+        ? 'provider-add'
+        : `row-${now.list[0].name}`
+    // A provider's row: its place, which is also the key that opens it, its name, and where its work goes.
+    const row = (one: Provider) => {
+      const hotkey = one.enabled && (one.position ?? 10) <= 9 ? String(one.position) : undefined
+      const mark = hotkey !== undefined ? '' : one.enabled ? `${one.position}.`.padEnd(3) : one.official ? '◇  ' : '○  '
+      // What a provider off the route is for, said on its row: a heading over each group would cost the list rows.
+      const tag = one.enabled ? '' : one.official ? 'web search only · ' : 'disabled · '
+      const speed = now.isFastest && one.enabled && typeof one.seconds === 'number' ? ` · ${one.seconds.toFixed(2)}s` : ''
+      const lack = one.key ? '' : ' · no key'
+      const room = columns - 2 - 3 - wide - 2 - tag.length - speed.length - lack.length
+      const where = `${one.model} · ${one.base_url.replace(/^https?:\/\//, '')}`
+
+      return item(
+        `row-${one.name}`,
+        one.name,
+        [
+          `${mark}${cut(one.name, wide).padEnd(wide)}  `,
+          <Text dimColor>{`${tag}${cut(where, Math.max(8, room))}${speed}`}</Text>,
+          ...(lack === '' ? [] : [<Text color="warning">{lack}</Text>]),
+        ],
+        () => openProvider($, one),
+        { ...(hotkey === undefined ? {} : { hotkey }), isStart: `row-${one.name}` === start },
+      )
+    }
+    // A setting's row: its name, what it is set to, and what that means; Enter changes it.
+    const setting = (key: string, name: string, value: string, color: Color | undefined, means: string, onPress: () => unknown) =>
+      item(
+        key,
+        name,
+        [
+          name.padEnd(13),
+          <Text color={color}>{value}</Text>,
+          <Text dimColor>{cut(`  ${means}`, Math.max(8, columns - 2 - 13 - value.length))}</Text>,
+        ],
+        onPress,
+      )
+    const open = used.length === 0 ? '' : used.length === 1 ? ' · 1 to open it' : ` · 1–${Math.min(9, used.length)} to open a provider`
+
+    const about =
+      used.length === 0
+        ? 'No provider is enabled: open one to enable it, or add one.'
+        : now.isFastest && used.length > 1
+          ? 'The fastest in the speed test is tried first; the next takes over when one fails. Giving a provider a place makes your priority count again.'
+          : 'The first that answers does the work; the next takes over when one fails.'
+    const search = 'Web search (--web) is off: it needs a DeepSeek API key (DEEPSEEK_API_KEY).'
+    const keys = `Enter to select${open} · Esc to close`
+    // The rows of the list: its title, the settings, the providers under their line, what dsk said, and the keys.
+    const need =
+      1 + 2 + 1 + 1 + tall(about) + now.list.length + 1 + 1 + (now.search ? 0 : tall(search)) +
+      (now.note === '' ? 0 : now.note.split('\n').reduce((sum, line) => sum + tall(line), 0)) + tall(`${keys} · Tab to move · ↑/↓ to scroll`)
 
     return (
       <Box flexDirection="column">
         <Box>
-          <Text bold>{`dsk${shownVersion === '' ? '' : ` ${shownVersion}`} `}</Text>
-          <Text color={shownOn ? 'success' : 'inactive'} bold>
-            {shownOn ? '● on' : '○ off'}
-          </Text>
-          <Text>  </Text>
-          <Button
-            key="dsk-power"
-            label={shownOn ? 'turn off' : 'turn on'}
-            onPress={() => power($, !shownOn)}
-          />
+          <Text bold>{`dsk${shownVersion === '' ? '' : ` ${shownVersion}`}`}</Text>
+          <Text dimColor> · settings</Text>
         </Box>
-        <Text dimColor wrap="wrap">
-          {shownOn
-            ? 'On: running jobs show above the prompt and /dsk lists them. It stays on in the sessions you start after this one.'
-            : 'Off: nothing is read or drawn. It stays off in the sessions you start after this one.'}
-        </Text>
+        {setting(
+          'dsk-power',
+          'Job display',
+          shownOn ? '● on' : '○ off',
+          shownOn ? 'success' : 'inactive',
+          shownOn ? 'running jobs show above the prompt, /dsk lists them' : 'nothing is read or drawn',
+          () => power($, !shownOn),
+        )}
+        {setting(
+          'route-order',
+          'Route order',
+          now.isFastest ? 'fastest first' : 'your priority',
+          now.isFastest ? 'warning' : undefined,
+          now.isFastest ? 'the speed test decides who is tried first' : 'providers are tried as numbered below',
+          () => orderBy($, now.isFastest ? 'listed' : 'fastest'),
+        )}
         <Text> </Text>
         <Text bold>Providers</Text>
         <Text dimColor wrap="wrap">
-          {used.length > 0
-            ? `The work goes to ${used.map(one => one.name).join(' → ')}: the first that answers; the next takes over when one fails.${used.length > 1 ? ' Priority sets which is tried 1st, 2nd and so on.' : ''}`
-            : 'No provider is enabled: add one or enable one below.'}
+          {about}
         </Text>
-        {now.isFastest && used.length > 1 && (
+        {used.map(row)}
+        {searchOnly.map(row)}
+        {off.map(row)}
+        {item('provider-add', 'Add a provider', ['+  Add a provider'], () => openForm($), { isStart: start === 'provider-add' })}
+        <Text> </Text>
+        {!now.search && (
           <Text color="warning" wrap="wrap">
-            route_order is fastest in config.json: the measured fastest is tried first, whatever the priority below says.
+            {search}
           </Text>
         )}
-        <Text> </Text>
-        {used.map(row)}
-        {searchOnly.length > 0 && (
-          <Box flexDirection="column">
-            <Text> </Text>
-            <Text dimColor>Web search only</Text>
-            {searchOnly.map(row)}
-          </Box>
-        )}
-        {off.length > 0 && (
-          <Box flexDirection="column">
-            <Text> </Text>
-            <Text dimColor>Disabled</Text>
-            {off.map(row)}
-          </Box>
-        )}
-        <Text> </Text>
-        <Box>
-          <Button key="provider-add" label="+ add provider" onPress={() => openForm($)} />
-        </Box>
-        <Text dimColor wrap="wrap">
-          A provider you add is tried before official DeepSeek; priority changes that.
-        </Text>
-        <Text color={now.search ? undefined : 'warning'} dimColor={now.search} wrap="wrap">
-          {`Web search (--web): ${now.search ? 'on, through official DeepSeek' : 'off, it needs a DeepSeek API key (DEEPSEEK_API_KEY)'}`}
-        </Text>
         {note}
+        <Text dimColor wrap="wrap">{`Enter to select · ${moves(need)}${open} · Esc to close`}</Text>
       </Box>
     )
+  })
+
+  // Escape, or the close mark, in a provider's view or the form goes back to the list; from the list it closes.
+  on('ui.close', { id: SETUP }, async ($, e, next) => {
+    const now = await read($, providers)
+
+    if (e.origin.kind !== 'person' || now.mode === 'list') {
+      return next(e)
+    }
+
+    try {
+      // Escape gave the keys back to the prompt before it asked to close: the list asks for them again.
+      await toList($, true)
+    } catch {
+      // Rather closed than a pane that no key closes.
+      return next(e)
+    }
+
+    return { value: undefined }
   })
 
   on('command.run', { command: COMMAND }, async ($, e) => {

@@ -93,19 +93,40 @@ One command, typed like any other slash command, with a word after it for all bu
 A provider is an API that serves a DeepSeek model: DeepSeek's own (`official`), or any OpenAI-compatible endpoint you add (a custom provider). `/dsk config` lists them in the order a run tries them, each with its model, its endpoint and whether its key is set. It looks roughly like this:
 
 ```
-dsk 0.10.0 ● on  [ turn off ]
+dsk 0.10.3 · settings
+  Job display  ● on  running jobs show above the prompt, /dsk lists them
+  Route order  your priority  providers are tried as numbered below
 
 Providers
-The work goes to myhost → official: the first that answers; the next takes over when one fails.
+The first that answers does the work; the next takes over when one fails.
+  1: myhost    deepseek-v4.1-flash · example.com/v1
+  2: official  deepseek-flash · api.deepseek.com
+  ○  spare     disabled · deepseek-v4.1-flash · spare.example.com/v1
+  +  Add a provider
 
-● 1. myhost    deepseek-v4.1-flash · https://example.com/v1
-    [ edit ] priority 1st  [ disable ]
-● 2. official  deepseek-flash · https://api.deepseek.com
-    [ edit ] priority 2nd  use for web search and work
-
-[ + add provider ]
-Web search (--web): on, through official DeepSeek
+Enter to select · ↑/↓ to move · 1–2 to open a provider · Esc to close
 ```
+
+Every row is one control: ↑ and ↓ (or Tab) move between rows, Enter presses the one that is lit, and a provider's number opens it. A provider opens into its own view, with its model, endpoint, key and place on the route, and what can be done with it:
+
+```
+myhost
+● on the route, tried 1st of 2
+
+  Model    deepseek-v4.1-flash
+  API URL  https://example.com/v1
+  API key  set, in DSK_MYHOST_API_KEY
+  Route    myhost → official
+
+  f: Try first  it is first
+  u: Move up  it is first
+  d: Move down
+  e: Edit name, URL, model or key
+  x: Disable
+  b: Back to the list
+```
+
+Esc goes back to the list, and from the list closes the pane. In a pane too short to show all of a view, the arrows scroll it and Tab moves between rows; the line of keys at the bottom says which holds. Claude Code keeps the left and right arrows for the prompt, so nothing in the pane uses them.
 
 **Who does what.** Web search and the work are set apart:
 
@@ -116,11 +137,12 @@ Web search (--web): on, through official DeepSeek
 | A custom provider only, no DeepSeek key | the custom provider | not available: it needs a DeepSeek API key |
 
 - **Official DeepSeek always serves web search** once its key is entered, whatever else is set up. Web search has no other provider.
-- **A custom provider is tried first.** One you add with `+ add provider` goes ahead of official DeepSeek on the route (and after the custom providers you already have); so does one you enable again. Picking `custom` in the install form goes further: every task runs on the custom endpoint, and official DeepSeek is left with web search only.
-- **Official DeepSeek: web search only, or work as well.** Its row has a `use for` picker with two choices. `web search only` takes it off the route: no task is ever sent to it, and it moves under a "Web search only" heading. `web search and work` puts it back, as the last provider tried. dsk refuses `web search only` while official is the only provider that can do the work.
-- **Priority.** With more than one provider enabled, each row has a `priority` picker: `1st` is tried first, `2nd` takes over when it fails, and so on. Picking a place moves that provider there and shifts the others.
-- **The model.** `edit` on a provider opens its name, API URL, model name and API key. Change **Model name** to the model id as that endpoint lists it and save. `official` starts as `deepseek-flash`; a custom provider uses whatever you entered. An empty API key field keeps the key you have. `dsk doctor` then tests the key and the model against the provider.
-- **Add, rename, disable.** `+ add provider` asks for a name, API URL, model name and API key. A rename keeps the key and the place on the route, and running jobs carry on. `disable` takes a custom provider off the route without deleting it; `enable` puts it back.
+- **A custom provider is tried first.** One you add with `+ Add a provider` goes ahead of official DeepSeek on the route (and after the custom providers you already have); so does one you enable again. Picking `custom` in the install form goes further: every task runs on the custom endpoint, and official DeepSeek is left with web search only.
+- **Official DeepSeek: web search only, or work as well.** Its view has one action for it. `Use for web search only` takes it off the route: no task is ever sent to it, and its row says `web search only`. `Use for work as well` puts it back, as the last provider tried. dsk refuses web search only while official is the only provider that can do the work.
+- **Priority.** With more than one provider enabled, a provider's view has `Try first`, `Move up` and `Move down`: the number on its row is its place, `1` is tried first, `2` takes over when it fails, and so on. The view stays open after a move, so pressing again moves it further.
+- **Your priority, or the fastest first.** `Route order` in the list chooses what decides who is tried first: `your priority`, the numbers, or `fastest first`, the speed test (`"route_order": "fastest"`). Giving a provider a place is a choice of priority, so it sets the order back to `your priority`; pressing `Route order` brings the fastest first back.
+- **The model.** `Edit` on a provider opens its name, API URL, model name and API key. Change **Model name** to the model id as that endpoint lists it and save. `official` starts as `deepseek-flash`; a custom provider uses whatever you entered. An empty API key field keeps the key you have. `dsk doctor` then tests the key and the model against the provider.
+- **Add, rename, disable.** `+ Add a provider` asks for a name, API URL, model name and API key. A rename keeps the key and the place on the route, and running jobs carry on. `Disable` takes a custom provider off the route without deleting it; `Enable` puts it back.
 - **Where it is kept.** The pane writes `~/.config/dsk/config.json` (every other setting in it is kept) and puts keys in `~/.config/dsk/env`, readable by you alone. Both win over the install form.
 
 The same from a shell:
@@ -130,12 +152,13 @@ dsk provider list                                  # the route in order, and who
 echo "$KEY" | dsk provider add myhost --url https://example.com/v1 --model deepseek-v4.1-flash --key-stdin
 dsk provider set official --model deepseek-flash   # change a model; --url and --key-stdin change the rest
 dsk provider move myhost 1                         # priority: tried first
+dsk provider order fastest                         # the speed test decides who is tried first; `listed` is your priority
 dsk provider disable official                      # official DeepSeek: web search only
 dsk provider enable official                       # official DeepSeek: web search and work, tried last
 dsk provider rename myhost fast
 ```
 
-With `"route_order": "fastest"` in `config.json`, the provider measured fastest is tried first, whatever the priority says; `/dsk config` and `dsk provider list` say so when it is set. See [docs/configuration.md](docs/configuration.md#providers).
+With `"route_order": "fastest"` in `config.json`, which `dsk provider order fastest` and `Route order` in the pane write, the provider measured fastest is tried first, whatever the priority says; `/dsk config` and `dsk provider list` say so when it is set. A `dsk provider move` or `up` after that sets it back to `listed`: a place you choose counts. See [docs/configuration.md](docs/configuration.md#providers).
 
 ## Hand over a task
 
@@ -275,7 +298,7 @@ It is the session that wrote the first generator of this page's images: 7 turns 
 | Hooks module | `hooks/register.tsx` | the display and the command `/dsk`; TypeScript, because Claude Code runs it itself |
 | CLI | `scripts/dsk.py` | everything else. Claude Code never loads it, it only runs it |
 
-The Stop hook and the two configure hooks are always on. The display is not: `/dsk on` turns it on and `/dsk off` turns it off (or the button in `/dsk config`), in the session where you type it and in the sessions you start afterwards. `/dsk` lists the jobs. Off, it reads nothing and draws nothing. Every command is in [In Claude Code](#in-claude-code).
+The Stop hook and the two configure hooks are always on. The display is not: `/dsk on` turns it on and `/dsk off` turns it off (or `Job display` in `/dsk config`), in the session where you type it and in the sessions you start afterwards. `/dsk` lists the jobs. Off, it reads nothing and draws nothing. Every command is in [In Claude Code](#in-claude-code).
 
 What the display draws, and how the form's answers reach `dsk`: [docs/plugin.md](docs/plugin.md).
 
@@ -312,7 +335,7 @@ What is known not to work yet: [docs/limits.md](docs/limits.md).
 | `stats [ID ...]` | what sessions measured: outcomes, where the turns went, tokens, time, per profile |
 | `search "query"`, `fetch URL` | raw web search and page fetch, no model |
 | `doctor`, `bench`, `configure` | check each profile; time each provider, fastest first; how dsk is set up, with its version |
-| `provider list\|add\|set\|rename\|move\|up\|enable\|disable` | what `/dsk config` runs: the providers, their models and keys, their priority, and whether official DeepSeek does work or web search only |
+| `provider list\|add\|set\|rename\|move\|up\|order\|enable\|disable` | what `/dsk config` runs: the providers, their models and keys, their priority, whether the priority or the speed test decides who is tried first, and whether official DeepSeek does work or web search only |
 
 ## Tests
 
