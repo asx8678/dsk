@@ -13,7 +13,7 @@ Targets: a median of 6 turns or fewer, a cached share of 0.9 from turn 3 on, fai
 """
 import argparse, concurrent.futures, json, os, secrets, shutil, statistics, subprocess, sys, tempfile, time
 
-DSK = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "skill", "scripts", "dsk.py")
+DSK = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "skill", "scripts", "start.mjs")
 IGNORE = "__pycache__/\n*.pyc\n"
 DURATIONS = '''import re
 
@@ -124,7 +124,7 @@ def run_one(task, profile, state):
         for cmd in (["init", "-q"], ["add", "-A"], ["-c", "user.name=t", "-c", "user.email=t@t", "commit", "-qm", "init"]):
             subprocess.run(["git", *cmd], cwd=work, check=True, capture_output=True)
     started = time.time()
-    done = subprocess.run([sys.executable, DSK, "run", "--profile", profile, *args], cwd=work, capture_output=True,
+    done = subprocess.run(["node", DSK, "run", "--profile", profile, *args], cwd=work, capture_output=True,
                           text=True, env={**os.environ, "XDG_STATE_HOME": state})
     shutil.rmtree(work, ignore_errors=True)
     words = done.stdout.split()

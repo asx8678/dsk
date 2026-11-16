@@ -4,14 +4,79 @@ Run from the project root:  python3 -m unittest discover -s tests
 The scripted server covers what a real API cannot produce on demand (a 402, a cut-off reply, exact request
 bytes); tests/live.py runs real tasks against the real providers.
 """
-import ast, importlib.util, json, os, shutil, subprocess, sys, tempfile, threading, time, unittest
+import fcntl, importlib.util, json, os, pathlib, re, shlex, shutil, subprocess, sys, tempfile, threading, time, types, unittest
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from unittest import mock
 
-DSK = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "skill", "scripts", "dsk.py")
-spec = importlib.util.spec_from_file_location("dsk", DSK)
-dsk = importlib.util.module_from_spec(spec)
-spec.loader.exec_module(dsk)
+SCRIPTS = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "skill", "scripts")
+# The tests run dsk as the plugin does: node skill/scripts/start.mjs, which runs the build in dist/ while it matches the
+# sources, else the sources. DSK_CMD names another command. HOME moves into each test's temp directory, so that a
+# command that ignores XDG_STATE_HOME or XDG_CONFIG_HOME cannot reach the real ones.
+CMD = ([os.path.abspath(a) if os.path.exists(a) else a for a in shlex.split(os.environ["DSK_CMD"])]  # tests run elsewhere
+       if os.environ.get("DSK_CMD") else ["node", os.path.join(SCRIPTS, "start.mjs")])
+
+spec = importlib.util.spec_from_file_location("runner", os.path.join(SCRIPTS, "runner.py"))
+runner = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(runner)
+
+
+class Session:
+    """A session's log, one JSON record per line, read as dsk reads it: what the tests check of the state dsk keeps."""
+
+    def __init__(self, sid):
+        self.id, self.dir = sid, os.path.join(dsk.STATE, sid)
+        self.path = os.path.join(self.dir, "log.jsonl")
+        with open(self.path, encoding="utf-8") as f:  # a line torn by a crash has no newline: skip it
+            self.recs = [json.loads(line) for line in f if line.endswith("\n")]
+
+    def of(self, *types):
+        return [r for r in self.recs if r["t"] in types]
+
+    def last(self, *types):
+        return next((r for r in reversed(self.recs) if r["t"] in types), None)
+
+    head = property(lambda self: self.recs[0])
+
+    def status(self):
+        """The last state. A `running` session whose lock no process holds was interrupted, which dsk counts as `error`."""
+        status = self.last("state")["status"]
+        if status != "running":
+            return status
+        with open(os.path.join(self.dir, "lock"), "a") as f:
+            try:
+                fcntl.flock(f, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            except BlockingIOError:
+                return "running"
+        return "error"
+
+
+def texts():
+    """dsk's fixed texts, the prompts and messages of lib/texts.ts, as Node reads them."""
+    url = pathlib.Path(SCRIPTS, "lib", "texts.ts").resolve().as_uri()
+    js = "process.stdout.write(JSON.stringify(await import(process.argv[1])))"
+    done = subprocess.run(["node", "--input-type=module", "-e", js, url], capture_output=True, text=True, check=True)
+    return json.loads(done.stdout)
+
+
+def version():
+    """The plugin's version, from its manifest."""
+    with open(os.path.join(SCRIPTS, "..", ".claude-plugin", "plugin.json"), encoding="utf-8") as f:
+        return json.load(f)["version"]
+
+
+def sandbox_works(profile):
+    """Whether macOS's sandbox-exec applies `profile` here: not elsewhere, nor inside a sandbox, which macOS will not nest."""
+    try:
+        return subprocess.run(["/usr/bin/sandbox-exec", "-p", profile, "/usr/bin/true"], capture_output=True,
+                              timeout=30).returncode == 0
+    except (OSError, subprocess.SubprocessError):
+        return False
+
+
+# What the tests read of dsk itself: its fixed texts, the worker's imports and gate as runner.py has them, its version,
+# and its sessions' logs. Case points STATE at each test's own state directory.
+dsk = types.SimpleNamespace(**{**texts(), "IMPORTS": runner.IMPORTS}, gate=runner.gate, Session=Session, STATE=None,
+                            version=version, kilo=lambda n: f"{n / 1000:.1f}k")
 
 
 def script(body):
@@ -171,6 +236,8 @@ class Case(unittest.TestCase):
         self.env = {**os.environ, "XDG_STATE_HOME": f"{self.tmp}/state", "XDG_CONFIG_HOME": f"{self.tmp}/config",
                     "KEY_A": "sk-fake-a", "KEY_B": "sk-fake-b", "KEY_S": "sk-fake-search",
                     "GIT_CONFIG_GLOBAL": os.devnull, "GIT_CONFIG_NOSYSTEM": "1", "CLAUDE_CODE_SESSION_ID": ""}
+        os.makedirs(f"{self.tmp}/home")
+        self.env["HOME"] = f"{self.tmp}/home"
         self.config = {
             "route": ["a", "b"], "backoff": [0, 0],
             "profiles": {"a": {"base_url": self.api.url + "/a", "key_env": "KEY_A", "model": "model-a"},
@@ -188,275 +255,14 @@ class Case(unittest.TestCase):
         with open(f"{self.tmp}/config/dsk/config.json", "w") as f:
             json.dump(self.config, f)
 
-    def session(self, **head):
-        s = dsk.Session()
-        s.add("head", id=s.id, **{"effort": "off", "route": ["a", "b"], **head})
-        s.add("series", why="start", profile="a")
-        s.add("msg", turn=0, m={"role": "system", "content": dsk.SYSTEM})
-        s.add("msg", turn=0, m={"role": "user", "content": "task"})
-        return s
-
 
 class Wire(Case):
-    def test_body_has_fixed_order_one_static_tool_and_nothing_volatile(self):
-        profile, msgs = {"model": "m", "extra": {}}, [{"role": "user", "content": "héllo"}]
-        body = dsk.request_body(profile, "off", msgs)
-        self.assertEqual(body, dsk.request_body(dict(profile), "off", list(msgs)))
-        self.assertEqual(body, '{"model":"m","messages":[{"role":"user","content":"héllo"}],"tools":' + dsk.dumps(dsk.TOOLS)
-                         + ',"max_tokens":16000,"stream":true,"stream_options":{"include_usage":true},'
-                           '"tool_choice":"required","thinking":{"type":"disabled"},'
-                           '"reasoning_effort":"none","temperature":0}')
-        high = json.loads(dsk.request_body(profile, "high", msgs))
-        self.assertEqual((high["thinking"], high["reasoning_effort"], high["max_tokens"], high["tool_choice"]),
-                         ({"type": "enabled"}, "high", 64000, "auto"))
-        for absent in ("temperature", "top_p", "user_id"):
-            self.assertNotIn(absent, high)
-        self.assertEqual([(t["function"]["name"], list(t["function"]["parameters"]["properties"])) for t in high["tools"]],
-                         [("run_code", ["code"])])
-
-    def test_extra_overrides_and_null_removes(self):
-        profile = {"model": "m", "extra": {"thinking": None, "enable_thinking": False, "user_id": "dsk"}}
-        body = json.loads(dsk.request_body(profile, "off", []))
-        self.assertNotIn("thinking", body)
-        self.assertEqual((body["enable_thinking"], body["user_id"]), (False, "dsk"))
-        body = json.loads(dsk.request_body({"model": "m", "extra": {"stream": False}}, "off", []))
-        self.assertEqual((body["stream"], "stream_options" in body), (False, False))  # no streaming, no stream options
-
     def test_system_prompt_is_static(self):
         today = __import__("datetime").date.today()
         for volatile in (os.getcwd(), os.path.expanduser("~"), str(today.year), self.tmp):
             self.assertNotIn(volatile, dsk.SYSTEM)
         for module in dsk.IMPORTS:
             self.assertIn(module, dsk.SYSTEM)
-
-    def test_blank_keepalive_lines_are_tolerated(self):
-        self.api.replies = [{"content": "hello", "blank": 5}]
-        self.assertEqual(dsk.chat(self.session(), dsk.config()), ({"role": "assistant", "content": "hello"}, "stop"))
-
-    def test_a_provider_that_answers_json_even_when_stream_was_asked_still_runs_a_turn(self):
-        self.api.replies = [{"code": "print(1)", "json": True}]
-        s = self.session()
-        reply, finish = dsk.chat(s, dsk.config())
-        self.assertEqual((finish, reply["tool_calls"][0]["function"]["arguments"]), ("tool_calls", '{"code": "print(1)"}'))
-        self.assertIsNone(s.of("usage")[0]["first"])  # nothing was streamed, so nothing to time
-
-    def test_reply_is_kept_exactly_as_it_will_be_replayed(self):
-        self.api.replies = [{"arguments": '{"code":  "print(\\"é\\")" }'}]
-        reply, finish = dsk.chat(self.session(), dsk.config())
-        self.assertEqual((finish, list(reply)), ("tool_calls", ["role", "content", "tool_calls"]))
-        self.assertEqual(reply["tool_calls"], [{"id": "call_0_0", "type": "function", "function": {
-            "name": "run_code", "arguments": '{"code":  "print(\\"é\\")" }'}}])
-
-    def test_reasoning_is_replayed_only_when_thinking_is_on(self):
-        for effort, kept in (("high", True), ("off", False)):
-            self.api.replies = [{"code": "print(1)", "message": {"reasoning_content": "let me think"}}]
-            reply, _ = dsk.chat(self.session(effort=effort), dsk.config())
-            self.assertEqual(reply.get("reasoning_content"), "let me think" if kept else None)
-        self.api.replies = [{"code": "print(1)", "message": {"reasoning": "gateway spelling"}}]
-        self.assertEqual(dsk.chat(self.session(effort="low"), dsk.config())[0]["reasoning_content"], "gateway spelling")
-
-    def test_retry_sends_identical_bytes(self):
-        self.api.replies = [{"status": 503}, {"status": 429}, "ok"]
-        s = self.session()
-        self.assertEqual(dsk.chat(s, dsk.config())[0]["content"], "ok")
-        raws = [r["raw"] for r in self.api.chats()]
-        self.assertEqual(len(raws), 3)
-        self.assertEqual(len(set(raws)), 1)
-        self.assertEqual(len(s.of("req")), 1)
-
-    def test_profile_headers_hold_one_session_value_for_the_whole_run(self):
-        self.config["profiles"]["a"]["headers"] = {"x-opencode-session": "{session}", "x-fixed": "1"}
-        self.write_config()
-        self.api.replies = ["one", "two", "another run", {"status": 503}, {"status": 503}, {"status": 503}, "from b"]
-        s = self.session()
-        dsk.chat(s, dsk.config())
-        dsk.chat(dsk.Session(s.id), dsk.config())  # a later process, as after `dsk reject` or `dsk answer`
-        dsk.chat(self.session(), dsk.config())
-        moved = self.session()
-        dsk.chat(moved, dsk.config())
-        sent = [r["headers"] for r in self.api.chats()]
-        first, again, other = (h["x-opencode-session"] for h in sent[:3])
-        self.assertTrue(first.startswith(f"dsk-{s.id}-"))
-        self.assertEqual(first, again)
-        self.assertNotEqual(first, other)
-        self.assertEqual(sent[0]["x-fixed"], "1")
-        self.assertEqual(moved.profile, "b")  # a profile without `headers` sends only the usual three
-        self.assertNotIn("x-opencode-session", sent[-1])
-        self.assertEqual(sent[-1]["user-agent"], "dsk")
-
-    def test_only_errors_about_used_up_credit_count_as_spent(self):
-        for status, text in ((402, "Insufficient Balance"), (429, "You exceeded your current quota"),
-                             (400, "Go usage limit reached for this 5-hour window"), (403, "credit balance is too low"),
-                             (429, "Monthly token quota exceeded")):
-            self.assertTrue(dsk.spent(status, text), text)
-        for status, text in ((429, "[code=tier_limit_exceeded] membership concurrency limit exceeded: 11/10"),
-                             (429, "Your subscription allows 1 request at a time on this key"),
-                             (403, "This subscription key can only call deepseek-v4.1-flash-value."),
-                             (429, "Rate limit reached, slow down"), (500, "quota service unavailable"),
-                             (400, "This model's maximum context length limit exceeded: 1100000 tokens"),
-                             (400, "request size limit exceeded"), (400, "max_tokens limit exceeded: 400000 > 384000"),
-                             (400, "Prompt is too long: token limit exceeded")):
-            self.assertFalse(dsk.spent(status, text), text)
-
-    def test_used_up_credit_pauses_the_profile_for_every_run(self):
-        self.api.replies = [{"status": 402, "error": "Insufficient Balance"}, "from b", "b again"]
-        self.assertEqual(dsk.chat(self.session(), dsk.config())[0]["content"], "from b")
-        later = self.session()
-        self.assertEqual(dsk.chat(later, dsk.config())[0]["content"], "b again")
-        self.assertEqual([r["path"] for r in self.api.chats()], ["/a/chat/completions"] + ["/b/chat/completions"] * 2)
-        self.assertEqual(later.of("series")[-1]["status"], "paused")  # skipped without a request
-        self.assertAlmostEqual(dsk.paused("a"), time.time() + 3600, delta=60)  # pause_hours defaults to 1
-        shown = subprocess.run([sys.executable, DSK, "configure"], env=self.env, capture_output=True, text=True).stdout
-        self.assertRegex(shown, r"a:\s+\S+ · model-a · key set · paused until .*, credit used up")
-
-    def test_a_pause_ends_at_the_reset_time_the_error_names_and_the_last_profile_is_always_tried(self):
-        reset = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(time.time() + 7200))
-        self.api.replies = [{"status": 429, "error": f"usage limit reached, resets {reset}"}, "from b", "a anyway"]
-        self.assertEqual(dsk.chat(self.session(), dsk.config())[0]["content"], "from b")
-        self.assertEqual(len(self.api.chats()), 2)  # a spent 429 is not retried
-        self.assertAlmostEqual(dsk.paused("a"), time.time() + 7200, delta=5)
-        self.assertEqual(dsk.chat(self.session(route=["a"]), dsk.config())[0]["content"], "a anyway")
-        with open(os.path.join(dsk.STATE, "paused", "a"), "w") as f:
-            json.dump({"until": time.time() - 1}, f)
-        self.assertEqual(dsk.paused("a"), 0)
-
-    def test_a_reply_cut_off_without_a_finish_reason_counts_as_length(self):
-        self.api.replies = [{"content": "long", "finish": None, "usage": {"completion_tokens": dsk.MAX_TOKENS["off"]}},
-                            {"content": "short", "finish": None, "usage": {"completion_tokens": 5}}]
-        self.assertEqual(dsk.chat(self.session(), dsk.config())[1], "length")
-        self.assertIsNone(dsk.chat(self.session(), dsk.config())[1])
-
-    def test_interrupted_generation_is_retried(self):
-        self.api.replies = [{"content": "half", "finish": "aborted"}, "whole"]
-        self.assertEqual(dsk.chat(self.session(), dsk.config())[0]["content"], "whole")
-
-    def test_a_limit_reported_as_400_is_retried_like_a_429(self):
-        limit = {"status": 400, "error": "[code=tier_limit_exceeded] membership concurrency limit exceeded: 11/10"}
-        self.api.replies = [limit, limit, "after the limit cleared"]
-        self.assertEqual(dsk.chat(self.session(route=["a"]), dsk.config())[0]["content"], "after the limit cleared")
-        self.api.replies = [limit] * 3 + ["from b"]
-        s = self.session()
-        self.assertEqual(dsk.chat(s, dsk.config())[0]["content"], "from b")
-        self.assertEqual(s.profile, "b")
-
-    def test_client_errors_are_not_retried(self):
-        self.api.replies = [{"status": 400, "error": "bad request body"}]
-        with self.assertRaisesRegex(dsk.Fail, "a: HTTP 400 .*bad request body"):
-            dsk.chat(self.session(route=["a"]), dsk.config())
-        self.assertEqual(len(self.api.chats()), 1)
-
-    def test_failover_on_402_starts_a_new_series_with_the_same_messages(self):
-        self.api.replies = [{"status": 402}, "from b"]
-        s = self.session()
-        self.assertEqual(dsk.chat(s, dsk.config())[0]["content"], "from b")
-        first, second = self.api.chats()
-        self.assertTrue(first["path"].startswith("/a/") and second["path"].startswith("/b/"))
-        self.assertEqual((first["key"], second["key"]), ("Bearer sk-fake-a", "Bearer sk-fake-b"))
-        a, b = self.api.bodies()
-        self.assertEqual((a["model"], b["model"]), ("model-a", "model-b"))
-        self.assertEqual(a["messages"], b["messages"])
-        self.assertEqual([(r["why"], r["profile"]) for r in s.of("series")], [("start", "a"), ("failover", "b")])
-        self.assertEqual(s.profile, "b")
-
-    def test_failover_after_repeated_5xx_and_error_when_route_is_exhausted(self):
-        self.api.replies = [{"status": 500}] * 3 + [{"status": 503}] * 3
-        with self.assertRaisesRegex(dsk.Fail, "b: HTTP 503"):
-            dsk.chat(self.session(), dsk.config())
-        self.assertEqual(len(self.api.chats()), 6)
-
-    def test_network_failure_is_retried_then_fails_over_or_is_reported(self):
-        self.config["profiles"]["a"]["base_url"] = "http://127.0.0.1:1"  # nothing listens there
-        self.write_config()
-        self.api.replies = ["from b"]
-        s = self.session()
-        self.assertEqual(dsk.chat(s, dsk.config())[0]["content"], "from b")
-        self.assertEqual([(r["why"], r.get("status")) for r in s.of("series")], [("start", None), ("failover", 0)])
-        with self.assertRaisesRegex(dsk.Fail, "a: HTTP 0 URLError"):
-            dsk.chat(self.session(route=["a"]), dsk.config())
-
-    def test_missing_key_is_an_error_and_never_sent(self):
-        with mock.patch.dict(os.environ, {"KEY_A": ""}):
-            with self.assertRaisesRegex(dsk.Fail, "KEY_A is not set"):
-                dsk.chat(self.session(), dsk.config())
-        self.assertEqual(self.api.requests, [])
-
-    def test_key_falls_back_to_the_env_file_and_stays_out_of_the_environment(self):
-        with open(f"{self.tmp}/config/dsk/env", "w") as f:
-            f.write("# keys\nexport KEY_A='sk-from-file' # a comment\nKEY_B=\"sk-b-file\"\n")
-        self.api.replies = ["one", "two"]
-        with mock.patch.dict(os.environ, {"KEY_A": "", "KEY_B": ""}):
-            dsk.chat(self.session(), dsk.config())
-            self.assertEqual(os.environ["KEY_A"], "")
-            self.assertNotIn("sk-from-file", json.dumps(dsk.clean_env(dsk.config(), self.tmp)))
-        dsk.chat(self.session(), dsk.config())
-        self.assertEqual([r["key"] for r in self.api.requests], ["Bearer sk-from-file", "Bearer sk-fake-a"])
-
-    def test_full_profile_is_skipped_and_the_last_one_waits_for_a_slot(self):
-        def release():
-            for handle in dsk.slots.values():
-                handle.close()
-            dsk.slots.clear()
-        self.addCleanup(release)
-        self.config["profiles"]["a"]["max_sessions"] = 1
-        self.write_config()
-        os.makedirs(f"{self.tmp}/state/dsk/slots")
-        other = dsk.flock(f"{self.tmp}/state/dsk/slots/a.0", "")  # another run holds a's only slot
-        self.api.replies = ["from b", "from a"]
-        s = self.session()
-        self.assertEqual(dsk.chat(s, dsk.config())[0]["content"], "from b")
-        self.assertEqual([(r["why"], r.get("status")) for r in s.of("series")], [("start", None), ("failover", "full")])
-        self.assertEqual([r["path"] for r in self.api.chats()], ["/b/chat/completions"])
-        threading.Timer(0.2, other.close).start()
-        with mock.patch.object(dsk, "SLOT_POLL", 0.05):
-            self.assertEqual(dsk.chat(self.session(route=["a"]), dsk.config())[0]["content"], "from a")
-        with self.assertRaises(dsk.Fail):  # this process now holds the slot
-            dsk.flock(f"{self.tmp}/state/dsk/slots/a.0", "")
-
-    def test_profiles_with_one_endpoint_and_key_share_the_smallest_limit(self):
-        self.config["profiles"]["a"]["max_sessions"] = 3
-        self.config["profiles"]["c"] = {**self.config["profiles"]["a"], "model": "model-c", "max_sessions": 1}
-        self.write_config()
-        cfg = dsk.config()
-        self.assertEqual(dsk.pool(cfg, "c"), (f"{self.tmp}/state/dsk/slots/a", 1))
-        self.assertEqual(dsk.pool(cfg, "b"), (f"{self.tmp}/state/dsk/slots/b", None))
-        os.makedirs(f"{self.tmp}/state/dsk/slots")
-        other = dsk.flock(f"{self.tmp}/state/dsk/slots/a.0", "")  # a run on profile a holds the one slot they share
-        self.addCleanup(other.close)
-        self.assertFalse(dsk.claim_slot(cfg, "c"))
-        self.assertFalse(dsk.claim_slot(cfg, "a"))
-        self.assertEqual(dsk.slots, {})
-
-    def test_series_guard_rejects_a_rewritten_prefix(self):
-        self.api.replies = ["one", "two"]
-        s, cfg = self.session(), dsk.config()
-        s.add("msg", turn=1, m=dsk.chat(s, cfg)[0])
-        s.add("msg", turn=1, m={"role": "user", "content": "result"})
-        dsk.chat(s, cfg)
-        s.recs[3]["m"]["content"] = "task, edited after it was sent"
-        with self.assertRaisesRegex(dsk.Fail, "does not extend"):
-            dsk.chat(s, cfg)
-        self.assertEqual(len(self.api.chats()), 2)
-
-    def test_usage_is_logged_with_either_cache_field(self):
-        self.api.replies = [
-            {"content": "x", "usage": {"prompt_tokens": 100, "completion_tokens": 7, "prompt_cache_hit_tokens": 90}},
-            {"content": "x", "usage": {"prompt_tokens": 100, "completion_tokens": 7,
-                                       "prompt_tokens_details": {"cached_tokens": 80}}},
-            {"content": "x", "usage": {"prompt_tokens": 100, "completion_tokens": 7}},
-        ]
-        s, cfg = self.session(), dsk.config()
-        for _ in range(3):
-            dsk.chat(s, cfg)
-        self.assertEqual([(u["prompt"], u["hit"], u["out"]) for u in s.of("usage")],
-                         [(100, 90, 7), (100, 80, 7), (100, None, 7)])
-
-    def test_log_reloads_from_disk_and_keys_stay_out_of_it(self):
-        self.api.replies = ["x"]
-        s = self.session()
-        dsk.chat(s, dsk.config())
-        self.assertEqual(dsk.Session(s.id).recs, s.recs)
-        with open(s.path) as f:
-            self.assertNotIn("sk-fake", f.read())
 
 
 class Cli(Case):
@@ -483,7 +289,7 @@ class Cli(Case):
         return subprocess.run(["git", *args], cwd=repo, env=self.env, capture_output=True, text=True).stdout
 
     def dsk(self, *args, cwd=None, stdin=None):
-        done = subprocess.run([sys.executable, DSK, *args], cwd=cwd or self.tmp, env=self.env, input=stdin,
+        done = subprocess.run([*CMD, *args], cwd=cwd or self.tmp, env=self.env, input=stdin,
                               capture_output=True, text=True, timeout=120)
         return done.returncode, done.stdout, done.stderr
 
@@ -511,7 +317,7 @@ class Plugin(Cli):
 
     def hook(self, *flags, **options):
         env = {f"CLAUDE_PLUGIN_OPTION_{name.upper()}": value for name, value in options.items()}
-        done = subprocess.run([sys.executable, DSK, "configure", "--hook", "--data", self.data, *flags], env={**self.env, **env},
+        done = subprocess.run([*CMD, "configure", "--hook", "--data", self.data, *flags], env={**self.env, **env},
                               input='{"hook_event_name": "SessionStart"}', capture_output=True, text=True, timeout=60)
         return done.returncode, done.stdout
 
@@ -530,48 +336,6 @@ class Plugin(Cli):
         self.hook(provider="official", deepseek_api_key="sk-official")  # before the next prompt: nothing changed, nothing written
         self.assertEqual(os.stat(f"{self.data}/options.json").st_mtime_ns, before)
 
-    def test_custom_provider_runs_on_its_endpoint_with_its_model_and_key(self):
-        custom = {"provider": "custom", "custom_base_url": self.api.url + "/c", "custom_model": "my-model", "custom_api_key": "sk-custom"}
-        self.hook(**custom)
-        self.api.replies = [script('done("x")')]
-        out, _ = self.run_ok("task")
-        request = self.api.chats()[0]
-        self.assertIn(" · done · custom · ", out)
-        self.assertEqual([request["path"], request["key"], json.loads(request["raw"])["model"]],
-                         ["/c/chat/completions", "Bearer sk-custom", "my-model"])
-        self.assertNotIn("sk-custom", json.dumps(dsk.clean_env(dsk.config(), self.tmp)))
-        self.hook(**custom, deepseek_api_key="sk-official")  # with a DeepSeek key as well, runs still go only to custom
-        self.assertEqual(self.dsk("configure")[1].splitlines()[1:], [f"custom:  {self.api.url}/c · my-model · key set"])
-        self.hook(**{**custom, "provider": "official"}, deepseek_api_key="sk-official")  # the picker decides which one runs
-        self.assertEqual(self.dsk("configure")[1].splitlines()[0], f"dsk {dsk.version()} · ready · official · https://api.deepseek.com · deepseek-flash")
-
-    def test_what_is_missing_is_said_at_session_start_and_a_hook_never_blocks(self):
-        code, out = self.hook("--announce")
-        said = json.loads(out)
-        self.assertEqual(code, 0)
-        # the first session on a version names it, once: after an install or an update
-        self.assertEqual(said["systemMessage"], f"dsk {dsk.version()} installed. "
-                         "dsk is not set up yet: it has no DeepSeek API key. Run /plugin configure dsk@acme "
-                         "and enter your DeepSeek API key, or pick provider `custom` and enter its endpoint URL, model name and API key. "
-                         "Then restart Claude Code.")
-        self.assertEqual(said["hookSpecificOutput"]["hookEventName"], "SessionStart")
-        self.assertIn("Never ask for a key in the chat.", said["hookSpecificOutput"]["additionalContext"])
-        self.assertEqual(self.hook(), (0, ""))  # before a prompt the options are stored and nothing is said
-        code, out = self.hook("--announce", provider="custom", custom_base_url="https://example.invalid/v1")
-        self.assertIn("dsk is not set up yet: provider custom still needs its model name, API key. ", json.loads(out)["systemMessage"])
-        code, out, _ = self.dsk("configure")
-        self.assertEqual((code, out.splitlines()[0]), (1, f"dsk {dsk.version()} · not set up · provider custom still needs its model name, API key"))
-        self.assertIn("next:    in Claude Code, /plugin configure dsk@acme: enter your DeepSeek API key", out)
-        code, out, _ = self.dsk("run", "task")
-        self.assertEqual(code, 1)
-        self.assertIn("error: DEEPSEEK_API_KEY is not set. In Claude Code, run /plugin configure dsk@acme and enter", out)
-        self.assertEqual(self.api.requests, [])
-        self.assertEqual(self.hook("--announce", provider="official", deepseek_api_key="sk-official"), (0, ""))  # set up: silent
-        with mock.patch.dict(os.environ, {"XDG_CONFIG_HOME": "/dev/null/nowhere"}):  # even when it cannot write
-            self.assertEqual(subprocess.run([sys.executable, DSK, "configure", "--hook", "--announce", "--data", "/dev/null/x"],
-                                            env={**self.env, "XDG_CONFIG_HOME": "/dev/null/nowhere"}, input="{}", capture_output=True,
-                                            text=True, timeout=60).returncode, 0)
-
     def test_a_config_file_and_the_env_file_win_over_the_plugins_options(self):
         self.hook(provider="custom", custom_base_url=self.api.url + "/c", custom_model="m", custom_api_key="sk-custom")
         with open(f"{self.tmp}/config/dsk/env", "w") as f:
@@ -589,7 +353,7 @@ class Plugin(Cli):
         code, out, _ = self.dsk("configure")
         self.assertEqual((code, out.splitlines()[0]), (1, f"dsk {dsk.version()} · not set up · it has no DeepSeek API key"))
 
-    @unittest.skipUnless(dsk.sandbox_works("(version 1)(allow default)(deny file-write* (literal \"/nonexistent\"))"),
+    @unittest.skipUnless(sandbox_works("(version 1)(allow default)(deny file-write* (literal \"/nonexistent\"))"),
                          "no sandbox here: not macOS, or already inside a sandbox, which macOS will not nest")
     def test_the_sandbox_hides_the_keys_the_plugin_stored_from_scripts_and_checks(self):
         self.hook(provider="custom", custom_base_url=self.api.url + "/c", custom_model="m", custom_api_key="sk-custom")
@@ -600,10 +364,6 @@ class Plugin(Cli):
         self.assertEqual(self.api.chats()[0]["key"], "Bearer sk-custom")  # dsk itself still reads it
         self.assertEqual((out.count("Operation not permitted"), "sk-custom" in out + self.output(sid, 1)), (1, False), out)
         self.assertIn(f"checks:  cat {stored}; test $? = 1 → 0\n", out)
-
-    def test_the_file_parses_on_an_older_python_so_that_it_can_say_what_it_needs(self):
-        with open(DSK, encoding="utf-8") as f:
-            ast.parse(f.read(), feature_version=(3, 9))
 
 
 class Providers(Cli):
@@ -758,16 +518,6 @@ class Providers(Cli):
                                                            "still set in your environment\n"))
         self.assertEqual(self.files()[1], "export KEEP=1 DSK_Z_API_KEY=k1\n")
 
-    def test_a_session_fails_over_to_a_provider_renamed_since_it_started_but_not_to_one_removed(self):
-        s = self.session()
-        self.assertEqual(dsk.later_profiles(s, dsk.config()), ["b"])
-        self.assertEqual(self.dsk("provider", "rename", "b", "y")[0], 0)
-        self.assertEqual(dsk.later_profiles(s, dsk.config()), ["y"])
-        self.assertEqual(self.dsk("provider", "rename", "a", "x")[0], 0)  # the one it is on, too
-        self.assertEqual(dsk.later_profiles(s, dsk.config()), ["y"])
-        self.assertEqual(self.dsk("provider", "remove", "y")[0], 0)
-        self.assertEqual(dsk.later_profiles(s, dsk.config()), [])
-
     def test_work_in_review_on_a_removed_provider_can_still_be_read_and_accepted(self):
         repo = self.repo({"t.py": "t = 1\n"})
         self.api.replies = [script('edit("t.py", "t = 1", "t = 2")\ndone("x")')]
@@ -782,7 +532,7 @@ class Providers(Cli):
         self.dsk("provider", "add", "c", "--url", "https://c.example/v1", "--model", "m", "--key-stdin", stdin="k")
         sleep = f"sleep 43.{os.getpid()}"  # its own: an earlier run's sleep outlives the dsk that started it
         self.api.replies = [script(f'sh("{sleep}")')]
-        proc = subprocess.Popen([sys.executable, DSK, "run", "long one"], cwd=self.tmp, env=self.env,
+        proc = subprocess.Popen([*CMD, "run", "long one"], cwd=self.tmp, env=self.env,
                                 stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
         self.addCleanup(proc.kill)
         self.addCleanup(subprocess.run, ["pkill", "-f", sleep])
@@ -866,22 +616,6 @@ class Speed(Cli):
             json.dump(found, f)
         return found
 
-    def test_probe_times_a_profile_and_says_why_it_cannot(self):
-        self.api.delays["a"] = 0.3
-        self.api.replies = ["ok", "ok"]
-        result = dsk.probe(dsk.config(), "a")
-        self.assertEqual((result["why"], len(self.api.chats())), ("", 2))
-        self.assertGreaterEqual(result["seconds"], 0.3)
-        with mock.patch.dict(os.environ, {"KEY_B": ""}):
-            self.assertEqual(dsk.probe(dsk.config(), "b"), {"seconds": None, "why": "no key"})
-        self.config["profiles"]["b"]["max_sessions"] = 1
-        self.write_config()
-        os.makedirs(f"{self.tmp}/state/dsk/slots", exist_ok=True)
-        other = dsk.flock(f"{self.tmp}/state/dsk/slots/b.0", "")  # another run holds b's only slot
-        self.addCleanup(other.close)
-        self.assertEqual(dsk.probe(dsk.config(), "b"), {"seconds": None, "why": "busy"})
-        self.assertEqual(len(self.api.chats()), 2)  # a busy profile is not asked anything
-
     def test_bench_prints_the_faster_profile_first_and_writes_both_to_speed_json(self):
         self.api.delays.update({"a": 0.3, "b": 0.0})
         self.api.replies = ["ok"] * 4  # two test requests per profile
@@ -953,20 +687,6 @@ class Speed(Cli):
         self.run_ok("--profile", "a", "task")
         self.assertEqual([r["path"] for r in self.api.chats()], ["/a/chat/completions"])
 
-    def test_a_busy_profile_keeps_its_earlier_seconds(self):
-        old = self.measured({"a": 1.25, "b": 3.0})["a"]["at"]
-        self.config["profiles"]["a"]["max_sessions"] = 1
-        self.write_config()
-        os.makedirs(f"{self.tmp}/state/dsk/slots", exist_ok=True)
-        other = dsk.flock(f"{self.tmp}/state/dsk/slots/a.0", "")  # another run holds a's only slot
-        self.addCleanup(other.close)
-        self.api.replies = ["ok", "ok"]
-        found = dsk.bench(dsk.config(), ["a", "b"])
-        self.assertEqual(found["a"], {"seconds": 1.25, "why": "busy", "at": old})
-        self.assertEqual(json.loads(self.cat(self.tmp, "state/dsk/speed.json"))["a"],
-                         {"seconds": 1.25, "why": "busy", "at": old})
-        self.assertLess(found["b"]["seconds"], 3.0)
-
     def test_configure_shows_the_order_only_when_the_route_is_fastest(self):
         self.measured({"a": 1.42, "b": 2.1})
         self.assertNotIn("order:", self.dsk("configure")[1])
@@ -976,24 +696,6 @@ class Speed(Cli):
         self.write_config()
         code, out, _ = self.dsk("configure")
         self.assertIn("\norder:    fastest first: a 1.42s, b 2.10s, c (not measured)\n", out)
-
-
-class Parser(unittest.TestCase):
-    def call(self, arguments, name="run_code"):
-        return {"id": "c1", "type": "function", "function": {"name": name, "arguments": arguments}}
-
-    def test_one_run_code_call_yields_its_script_unchanged(self):
-        code = ('text = r\'\'\'x = """triple"""\npath = "C:\\temp\\new"\n```python\nprint("fence")\n```\n\'\'\'\n'
-                'write("a.md", text)\n')
-        reply = {"role": "assistant", "content": "", "tool_calls": [self.call(json.dumps({"code": code}))]}
-        self.assertEqual(dsk.parse(reply), code)
-
-    def test_anything_else_is_not_a_script(self):
-        good = self.call('{"code": "print(1)"}')
-        for calls in ([], [good, good], [self.call('{"code": "print(1)"}', "write_file")], [self.call('{"code": "print(1')],
-                      [self.call('{"script": "print(1)"}')], [self.call('{"code": ["print(1)"]}')], [self.call('"print(1)"')]):
-            self.assertIsNone(dsk.parse({"role": "assistant", "content": "", "tool_calls": calls}), calls)
-        self.assertIsNone(dsk.parse({"role": "assistant", "content": "prose only"}))
 
 
 class Gate(unittest.TestCase):
@@ -1346,14 +1048,6 @@ class Gates(Cli):
         self.assertEqual(sorted(self.git(repo, "status", "--porcelain").splitlines()), sorted(before + [" M tests/t.py"]))
         self.assertEqual(self.cat(repo, "mine.txt"), "v2, uncommitted\n")
 
-    def test_snapshot_sees_a_same_size_edit_made_in_the_same_second_as_the_commit(self):
-        repo = self.repo({"a.txt": "t = 1\n"})
-        committed, indexed = self.git(repo, "rev-parse", "HEAD^{tree}").strip(), os.stat(f"{repo}/.git/index").st_mtime
-        self.put(repo, {"a.txt": "t = 2\n"})
-        os.utime(f"{repo}/a.txt", (indexed, indexed))
-        __import__("time").sleep(1.1)  # the session's copy of my index must not look newer than the edit
-        self.assertNotEqual(dsk.snapshot(repo, f"{self.tmp}/session-index"), committed)
-
     def test_edits_made_by_someone_else_during_a_run_are_left_alone(self):
         repo = self.repo({"a.txt": "one\n", "src/a.py": "a = 1\n", "tests/t.py": "t = 1\n"})
         mine = {"a.txt": "one, edited by me while dsk was running\n", "new-by-me.txt": "mine\n"}
@@ -1383,22 +1077,6 @@ class Gates(Cli):
         self.assertIn("· review ·", out)
         self.assertIn("scope:   reverted flag.py (copies in ", out)
 
-    def test_a_script_without_a_shell_command_is_charged_only_for_what_it_wrote(self):
-        repo = self.repo({"src/a.py": "a = 1\n", "tests/t.py": "t = 1\n", "tests/u.py": "u = 1\n"})
-        with mock.patch.object(dsk, "STATE", f"{self.tmp}/state/dsk"):
-            log = dsk.Session()
-            log.add("head", id=log.id, workdir=repo, root=repo, allow=["tests/**"], start=dsk.snapshot(repo, f"{log.dir}/index"))
-            for turn, calls in ((1, ["write"]), (2, ["write", "sh"])):
-                before = dsk.span(log)
-                self.put(repo, {"src/a.py": f"a = {turn + 1}  # someone else, meanwhile\n", "tests/t.py": f"t = {turn + 1}\n",
-                                "tests/u.py": f"u = {turn + 1}  # someone else, in scope\n"})
-                log.shelled = 4242 if "sh" in calls else None
-                log.add("ledger", turn=turn, fn="write", arg="./tests/t.py", code=0)
-                reverted = dsk.settle(log, before, turn)
-                self.assertEqual((reverted, log.last("gate")["touched"]),
-                                 ([], ["tests/t.py"]) if turn == 1 else (["src/a.py"], ["tests/t.py", "tests/u.py"]))
-        self.assertEqual(self.cat(repo, "src/a.py"), "a = 2  # someone else, meanwhile\n")
-
     def test_read_only_run_reverts_every_change(self):
         repo = self.repo({"a.txt": "one\n"})
         self.api.replies = [script('sh("echo two > a.txt; echo x > b.txt")\ndone("The file says one.")')]
@@ -1409,7 +1087,7 @@ class Gates(Cli):
                                                "context: 1.2k of 32.0k",
                                                f'next:    dsk show {sid} --answer | dsk continue {sid} "next task"'])
 
-    @unittest.skipUnless(dsk.sandbox_works("(version 1)(allow default)(deny file-write* (literal \"/nonexistent\"))"),
+    @unittest.skipUnless(sandbox_works("(version 1)(allow default)(deny file-write* (literal \"/nonexistent\"))"),
                          "no sandbox here: not macOS, or already inside a sandbox, which macOS will not nest")
     def test_sandbox_stops_writes_to_git_and_reads_of_the_key_file_in_scripts_and_checks(self):
         repo = self.repo({"a.txt": "one\n"})
@@ -1518,22 +1196,6 @@ class Compaction(Cli):
         wires = [json.dumps(b["messages"], ensure_ascii=False, separators=(",", ":")) for b in self.api.bodies()]
         extends = [later.startswith(earlier[:-1]) for earlier, later in zip(wires, wires[1:])]
         self.assertEqual(extends, [True, True, False, True, True])
-
-    def test_the_same_log_compacts_to_the_same_bytes(self):
-        log = self.long_run()
-        limit = self.config["profiles"]["a"]["compact_at"]
-        cut = next(i for i, r in enumerate(log.recs) if r["t"] == "series" and r["why"] == "compact")
-        logged = [{"turn": r["turn"], "m": r["m"]} for r in log.recs[cut + 1:cut + 8]]
-        self.assertEqual(dsk.compaction(log.recs[:cut], log.recs[cut]["changed"], limit), logged)
-        program = ("import importlib.util, json, sys\n"
-                   f"spec = importlib.util.spec_from_file_location('dsk', {DSK!r})\n"
-                   "dsk = importlib.util.module_from_spec(spec); spec.loader.exec_module(dsk)\n"
-                   f"recs = [json.loads(line) for line in open({log.path!r})][:{cut}]\n"
-                   f"sys.stdout.write(dsk.dumps(dsk.compaction(recs, {log.recs[cut]['changed']!r}, {limit})))")
-        outputs = {subprocess.run([sys.executable, "-c", program], env={**self.env, "PYTHONHASHSEED": seed},
-                                  capture_output=True, text=True).stdout for seed in ("1", "2", "3")}
-        self.assertEqual(outputs, {dsk.dumps(logged)})
-
 
 class Review(Cli):
     WORK = ('note("t.py holds the constant")\nedit("tests/t.py", "t = 1", "t = 2")\n'
@@ -1755,16 +1417,6 @@ class Review(Cli):
         self.assertEqual(roles, [False, False, True, False, True])
         self.assertIn("recheck: asked after turn 1 · no reasoning came back · no change\n", out)
         self.assertRegex(out, r"\nreview:  call 1: 1 blocker in \d+ s · call 2: nothing in \d+ s · quotes still in the code: 0 of 1\n")
-
-    def test_compaction_keeps_the_findings_the_worker_is_fixing(self):
-        repo, out, sid = self.reviewed_run([script(self.HAND_IN), self.verdict(self.BLOCKER), script('print(read("tests/t.py"))'),
-                                            script(self.FIX), self.verdict()])
-        recs = dsk.Session(sid).recs
-        cut = [i for i, r in enumerate(recs) if r["t"] == "reviewer"][1]
-        first = dsk.compaction(recs[:cut], ["tests/t.py"], 32000)[1]["m"]["content"]
-        sent = dsk.Session(sid).of("reviewer")[0]["findings"]
-        self.assertIn("\n\n## The reviewer's findings\n" + dsk.findings_text(sent), first)
-        self.assertNotIn("The reviewer's findings", dsk.compaction(recs, ["tests/t.py"], 32000)[1]["m"]["content"])
 
     def test_the_reviewer_is_off_unless_asked_and_continue_keeps_it(self):
         repo = self.repo({"tests/t.py": "t = 1\n"})
@@ -2169,13 +1821,13 @@ class Protocol(Cli):
         self.assertEqual(self.dsk("reject", sid, "--drop")[0], 0)
 
     def hook(self, **event):
-        done = subprocess.run([sys.executable, DSK, "status", "--hook"], env=self.env, capture_output=True, text=True,
+        done = subprocess.run([*CMD, "status", "--hook"], env=self.env, capture_output=True, text=True,
                               input=json.dumps({"hook_event_name": "Stop", "cwd": self.tmp, **event}))
         return done.returncode, done.stderr
 
     def test_status_json_follows_a_run_through_its_phases(self):
         repo = self.repo({"tests/t.py": "t = 1\n"})
-        status = f"{sys.executable} {DSK} status --json"
+        status = f"{shlex.join(CMD)} status --json"
         self.api.between_turns[2] = lambda: self.put(self.tmp, {"model.json": self.dsk("status", "--json")[1]})
         self.api.replies = [script(f'read("tests/t.py")\nsh("{status} > {self.tmp}/script.json")'),
                             script('edit("tests/t.py", "t = 1", "t = 2")\ndone("x")')]
@@ -2198,31 +1850,6 @@ class Protocol(Cli):
                          [sid, "a", 5, 2, 1, "edit it now", "claude-1", repo, ""])
         self.assertIn(f"in {dsk.kilo(end['in'])} ({end['cached']:.0%} cached) · out {dsk.kilo(end['out'])}", out)
         self.assertLessEqual(end["created"], end["active"])
-
-    def test_status_json_reads_a_stopped_log_once_and_reports_failover_and_cost(self):
-        self.config["profiles"]["a"]["price"] = {"in": 2.0, "cached": 1.0, "out": 10.0}
-        self.config["profiles"]["b"]["price"] = {"in": 4.0, "cached": 2.0, "out": 20.0}
-        self.write_config()
-        self.api.replies = [{"status": 429}, {"status": 429}, {"status": 429}, script('done("x")'), script('done("y")')]
-        _, moved = self.run_ok("first")
-        _, stayed = self.run_ok("--profile", "b", "second")
-        first = {j["id"]: j for j in json.loads(self.dsk("status", "--json")[1])["jobs"]}
-        self.assertEqual([first[moved]["failover"], first[moved]["profile"], first[stayed]["failover"]], ["a 429", "b", ""])
-        usage = [r for r in dsk.Session(stayed).recs if r["t"] == "usage"]
-        self.assertAlmostEqual(first[stayed]["cost"], sum((u["prompt"] - u["hit"]) * 4.0 + u["hit"] * 2.0 + u["out"] * 20.0
-                                                          for u in usage) / 1e6)
-        self.assertGreater(first[stayed]["cost"], 0)
-        with mock.patch.object(dsk, "job", wraps=dsk.job) as job, mock.patch("builtins.print") as printed:
-            self.assertEqual(dsk.cmd_status(mock.Mock(json=True, hook=False), dsk.config()), 0)
-        self.assertEqual(job.call_count, 0)  # neither log has moved since its session stopped
-        self.assertEqual({j["id"]: j for j in json.loads(printed.call_args[0][0])["jobs"]}, first)
-        with open(os.path.join(self.tmp, "state/dsk", stayed, "log.jsonl"), "a") as f:
-            f.write(json.dumps({"t": "state", "status": "accepted"}) + "\n")
-        with mock.patch.object(dsk, "job", wraps=dsk.job) as job, mock.patch("builtins.print") as printed:
-            dsk.cmd_status(mock.Mock(json=True, hook=False), dsk.config())
-        self.assertEqual([c.args[0].id for c in job.call_args_list], [stayed])  # only the log that moved is read again
-        self.assertEqual({j["id"]: j["status"] for j in json.loads(printed.call_args[0][0])["jobs"]},
-                         {moved: "done", stayed: "accepted"})
 
     def test_owner_defaults_to_the_claude_code_session_that_runs_dsk(self):
         self.api.replies = [script('done("x")'), script('done("y")')]
@@ -2247,7 +1874,7 @@ class Protocol(Cli):
 
     def test_a_running_session_is_busy_and_shows_as_running(self):
         self.api.replies = [script('sh("sleep 49.873")')]
-        proc = subprocess.Popen([sys.executable, DSK, "run", "long one"], cwd=self.tmp, env=self.env,
+        proc = subprocess.Popen([*CMD, "run", "long one"], cwd=self.tmp, env=self.env,
                                 stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
         self.addCleanup(proc.kill)
         self.wait_for("sleep 49.873")
@@ -2265,7 +1892,7 @@ class Protocol(Cli):
     def test_only_one_in_place_run_per_tree_and_worktree_runs_are_exempt(self):
         repo = self.repo({"tests/t.py": "t = 1\n"})
         self.api.replies = [script('sh("sleep 49.874")'), script('done("in the worktree")')]
-        first = subprocess.Popen([sys.executable, DSK, "run", "slow one"], cwd=repo, env=self.env,
+        first = subprocess.Popen([*CMD, "run", "slow one"], cwd=repo, env=self.env,
                                  stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
         self.addCleanup(first.kill)
         self.wait_for("sleep 49.874")
@@ -2343,7 +1970,7 @@ class Protocol(Cli):
 
     def test_sigterm_ends_the_run_as_error_and_leaves_nothing_running(self):
         self.api.replies = [script('print("going", flush=True)\nsh("sleep 49.871")')]
-        proc = subprocess.Popen([sys.executable, DSK, "run", "sleepy"], cwd=self.tmp, env=self.env,
+        proc = subprocess.Popen([*CMD, "run", "sleepy"], cwd=self.tmp, env=self.env,
                                 stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
         self.wait_for("sleep 49.871")
         proc.terminate()
@@ -2357,7 +1984,7 @@ class Protocol(Cli):
         for kill in ("terminate", "kill"):
             repo = self.repo({"src/a.py": "a = 1\n", "tests/t.py": "t = 1\n"})
             self.api.replies = [script(work)]
-            proc = subprocess.Popen([sys.executable, DSK, "run", "--allow", "tests/**", "edit"], cwd=repo, env=self.env,
+            proc = subprocess.Popen([*CMD, "run", "--allow", "tests/**", "edit"], cwd=repo, env=self.env,
                                     stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
             self.wait_for("sleep 49.875")
             getattr(proc, kill)()
@@ -2383,7 +2010,7 @@ class Protocol(Cli):
 
     def test_a_killed_run_shows_as_error_and_can_be_dropped(self):
         self.api.replies = [script('sh("sleep 3.871")')]
-        proc = subprocess.Popen([sys.executable, DSK, "run", "doomed"], cwd=self.tmp, env=self.env,
+        proc = subprocess.Popen([*CMD, "run", "doomed"], cwd=self.tmp, env=self.env,
                                 stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
         self.wait_for("sleep 3.871")
         proc.kill()
@@ -2411,19 +2038,6 @@ class Protocol(Cli):
         code, out, _ = self.dsk("doctor", "--profile", "b")
         self.assertEqual((code, out.splitlines()[1]), (1, "key:      KEY_B is not set"))
 
-    def test_doctor_sends_nothing_to_a_profile_whose_slots_are_all_held(self):
-        self.config["profiles"]["a"]["max_sessions"] = 1
-        self.write_config()
-        os.makedirs(f"{self.tmp}/state/dsk/slots")
-        other = dsk.flock(f"{self.tmp}/state/dsk/slots/a.0", "")  # a running job holds a's only slot
-        self.addCleanup(other.close)
-        self.api.search_results = [{"title": "T", "url": "https://ok.example/a", "date": None, "summary": "S"}]
-        code, out, _ = self.dsk("doctor", "--profile", "a")
-        self.assertEqual((code, out.splitlines()[1]), (0, "slots:    all 1 in use by running jobs, so it was not "
-                                                          "checked; run dsk doctor --profile a when they finish"))
-        self.assertEqual(self.api.chats(), [])
-
-
 class Stats(Cli):
     """Timestamps in every record, and `dsk stats`: what a set of sessions measured, read back from their logs."""
 
@@ -2441,113 +2055,6 @@ class Stats(Cli):
         s = dsk.Session(sid)
         self.assertEqual((s.of("state")[-2]["status"], s.of("state")[-1]["status"]), ("review", "accepted"))
         self.assertGreater(s.last("state")["at"], review)
-
-    def test_metrics_counts_the_kinds_and_rounds_of_a_scripted_session(self):
-        repo = self.repo({"t.py": "t = 1\n"})
-        self.api.replies = [script('print(read("t.py"))'), script('edit("t.py", "t = 1", "t = 2")\ndone("bumped t")')]
-        out, sid = self.run_ok("--allow", "t.py", "bump t", cwd=repo)
-        self.api.replies = [script('sh("true")\ndone("bumped t again")')]
-        self.assertEqual(self.dsk("reject", sid, "1. make it 3", cwd=repo)[0], 0)
-        time.sleep(0.02)
-        s = dsk.Session(sid)
-        m = dsk.metrics(s, dsk.config())
-        usage = s.of("usage")
-        self.assertEqual(m["id"], sid)
-        self.assertEqual(m["kinds"], {"read": 1, "write": 1, "run": 1})
-        self.assertEqual((m["turns"], m["lead_in"], m["cut"]), (3, 1, 0))
-        self.assertEqual((m["in"], m["out"]), (sum(u["prompt"] for u in usage), sum(u["out"] for u in usage)))
-        self.assertEqual((m["rounds"], m["rejects"], m["continues"]), (2, 1, 0))
-        self.assertEqual((m["compactions"], m["failovers"], m["profiles"]), (0, [], ["a"]))
-        self.assertEqual((m["status"], m["root"], m["effort"], m["web"]), ("review", repo, "off", False))
-        self.assertGreater(m["seconds"], 0)
-        self.assertIsNotNone(m["model_seconds"])
-        self.assertEqual(sorted(m["speed"]), ["a"])
-        self.assertEqual(m["speed"]["a"][1], len(usage))
-        self.assertGreater(m["speed"]["a"][0], 0)
-        self.assertIsNone(m["cost"])  # no profile of this config has a price
-
-    def test_a_log_without_timestamps_gives_no_durations_and_raises_nothing(self):
-        s = self.session(root=self.tmp, owner="", worktree=False, web=False, created=time.time())
-        s.add("req", n=0)
-        s.add("usage", turn=1, profile="a", prompt=100, hit=None, out=10)
-        s.add("result", turn=1, text="turn 1 · 11 left\noutput:\nhi", fail="")
-        s.add("state", status="done", end=None, changed=[], summary="nothing to change")
-        for r in s.recs:  # a log written before records carried `at`
-            r.pop("at")
-        m = dsk.metrics(s, dsk.config())
-        self.assertEqual((m["seconds"], m["model_seconds"], m["lead_seconds"]), (None, None, None))
-        self.assertEqual((m["turns"], m["kinds"], m["lead_in"]), (1, {"stop": 1}, 0))
-        self.assertEqual((m["in"], m["out"], m["hit"], m["max_out"]), (100, 10, 0, 10))
-        self.assertEqual(m["speed"], {})
-        s.add("state", status="accepted")  # closed after timestamps arrived: only this record is stamped
-        m = dsk.metrics(s, dsk.config())
-        self.assertEqual((m["seconds"], m["lead_seconds"]), (None, None))  # unknown, not a measured zero
-
-    def test_the_summary_counts_failovers_in_any_order_and_the_median_over_every_reply(self):
-        def log(profile, outs, left=None):
-            s = self.session(root=self.tmp, owner="", worktree=False, web=False, created=time.time())
-            if left:  # the run started on `left` and moved on without a turn there
-                s.add("series", why="start", profile=left)
-                s.add("series", why="failover", profile=profile, status="full")
-            for turn, out in enumerate(outs, 1):
-                s.add("usage", turn=turn, profile=profile, prompt=100, hit=0, out=out)
-                s.add("result", turn=turn, text="", fail="")
-            s.add("state", status="done", end=None, changed=[])
-            return s
-        pairs = [(s, dsk.metrics(s, dsk.config())) for s in (log("b", [10, 20, 900], left="a"), log("a", [30]))]
-        lines = dsk.stats_summary(pairs)
-        self.assertIn("replies:   median 20 tokens · largest 900", "\n".join(lines))  # of 10, 20, 30 and 900
-        away = [line for line in lines if line.startswith("profile a:")][0]
-        self.assertIn("· 1 failovers away", away)  # though the session that left `a` comes before the one that used it
-
-    def test_stats_json_sessions_newest_first_and_the_summary_lines_exactly(self):
-        repo = self.repo({"a.py": "a = 1\n"})
-        self.api.replies = [script('done("nothing to change")')]
-        out, first = self.run_ok("look around", cwd=repo)
-        time.sleep(0.01)
-        self.api.replies = [script('edit("a.py", "a = 1", "a = 2")\ndone("bumped a")')]
-        out, second = self.run_ok("--allow", "a.py", "bump a", cwd=repo)
-        code, out, err = self.dsk("stats", "--json", cwd=repo)
-        self.assertEqual(code, 0, err)
-        got = json.loads(out)["sessions"]
-        self.assertEqual([m["id"] for m in got], [second, first])
-        self.assertEqual(set(got[0]), {"id", "root", "owner", "worktree", "effort", "web", "created", "status",
-                                       "profiles", "rounds", "rejects", "continues", "compactions", "failovers",
-                                       "turns", "kinds", "lead_in", "cut", "in", "out", "hit", "cached", "max_out",
-                                       "speed", "cost", "seconds", "model_seconds", "lead_seconds"})
-        self.assertEqual((got[0]["status"], got[0]["kinds"], got[1]["status"], got[1]["kinds"]),
-                         ("review", {"write": 1}, "done", {"stop": 1}))
-        code, out, err = self.dsk("stats", cwd=repo)
-        self.assertEqual(code, 0, err)
-        lines = {row.split(":")[0]: row for row in out.splitlines() if ":" in row}
-        self.assertEqual(lines["sessions"], "sessions:  2 · done 1 · review 1")
-        self.assertEqual(lines["turns"], f"turns:     2 · median 1 per session · most 1 ({second})")
-        self.assertEqual(lines["kinds"], "kinds:     stop 50% · write 50%")
-        usage = [u for sid in (first, second) for u in dsk.Session(sid).of("usage")]
-        total_in, total_out = sum(u["prompt"] for u in usage), sum(u["out"] for u in usage)
-        hit = sum(u["hit"] or 0 for u in usage)
-        self.assertEqual(lines["tokens"], f"tokens:    in {dsk.kilo(total_in)} ({round(hit * 100 / total_in)}% cached)"
-                                          f" · out {dsk.kilo(total_out)}")
-        timed = sum(m["speed"].get("a", [0, 0])[1] for m in got)
-        secs = sum(m["speed"].get("a", [0, 0])[0] for m in got)
-        self.assertGreater(timed, 0)
-        self.assertEqual(lines["profile a"], f"profile a: {len(usage)} turns · in {dsk.kilo(total_in)} "
-                                             f"({round(hit * 100 / total_in)}% cached) · out {dsk.kilo(total_out)} · "
-                                             f"0 failovers away · {secs / timed:.1f} s per turn · "
-                                             f"first data p95 {dsk.p95([u['first'] for u in usage if u['first'] is not None]):.1f}s")
-        code, out, err = self.dsk("stats", "--sessions", cwd=repo)
-        tail = out.split("\n\n")[1].splitlines()
-        mine = dsk.Session(second).of("usage")
-        mine_in, mine_hit = sum(u["prompt"] for u in mine), sum(u["hit"] or 0 for u in mine)
-        self.assertEqual(tail, [f"{second} · review · 1 turns (0 r, 1 w, 0 x, 0 f) · in {dsk.kilo(mine_in)} "
-                                f"({round(mine_hit * 100 / mine_in)}% cached) · out {dsk.kilo(sum(u['out'] for u in mine))}"
-                                f" · {os.path.basename(repo)}",
-                                f"{first} · done · 1 turns (0 r, 0 w, 0 x, 0 f) · in "
-                                f"{dsk.kilo(sum(u['prompt'] for u in dsk.Session(first).of('usage')))} "
-                                f"({round(sum(u['hit'] or 0 for u in dsk.Session(first).of('usage')) * 100 / sum(u['prompt'] for u in dsk.Session(first).of('usage')))}% cached)"
-                                f" · out {dsk.kilo(sum(u['out'] for u in dsk.Session(first).of('usage')))} · "
-                                f"{os.path.basename(repo)}"])
-        self.assertEqual(self.dsk("stats", "--days", "0", cwd=repo)[:2], (0, "no sessions in the last 0 days\n"))
 
     def test_stats_project_leaves_out_a_session_of_another_root(self):
         repo = self.repo({"a.py": "a = 1\n"})

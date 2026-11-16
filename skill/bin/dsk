@@ -1,3 +1,14 @@
 #!/bin/sh
-# The dsk command. Claude Code puts a plugin's bin/ on the PATH of the Bash tool while the plugin is enabled.
-exec python3 "$(dirname "$0")/../scripts/dsk.py" "$@"
+# The dsk command. Claude Code puts a plugin's bin/ on the PATH of the Bash tool while the plugin is enabled, and the
+# hooks and the display run it too. dsk is TypeScript, run by Node.js 22.18 or newer: scripts/start.mjs runs the build
+# in scripts/dist/ while it matches the sources, else the sources. The worker's scripts run in Python 3.13 or newer.
+if ! command -v node >/dev/null 2>&1; then
+  needs="dsk needs Node.js 22.18 or newer on PATH, and there is none: https://nodejs.org"
+  case " $* " in
+    *" --announce "*) printf '{"systemMessage": "%s"}\n' "$needs"; exit 0 ;;  # said once, at session start
+    *" --hook "*) exit 0 ;;  # any other hook stays quiet, so that it does not fail on every turn
+  esac
+  echo "$needs" >&2
+  exit 1
+fi
+exec node "$(dirname "$0")/../scripts/start.mjs" "$@"

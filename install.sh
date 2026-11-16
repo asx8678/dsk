@@ -80,7 +80,23 @@ case "$mode" in
 uninstall) ;;   # uninstall reads no lists, so it needs no Python
 *)
     if ! python_ok; then
-        echo "install.sh: dsk needs Python 3.13 or newer, as python3, python3.13, python3.14 or python3.15, and there is none on your PATH. Install Python first: https://www.python.org/downloads/" >&2
+        echo "install.sh: dsk needs Python 3.13 or newer, as python3, python3.13, python3.14 or python3.15, for the worker's scripts, and there is none on your PATH. Install Python first: https://www.python.org/downloads/" >&2
+        exit 1
+    fi
+    ;;
+esac
+
+# ---- the Node.js that runs dsk
+
+node_ok() {   # is there a Node.js 22.18 or newer on PATH? It runs dsk's TypeScript as it is.
+    command -v node >/dev/null 2>&1 && node -e 'const [a, b] = process.versions.node.split(".").map(Number); process.exit(a > 22 || (a === 22 && b >= 18) ? 0 : 1)' >/dev/null 2>&1
+}
+
+case "$mode" in
+uninstall) ;;
+*)
+    if ! node_ok; then
+        echo "install.sh: dsk needs Node.js 22.18 or newer on your PATH, which runs it, and there is none. Install Node.js first: https://nodejs.org" >&2
         exit 1
     fi
     ;;
@@ -280,21 +296,21 @@ write_command() {   # write ~/.local/bin/dsk, a small script that runs the plugi
 # Written by dsk's install.sh: runs the dsk plugin that Claude Code has installed.
 set -eu
 
-linked="$HOME/.claude/skills/dsk/scripts/dsk.py"
-if [ -f "$linked" ]; then
-    exec python3 "$linked" "$@"
+linked="$HOME/.claude/skills/dsk/bin/dsk"
+if [ -x "$linked" ]; then
+    exec "$linked" "$@"
 fi
 
 newest=
 for folder in "$HOME"/.claude/plugins/cache/asx8678/dsk/*/; do
-    [ -f "$folder/scripts/dsk.py" ] || continue
+    [ -x "$folder/bin/dsk" ] || continue
     [ ! -f "$folder/.orphaned_at" ] || continue   # an update marks the folder it left behind as orphaned
     if [ -z "$newest" ] || [ "$folder" -nt "$newest" ]; then
         newest="$folder"
     fi
 done
 if [ -n "$newest" ]; then
-    exec python3 "$newest/scripts/dsk.py" "$@"
+    exec "$newest/bin/dsk" "$@"
 fi
 
 echo "dsk: the plugin is not installed. Run install.sh again." >&2

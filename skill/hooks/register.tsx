@@ -764,7 +764,7 @@ const card = (kit: Kit, report: Report) => {
  * own copy first, then the one on PATH. Undefined when neither can be run.
  */
 const dsk = async ($: EngineInterface, args: readonly string[], stdin?: string) => {
-  for (const program of [`${$.plugin.root}/scripts/dsk.py`, 'dsk']) {
+  for (const program of [`${$.plugin.root}/bin/dsk`, 'dsk']) {
     try {
       const ran = await $.process.run(
         [program, ...args],

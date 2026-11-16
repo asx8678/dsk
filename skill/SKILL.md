@@ -4,7 +4,6 @@ description: Hand the hands-on work to a DeepSeek worker through the dsk CLI, an
 allowed-tools:
   - Bash(dsk *)
   - Bash(${CLAUDE_SKILL_DIR}/bin/dsk *)
-  - Bash(${CLAUDE_SKILL_DIR}/scripts/dsk.py *)
 ---
 
 # dsk: you plan and verify, DeepSeek does the work

@@ -1,0 +1,15 @@
+{
+  "name": "dsk-dev",
+  "private": true,
+  "description": "Development tools for dsk: the type checker. dsk itself needs none of this; Node runs skill/scripts/dsk.ts as it is.",
+  "type": "module",
+  "scripts": {
+    "build": "tsc -p skill/scripts/tsconfig.build.json && node skill/scripts/stamp.mjs",
+    "check": "tsc -p skill/scripts && node tools/unawaited.ts",
+    "prove": "bun tools/prove.mjs"
+  },
+  "devDependencies": {
+    "@types/node": "^22.18.0",
+    "typescript": "7.0.2"
+  }
+}
