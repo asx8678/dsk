@@ -2183,10 +2183,12 @@ class Protocol(Cli):
                                "--check", f"{status} > {self.tmp}/checks.json", "edit  it\nnow", cwd=repo)
         seen = {name: json.loads(self.cat(self.tmp, f"{name}.json"))["jobs"] for name in ("script", "model", "checks")}
         seen["end"] = json.loads(self.dsk("status", "--json")[1])["jobs"]
-        self.assertEqual({name: [[job[k] for k in ("status", "phase", "turn", "act")] for job in jobs]
+        # `act` is the round's latest action, also while the worker waits for its model after it; `step` is its kind
+        self.assertEqual({name: [[job[k] for k in ("status", "phase", "turn", "step", "act")] for job in jobs]
                           for name, jobs in seen.items()},
-                         {"script": [["running", "script", 0, "read tests/t.py"]], "model": [["running", "model", 1, ""]],
-                          "checks": [["running", "checks", 1, "done x"]], "end": [["review", "", 2, ""]]})
+                         {"script": [["running", "script", 0, "read", "read tests/t.py"]],
+                          "model": [["running", "model", 1, "sh", f"sh {status} > {self.tmp}/script.json"[:80]]],
+                          "checks": [["running", "checks", 1, "done", "done x"]], "end": [["review", "", 2, "", ""]]})
         # `doing` is the shell command or check in flight, which here is the one that asked
         self.assertEqual([seen[name][0]["doing"] for name in ("script", "model", "checks", "end")],
                          [f"{status} > {self.tmp}/script.json"[:80], "", f"{status} > {self.tmp}/checks.json"[:80], ""])

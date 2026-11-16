@@ -91,6 +91,31 @@ const WORD: Record<string, string> = {
   accepted: 'accepted',
   dropped: 'dropped',
 }
+// A running job named by what it works on: the kind of its latest action. A worker waits for its model most of the
+// time, so the phase alone said Thinking… nearly always. Before its first action it plans; after a hand-in it is
+// sent back to, by a failed check or the second look, it revises.
+const STEP: Record<string, string> = {
+  '': 'Planning…',
+  read: 'Reading…',
+  glob: 'Searching…',
+  grep: 'Searching…',
+  edit: 'Editing…',
+  write: 'Editing…',
+  sh: 'Running…',
+  search: 'Researching…',
+  fetch: 'Researching…',
+  done: 'Revising…',
+}
+// Every word as wide as the widest, so that the bars of the rows line up.
+const ACTIVITY_WIDTH = Math.max(...[...Object.values(STEP), WORD.model, WORD.script, WORD.checks].map(word => word?.length ?? 0))
+
+/** The word for a running job: the checks by name, else what it works on; a dsk before 0.10.6 sends no step. */
+const activity = (job: Job) =>
+  (job.phase === 'checks' || job.step === undefined
+    ? (WORD[job.phase] ?? job.phase)
+    : (STEP[job.step] ?? WORD[job.phase] ?? job.phase)
+  ).padEnd(ACTIVITY_WIDTH)
+
 const MARK: Record<string, string> = {
   review: '⏺',
   question: '⏺',
@@ -470,7 +495,7 @@ const detail = (Text: Kit['Text'], job: Job, at: number, tail: string) => {
 
     return (
       <Text>
-        <Text color={tone}>{`${WORD[job.phase] ?? job.phase} `}</Text>
+        <Text color={tone}>{`${activity(job)} `}</Text>
         {meter(Text, turn / job.max_turns, 8, 'claude')}
         <Text dimColor>{` ${turn}/${job.max_turns}${tokens}`}</Text>
         {cached}
@@ -494,7 +519,13 @@ const detail = (Text: Kit['Text'], job: Job, at: number, tail: string) => {
 
 /** What a running job does right now: the command in flight, else the last one it finished. */
 const doing = (job: Job) =>
-  job.doing !== '' ? ` · ▸ ${job.doing}` : job.act !== '' ? ` · ${job.act}` : ''
+  job.doing !== '' ? ` · ▸ ${job.doing}` : job.act !== '' ? ` · ${target(job)}` : ''
+
+/** What the latest action was on: the file, pattern or command. The word before it already names its kind. */
+const target = (job: Job) =>
+  job.step !== undefined && job.step !== '' && job.act.startsWith(`${job.step} `) && STEP[job.step] !== undefined
+    ? job.act.slice(job.step.length + 1)
+    : job.act
 
 /**
  * One job as a branch of the tree, as Claude Code draws a subagent: what it is

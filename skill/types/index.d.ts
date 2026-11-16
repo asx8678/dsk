@@ -15,10 +15,13 @@ export type Job = {
   out: number
   /** Cached share of the input tokens, 0 to 1; null when the provider never said. */
   cached: number | null
-  /** The last action the turn in flight finished. */
+  /** The round's latest action, kind and argument (`read src/a.py`); before 0.10.6, the turn in flight's only. */
   act: string
   /** The shell command or check running now, or empty. */
   doing: string
+  /** While running: the kind of the round's latest action (read, grep, edit, sh, search, done...), empty before
+   * the first; absent from a dsk before 0.10.6. */
+  step?: string
   /** The profile the run left and why (`coralbricks 429`), or empty. */
   failover: string
   /** Dollars so far, or null when a profile it used has no `price`. */
