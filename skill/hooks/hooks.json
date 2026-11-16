@@ -9,7 +9,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "python3 \"${CLAUDE_PLUGIN_ROOT}/scripts/dsk.py\" configure --hook --announce --data \"${CLAUDE_PLUGIN_DATA}\""
+            "command": "\"${CLAUDE_PLUGIN_ROOT}/bin/dsk\" configure --hook --announce --data \"${CLAUDE_PLUGIN_DATA}\""
           }
         ]
       }
@@ -19,7 +19,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "python3 \"${CLAUDE_PLUGIN_ROOT}/scripts/dsk.py\" configure --hook --data \"${CLAUDE_PLUGIN_DATA}\""
+            "command": "\"${CLAUDE_PLUGIN_ROOT}/bin/dsk\" configure --hook --data \"${CLAUDE_PLUGIN_DATA}\""
           }
         ]
       }
@@ -29,7 +29,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "python3 \"${CLAUDE_PLUGIN_ROOT}/scripts/dsk.py\" status --hook"
+            "command": "\"${CLAUDE_PLUGIN_ROOT}/bin/dsk\" status --hook"
           }
         ]
       }

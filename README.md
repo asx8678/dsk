@@ -7,7 +7,9 @@
 
 <p align="center">
   <a href="#install"><img alt="Claude Code plugin" src="https://img.shields.io/badge/claude%20code-plugin-4f46e5?style=flat-square"></a>
-  <img alt="Python 3.13+" src="https://img.shields.io/badge/python-3.13%2B-4f46e5?style=flat-square">
+  <img alt="Node.js 22.18+" src="https://img.shields.io/badge/node-22.18%2B-4f46e5?style=flat-square">
+  <img alt="TypeScript 7" src="https://img.shields.io/badge/typescript-7-4f46e5?style=flat-square">
+  <img alt="Python 3.13+ for the worker's scripts" src="https://img.shields.io/badge/python-3.13%2B-4f46e5?style=flat-square">
   <img alt="standard library only" src="https://img.shields.io/badge/dependencies-none-4f46e5?style=flat-square">
 </p>
 
@@ -21,7 +23,7 @@
   <a href="#more">Docs</a>
 </p>
 
-Your best model shouldn't spend its turns reading files and typing out boilerplate. **dsk** is a small headless CLI that Claude Code calls through Bash to hand that work to DeepSeek V4.1 Flash: Claude plans, reviews and decides; the worker scouts the code and writes it, tests, docs and web research included. One Python file, standard library only, shipped as a Claude Code plugin: the skill, a reviewer agent, the review gate and a display of the jobs.
+Your best model shouldn't spend its turns reading files and typing out boilerplate. **dsk** is a small headless CLI that Claude Code calls through Bash to hand that work to DeepSeek V4.1 Flash: Claude plans, reviews and decides; the worker scouts the code and writes it, tests, docs and web research included. Written in TypeScript and run by Node with no dependencies, the worker's scripts in Python, shipped as a Claude Code plugin: the skill, a reviewer agent, the review gate and a display of the jobs.
 
 - **About 3 turns, not 30.** Each turn the worker sends one Python script that reads, edits, runs and searches through a small function API, and only what it prints comes back.
 - **Nothing lands unreviewed.** `dsk` runs every `--check` itself, undoes what a script changed outside `--allow`, and a Stop hook sends Claude back to any session still waiting for `accept` or `reject`.
@@ -47,7 +49,7 @@ Claude Code then asks which provider runs the worker, and for what that provider
 - **To change an answer,** `/plugin configure dsk@asx8678` opens the same form again; restart Claude Code after changing it. Everything else is changed in `/dsk config`: see [In Claude Code](#in-claude-code).
 - **To update,** type `/dsk update`: see [In Claude Code](#in-claude-code).
 - **To check it,** `dsk doctor` tests the key and the model against the provider, and `dsk configure` shows how dsk is set up. Until a provider is set, each session starts by saying what is missing.
-- **It needs** Python 3.13 or newer on `PATH`, as `python3` or as `python3.13`, `python3.14` or `python3.15`.
+- **It needs** Node.js 22.18 or newer on `PATH`, which runs dsk, and Python 3.13 or newer, as `python3` or as `python3.13`, `python3.14` or `python3.15`, which runs the worker's scripts. When one is missing, the session says so at its start.
 
 <details>
 <summary>From a shell, or to work on dsk itself</summary>
@@ -94,7 +96,7 @@ One command, typed like any other slash command, with a word after it for all bu
 A provider is an API that serves a DeepSeek model: DeepSeek's own (`official`), or any OpenAI-compatible endpoint you add (a custom provider). `/dsk config` lists them in the order a run tries them, each with its model, its endpoint and whether its key is set. It looks roughly like this:
 
 ```
-dsk 0.10.6 · settings
+dsk 0.11.0 · settings
   Delegation   ● on  Claude hands the hands-on work to dsk
   Job display  ● on  running jobs show above the prompt, /dsk lists them
   Route order  your priority  providers are tried as numbered below
@@ -299,7 +301,7 @@ It is the session that wrote the first generator of this page's images: 7 turns 
 | Command | `bin/dsk` | on the `PATH` of Claude's Bash tool while the plugin is enabled |
 | Hooks | `hooks/hooks.json` | three commands: at session start and before each prompt, `dsk configure --hook`; at each stop, `dsk status --hook` |
 | Hooks module | `hooks/register.tsx` | the display and the command `/dsk`; TypeScript, because Claude Code runs it itself |
-| CLI | `scripts/dsk.py` | everything else. Claude Code never loads it, it only runs it |
+| CLI | `scripts/dsk.ts`, `scripts/lib/` | everything else, in TypeScript. `scripts/start.mjs` runs the build in `scripts/dist/` while it matches the sources, else the sources; `scripts/runner.py` runs the worker's scripts. Claude Code never loads it, it only runs it |
 
 The Stop hook and the two configure hooks are always on. Delegation and the display are switches: `/dsk enable` turns both on and `/dsk disable` turns both off, in the session where you type it and in the sessions you start afterwards, and `Delegation` and `Job display` in `/dsk config` turn each by itself. An install that never chose hands work to dsk with the display off. Off, Claude is told to do the work itself (in its prompt, in the skill, and in the refusal of a `dsk run`), and the display reads nothing and draws nothing; a `dsk` you run yourself in a shell is not refused. `/dsk` lists the jobs. Every command is in [In Claude Code](#in-claude-code).
 
@@ -343,7 +345,10 @@ What is known not to work yet: [docs/limits.md](docs/limits.md).
 ## Tests
 
 ```
-python3 -m unittest discover -s tests     # 163 tests against a scripted API server and temp git repositories
+npm run check                             # TypeScript 7 type-checks the sources; every async call is awaited
+npm run build                             # compiles them into skill/scripts/dist/, which start.mjs runs while it is fresh
+bun run prove                             # gdp-wired proves the laws of the stop rules, the scope gate, the lifecycle and retries
+python3 -m unittest discover -s tests     # 128 tests against a scripted API server and temp git repositories
 python3 tests/live.py --table             # real toy tasks on the real providers; costs a few cents
 sh tests/install_test.sh                  # install.sh against a throwaway home folder, without the network
 ```

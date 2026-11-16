@@ -263,7 +263,7 @@ test('the display stays unloaded until /dsk enable, and the choice is kept', asy
 
   expect((await typed($, 'enable'))?.text).toMatch(/^dsk is enabled/)
   expect(ran[0]?.slice(-2)).toEqual(['status', '--json'])
-  expect(ran[0]?.[0]).toMatch(/\/scripts\/dsk\.py$/)
+  expect(ran[0]?.[0]).toMatch(/\/bin\/dsk$/)
   expect(kept).toEqual({ delegate: true, on: true })
   const loaded = await $.ui.mount({ ...BAND, surface: 'terminal' })
   expect((await loaded.find({ type: 'Text', text: /^. dsk · / }))?.text).toMatch(/dsk · 1 worker/)
