@@ -11,6 +11,7 @@ import { cachedShare, kilo } from './reports.ts'
 import { Session } from './session.ts'
 import { fastOrder, speeds } from './speed.ts'
 import { OPTIONS, SETUP } from './texts.ts'
+import { mendLauncher } from './launcher.ts'
 import { paused, spent } from './wire.ts'
 
 /** The first line of a file, without reading the rest of it. */
@@ -484,17 +485,22 @@ export function cmdConfigure(args: Args, cfg: Cfg): any {
           python = e.message
         }
       }
+      // Before every prompt too, not only at session start: /reload-plugins after an update starts no session.
+      const mended = mendLauncher()
+      let said: any = null
       if (python) {
-        print(pyJSONAscii({ systemMessage: `${news ? news + ' ' : ''}${python}.` }))
+        said = { systemMessage: `${news ? news + ' ' : ''}${python}.` }
       } else if (args.announce && ready && news) {
-        print(pyJSONAscii({ systemMessage: `${news} /dsk enable shows the jobs, /dsk config configures it.` }))
+        said = { systemMessage: `${news} /dsk enable shows the jobs, /dsk config configures it.` }
       }
       if (!python && args.announce && !ready) {
         const how = `Run /plugin configure ${plugin('id')} and ${SETUP}. Then restart Claude Code.`
-        print(pyJSONAscii({ systemMessage: `${news ? news + ' ' : ''}dsk is not set up yet: ${state}. ${how}`, hookSpecificOutput: {
+        said = { systemMessage: `${news ? news + ' ' : ''}dsk is not set up yet: ${state}. ${how}`, hookSpecificOutput: {
           hookEventName: 'SessionStart', additionalContext: `The dsk plugin has no working provider (${state}), so ` +
-            '`dsk run` will fail. If the user wants to delegate with dsk, tell them: ' + `${how} Never ask for a key in the chat.` } }))
+            '`dsk run` will fail. If the user wants to delegate with dsk, tell them: ' + `${how} Never ask for a key in the chat.` } }
       }
+      if (mended) said = said ? { ...said, systemMessage: `${said.systemMessage} ${mended}` } : { systemMessage: mended }
+      if (said) print(pyJSONAscii(said))
     } catch (e) { // a hook must never stand in the way of a session or a prompt
       if (e instanceof Interrupted) throw e
     }

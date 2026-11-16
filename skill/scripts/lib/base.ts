@@ -585,6 +585,13 @@ export async function shell(cmd: string, timeout: number, env?: NodeJS.ProcessEn
 
 // ---------------------------------------------------------------- output
 
+/**
+ * Whoever read dsk's output has gone, as `head` does after its lines: nothing more can be told, so main() ends
+ * without a word instead of reporting it on the pipe that just closed. Its own class, so that an EPIPE from a child
+ * process's pipe still counts as the error it is.
+ */
+export class OutputClosed extends Error {}
+
 /** Write all of `text` to a descriptor, synchronously. On macOS Node writes to a pipe asynchronously, so a report
  * written with console.log could be cut off by the process.exit() after it; a full pipe answers EAGAIN, so wait. */
 function writeAll(fd: number, text: string): void {
@@ -594,6 +601,7 @@ function writeAll(fd: number, text: string): void {
     try {
       done += fs.writeSync(fd, data, done, data.length - done)
     } catch (e: any) {
+      if (e?.code === 'EPIPE') throw new OutputClosed(`fd ${fd} closed`)
       if (e?.code !== 'EAGAIN') throw e
       sleepSync(0.001)
     }
