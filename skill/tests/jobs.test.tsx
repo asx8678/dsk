@@ -246,7 +246,7 @@ const typed = ($: Engine, args: string) =>
     presentation: { isFullscreen: true, columns: 120 },
   })
 
-test('the display stays unloaded until /dsk on, and the choice is kept', async ($, on) => {
+test('the display stays unloaded until /dsk enable, and the choice is kept', async ($, on) => {
   const { ran, lines, closed, kept } = await start($, on, [RUNNING], { on: false })
 
   // Unloaded: dsk is not read, and every site is the engine's own.
@@ -258,20 +258,20 @@ test('the display stays unloaded until /dsk on, and the choice is kept', async (
   expect((await row.find({ type: 'Text' }))?.text).toBe('Bash(dsk run "Write apps/todo/ with tests")')
   await row.unmount()
   expect((await typed($, ''))?.text).toBe(
-    'dsk is off. /dsk on turns it on.',
+    "dsk's job display is off. /dsk enable turns dsk on; /dsk config has a row for each.",
   )
 
-  expect((await typed($, 'on'))?.text).toMatch(/^dsk is on/)
+  expect((await typed($, 'enable'))?.text).toMatch(/^dsk is enabled/)
   expect(ran[0]?.slice(-2)).toEqual(['status', '--json'])
   expect(ran[0]?.[0]).toMatch(/\/scripts\/dsk\.py$/)
-  expect(kept).toEqual({ on: true })
+  expect(kept).toEqual({ delegate: true, on: true })
   const loaded = await $.ui.mount({ ...BAND, surface: 'terminal' })
   expect((await loaded.find({ type: 'Text', text: /^. dsk · / }))?.text).toMatch(/dsk · 1 worker/)
   await loaded.unmount()
   expect(lines.at(-1)).toBe('✻ dsk 1 running · ↑ 5.3k · ↓ 2.9k · 60% cached')
 
-  expect((await typed($, 'off'))?.text).toMatch(/^dsk is off/)
-  expect(kept).toEqual({ on: false })
+  expect((await typed($, 'disable'))?.text).toMatch(/^dsk is disabled/)
+  expect(kept).toEqual({ delegate: false, on: false })
   expect(lines.at(-1)).toBeUndefined()
   expect(closed).toEqual(['dsk-jobs'])
   const unloaded = await $.ui.mount({ ...BAND, surface: 'terminal' })

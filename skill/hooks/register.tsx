@@ -112,6 +112,7 @@ const board = atom(
 const calls = atom({ plugin: 'dsk', key: 'calls' } as const, {}, { shape: 'calls-1' })
 const frame = atom({ plugin: 'dsk', key: 'frame' } as const, 0)
 const isOn = atom({ plugin: 'dsk', key: 'isOn' } as const, false)
+const delegates = atom({ plugin: 'dsk', key: 'delegates' } as const, true)
 const view = atom({ plugin: 'dsk', key: 'view' } as const, null, { shape: 'view-1' })
 const providers = atom(
   { plugin: 'dsk', key: 'providers' } as const,
@@ -129,16 +130,26 @@ const seat = (count: number) => ({
   title: 'dsk config',
   focus: true as const,
   closeOnEscape: true as const,
-  rows: 14 + count,
+  rows: 15 + count,
 })
 
 // What /dsk takes after its name, each with the line the typeahead shows beside it.
 const WORDS = [
-  { word: 'on', description: 'Turn dsk on: running jobs show above the prompt' },
-  { word: 'off', description: 'Turn dsk off: only the display stops' },
+  { word: 'enable', description: 'Enable dsk: Claude hands work to dsk, and running jobs show above the prompt' },
+  { word: 'disable', description: 'Disable dsk: Claude does the work itself, and nothing is shown' },
   { word: 'update', description: 'Fetch the newest dsk and install it' },
-  { word: 'config', description: 'Open the settings: on or off, and the providers' },
+  { word: 'config', description: 'Open the settings: delegation, the display, and the providers' },
 ] as const
+// A dsk call that starts a round of work, wherever it stands in a command, with the rest of its arguments: looser
+// than CALL, because what it guards must not get by on a spelling.
+const ROUND = /(?:^|[\s;&|(\/])dsk(?:\.py)?\s+(run|answer|continue|reject)\b([^;&|\n]*)/g
+// What Claude is told while dsk is disabled: when a dsk call is refused, when it opens the skill, and in its prompt.
+const OFF_CALL =
+  'dsk is disabled (the user typed /dsk disable): nothing is delegated to dsk, so this call was not run. Do the work yourself. dsk show, dsk status, dsk accept and dsk reject ID --drop still work on the jobs there are. /dsk enable turns delegation on again; say so if the user asks for dsk.'
+const OFF_SKILL =
+  'dsk is disabled: the user turned delegation off with /dsk disable. Do not hand work to dsk: a dsk run, answer or continue, and a dsk reject that sends defects back, are refused. Do the work yourself, as you would without this skill. Jobs that exist can still be read (dsk show, dsk status), accepted (dsk accept) or dropped (dsk reject ID --drop). If the user asks for dsk, say that /dsk enable turns it on.'
+const OFF_PROMPT =
+  'dsk is disabled: the user turned delegation to dsk off with /dsk disable. Do not use the dsk:delegate skill and do not start dsk jobs (dsk run, answer, continue, or a reject that sends defects back): they are refused. Do the work yourself. /dsk enable turns delegation on again.'
 
 type Kit = Pick<Elements['terminal'], 'Box' | 'Text' | 'Code' | 'Button'>
 type Call = { verb: string; id: string | undefined; said: string }
@@ -258,6 +269,17 @@ const callOf = (command: string): Call | undefined => {
   const own = visible.slice(found.index, next === -1 ? undefined : after + next)
 
   return { verb: found[1] ?? '', id: found[2], said: positional(own) }
+}
+
+/**
+ * Whether a Bash command starts a round of work in dsk: a run, an answer, a continue, or a reject that sends defects
+ * back and does not drop the work. Words in a here-document or in quotes are text, and start nothing.
+ */
+const startsRound = (command: string) => {
+  const visible = command.replace(HEREDOC, body => body.replace(/[^\n]/g, ' '))
+  const blanked = visible.replace(QUOTED, quoted => ' '.repeat(quoted.length))
+
+  return [...blanked.matchAll(ROUND)].some(found => found[1] !== 'reject' || !/(?:^|\s)--drop\b/.test(found[2] ?? ''))
 }
 
 /** What a Bash call printed, as the row's props hold it: the text, or its standard output. */
@@ -949,6 +971,8 @@ let me = ''
 let cwd = ''
 // Whether the display is loaded: what the store holds, read at the start.
 let isLoaded = false
+// Whether Claude may hand work to dsk: on until `/dsk disable` says otherwise.
+let isDelegating = true
 let periods = 0
 let grace = 0
 let inFlight = 0
@@ -1180,10 +1204,17 @@ const upgrade = async ($: EngineInterface) => {
     : `dsk ${entry.version} → ${now} updated. Restart Claude Code or run /reload-plugins to load it.`
 }
 
-/** Turns dsk on or off here, and keeps the choice for the sessions after this one. */
+/** Turns the display on or off here, and keeps the choice for the sessions after this one. */
 const power = async ($: EngineInterface, on: boolean) => {
   await $.store.set('on', on)
   await load($, on)
+}
+
+/** Lets Claude hand work to dsk, or not, here and in the sessions after this one. */
+const delegate = async ($: EngineInterface, on: boolean) => {
+  isDelegating = on
+  await $.store.set('delegate', on)
+  await update($, delegates, () => on)
 }
 
 /** Puts one job's diff or its turns in the pane, in place of the list. */
@@ -1201,12 +1232,12 @@ const configure = async ($: EngineInterface) => {
   const used = now.list.filter(one => one.enabled).map(one => `${one.name} (${one.model})`)
   const searchOnly = now.list.filter(one => !one.enabled && one.official).map(one => one.name)
   const off = now.list.filter(one => !one.enabled && !one.official).map(one => one.name)
-  const state = `dsk${shownVersion === '' ? '' : ` ${shownVersion}`} is ${isLoaded ? 'on' : 'off'}. `
+  const state = `dsk${shownVersion === '' ? '' : ` ${shownVersion}`}: delegation ${isDelegating ? 'on' : 'off'}, job display ${isLoaded ? 'on' : 'off'}. `
 
   return {
     text: now.isError
       ? now.note
-      : `${state}The work goes to ${used.join(' → ') || 'nothing'}${searchOnly.length > 0 ? `; web search only: ${searchOnly.join(', ')}` : ''}${off.length > 0 ? `; disabled: ${off.join(', ')}` : ''}. Web search: ${now.search ? 'on' : 'off, no DeepSeek key'}. In the dsk config pane: ↑/↓ and Enter open a provider to set its priority, edit, enable or disable it; Route order chooses between your priority and the fastest first; Esc closes it.`,
+      : `${state}The work goes to ${used.join(' → ') || 'nothing'}${searchOnly.length > 0 ? `; web search only: ${searchOnly.join(', ')}` : ''}${off.length > 0 ? `; disabled: ${off.join(', ')}` : ''}. Web search: ${now.search ? 'on' : 'off, no DeepSeek key'}. In the dsk config pane: Delegation and Job display turn each on or off; ↑/↓ and Enter open a provider to set its priority, edit, enable or disable it; Route order chooses between your priority and the fastest first; Esc closes it.`,
   }
 }
 
@@ -1217,11 +1248,15 @@ export const register: Register = on => {
     shownVersion = await version($)
     await $.command.register({
       name: COMMAND,
-      description: 'Open the list of dsk jobs; /dsk on or off turns dsk on or off; /dsk update updates it; /dsk config configures it',
-      argumentHint: '[on|off|update|config]',
+      description: 'Open the list of dsk jobs; /dsk enable or disable turns delegation to dsk and its display on or off; /dsk update updates it; /dsk config configures it',
+      argumentHint: '[enable|disable|update|config]',
       immediate: true,
     })
-    // The choice made with `/dsk on` or `off` holds for the sessions after it.
+    // The choice made with `/dsk enable` or `disable` holds for the sessions after it. Delegation is on until it was
+    // turned off: an install that never chose has the display off and hands work to dsk.
+    isDelegating = (await $.store.get('delegate')) !== false
+    await update($, delegates, () => isDelegating)
+
     // Unloaded is how a session starts, so there is nothing to take down.
     if ((await $.store.get('on')) === true) {
       await load($, true)
@@ -1463,6 +1498,7 @@ export const register: Register = on => {
     }
 
     const shownOn = await read($, isOn)
+    const hands = await read($, delegates)
     const searchOnly = now.list.filter(one => !one.enabled && one.official)
     const off = now.list.filter(one => !one.enabled && !one.official)
     const wide = Math.min(18, Math.max(8, ...now.list.map(one => one.name.length)))
@@ -1520,7 +1556,7 @@ export const register: Register = on => {
     const keys = `Enter to select${open} · Esc to close`
     // The rows of the list: its title, the settings, the providers under their line, what dsk said, and the keys.
     const need =
-      1 + 2 + 1 + 1 + tall(about) + now.list.length + 1 + 1 + (now.search ? 0 : tall(search)) +
+      1 + 3 + 1 + 1 + tall(about) + now.list.length + 1 + 1 + (now.search ? 0 : tall(search)) +
       (now.note === '' ? 0 : now.note.split('\n').reduce((sum, line) => sum + tall(line), 0)) + tall(`${keys} · Tab to move · ↑/↓ to scroll`)
 
     return (
@@ -1529,6 +1565,14 @@ export const register: Register = on => {
           <Text bold>{`dsk${shownVersion === '' ? '' : ` ${shownVersion}`}`}</Text>
           <Text dimColor> · settings</Text>
         </Box>
+        {setting(
+          'dsk-delegate',
+          'Delegation',
+          hands ? '● on' : '○ off',
+          hands ? 'success' : 'inactive',
+          hands ? 'Claude hands the hands-on work to dsk' : 'Claude does the work itself, a dsk run is refused',
+          () => delegate($, !hands),
+        )}
         {setting(
           'dsk-power',
           'Job display',
@@ -1588,14 +1632,15 @@ export const register: Register = on => {
   on('command.run', { command: COMMAND }, async ($, e) => {
     const word = (e.args ?? '').trim().toLowerCase()
 
-    if (word === 'on' || word === 'off') {
-      await power($, word === 'on')
+    if (word === 'enable' || word === 'disable') {
+      await delegate($, word === 'enable')
+      await power($, word === 'enable')
 
       return {
         text:
-          word === 'on'
-            ? `dsk is on, here and in the sessions you start after this one. Running jobs show above the prompt, /${COMMAND} lists them all, /${COMMAND} off turns it off, /${COMMAND} config configures it.`
-            : `dsk is off, here and in the sessions you start after this one. /${COMMAND} on turns it on again.`,
+          word === 'enable'
+            ? `dsk is enabled, here and in the sessions you start after this one. Claude hands work to dsk again, running jobs show above the prompt, /${COMMAND} lists them all, /${COMMAND} disable turns it off, /${COMMAND} config configures it.`
+            : `dsk is disabled, here and in the sessions you start after this one. Nothing is delegated to dsk: Claude does the work itself, and a dsk run is refused. Jobs that are running finish, and dsk show, accept and reject --drop still work. /${COMMAND} enable turns it on again.`,
       }
     }
 
@@ -1607,11 +1652,16 @@ export const register: Register = on => {
       return configure($)
     }
 
-    if (word !== '' || !isLoaded) {
+    // A word it does not take: what it does take, whether dsk is on or off.
+    if (word !== '') {
       return {
-        text: isLoaded
-          ? `Usage: /${COMMAND} lists the jobs, /${COMMAND} off turns dsk off, /${COMMAND} update updates it, /${COMMAND} config configures it.`
-          : `dsk is off. /${COMMAND} on turns it on.`,
+        text: `Usage: /${COMMAND} lists the jobs, /${COMMAND} enable turns delegation and the job display on, /${COMMAND} disable turns both off, /${COMMAND} update updates dsk, /${COMMAND} config configures it.`,
+      }
+    }
+
+    if (!isLoaded) {
+      return {
+        text: `dsk's job display is off${isDelegating ? '' : ', and so is delegation'}. /${COMMAND} enable turns dsk on; /${COMMAND} config has a row for each.`,
       }
     }
 
@@ -1652,7 +1702,25 @@ export const register: Register = on => {
 
   // Note when each dsk call began, so its row can find the job it started, and
   // read dsk more often while one is in flight.
+  // Off, the skill that says to delegate says not to, to whoever opens it.
+  on('skill.prompt', async ($, e, next) => (isDelegating || e.pluginName !== 'dsk' ? next(e) : { text: OFF_SKILL }))
+
+  // Off, the prompt says so too, last: the list of skills still names dsk's as the one to use by default. A thread
+  // under way keeps the prompt it started with; there the answer to /dsk disable and the refusal below do the telling.
+  on('prompt.compose', async ($, e, next) => {
+    const composed = await next(e)
+
+    return isDelegating
+      ? composed
+      : { sections: [...composed.sections, { id: 'dsk:off', text: OFF_PROMPT, scope: 'session' as const }] }
+  })
+
   on('tool.call', { tool: 'Bash' }, async ($, e, next) => {
+    // Off, no round of work starts: the call is refused with words that say what to do in its place.
+    if (!isDelegating && startsRound(e.command)) {
+      return { deny: OFF_CALL }
+    }
+
     if (!isLoaded || callOf(e.command) === undefined) {
       return next(e)
     }
@@ -1836,7 +1904,7 @@ export const register: Register = on => {
         <Text dimColor>
           {now.at === 0
             ? 'No reading from `dsk status --json` yet. Is dsk on PATH and up to date?'
-            : `dsk is off. /${COMMAND} on turns it on.`}
+            : `dsk's job display is off. /${COMMAND} enable turns dsk on.`}
         </Text>
       )
     }
