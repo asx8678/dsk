@@ -60,6 +60,8 @@ export type Provider = {
   official: boolean
   /** What the last speed test measured, in seconds; null when it has no time, absent from a dsk before 0.10.3. */
   seconds?: number | null
+  /** "dsk" when built into dsk, "plugin" for the plugin's custom endpoint: those can only be disabled, not removed. "" or absent otherwise. */
+  builtin?: '' | 'dsk' | 'plugin'
 }
 
 /** What the providers pane of /dsk config shows. The form's text is not here: no key is stored. */
@@ -69,8 +71,8 @@ export type Providers = {
   search: boolean
   /** Whether `route_order` is `fastest`: the measured fastest is tried first, not the first listed. */
   isFastest: boolean
-  /** The list, one provider and what can be done with it, or the form that adds or changes one. */
-  mode: 'list' | 'provider' | 'add' | 'edit'
+  /** The list, one provider and what can be done with it, the form that adds or changes one, or the question before one is deleted. */
+  mode: 'list' | 'provider' | 'add' | 'edit' | 'delete'
   /** The provider that is open or that the form changes; in the list, the one last open, where the ring starts. */
   editing: string
   /** What dsk said last, and whether it was an error. */

@@ -687,6 +687,127 @@ class Providers(Cli):
         self.assertNotIn("official", self.files()[0].get("renamed", {}))
         self.assertIn("official", [r["name"] for r in json.loads(self.dsk("provider", "list", "--json")[1])["providers"]])
 
+    def test_remove_deletes_the_profile_and_its_key_and_nothing_else(self):
+        path = f"{self.tmp}/config/dsk/config.json"
+        with open(path) as f:
+            before = json.load(f)
+        before["effort"] = "max"
+        with open(path, "w") as f:
+            json.dump(before, f)
+        with open(f"{self.tmp}/config/dsk/env", "w") as f:
+            f.write("# mine\nexport KEEP=1\n")
+        os.chmod(f"{self.tmp}/config/dsk/env", 0o640)
+        self.dsk("provider", "add", "z", "--url", "https://z.example/v1", "--model", "zm", "--key-stdin", stdin="k1")
+        self.dsk("provider", "add", "w", "--url", "https://w.example/v1", "--model", "wm", "--key-stdin", stdin="k2")
+        self.assertEqual(self.dsk("provider", "rename", "w", "v")[0], 0)
+        code, out, err = self.dsk("provider", "remove", "v")
+        self.assertEqual(code, 0, out + err)
+        self.assertEqual(out, f"dsk · removed v · route: {' → '.join([*before['route'], 'z'])} · its key DSK_W_API_KEY "
+                              "is deleted from ~/.config/dsk/env\n")
+        cfg, env = self.files()
+        self.assertEqual(env, "# mine\nexport KEEP=1\nexport DSK_Z_API_KEY=k1\n")
+        self.assertEqual(os.stat(f"{self.tmp}/config/dsk/env").st_mode & 0o777, 0o640)
+        # Every other setting stays; the alias from its old name goes with it, so that name is free again.
+        self.assertEqual({k: v for k, v in cfg.items() if k not in ("route", "profiles")},
+                         {k: v for k, v in before.items() if k not in ("route", "profiles")})
+        self.assertEqual({k: v for k, v in cfg["profiles"].items() if k != "z"}, before["profiles"])
+        self.assertEqual(cfg["route"], [*before["route"], "z"])
+        self.assertEqual(self.dsk("provider", "add", "w", "--url", "https://w.example/v1", "--model", "wm", "--key-stdin",
+                                  stdin="k3")[0], 0)
+
+    def test_remove_refuses_what_would_come_back_or_empty_the_route_and_keeps_a_key_in_use(self):
+        self.dsk("provider", "add", "z", "--url", "https://z.example/v1", "--model", "zm", "--key-stdin", stdin="k1")
+        path = f"{self.tmp}/config/dsk/config.json"
+        with open(path) as f:
+            cfg = json.load(f)
+        cfg["profiles"]["y"] = {"base_url": "https://y.example/v1", "key_env": "DSK_Z_API_KEY", "model": "ym"}
+        cfg["profiles"]["s"] = {"base_url": "https://s.example/v1", "key_env": "KEY_S", "model": "sm"}
+        with open(path, "w") as f:
+            json.dump(cfg, f)
+        code, out, _ = self.dsk("provider", "remove", "z")
+        self.assertEqual((code, out.split(" · ")[-1]), (0, "its key stays in DSK_Z_API_KEY: y uses it too\n"))
+        self.assertIn("export DSK_Z_API_KEY=k1\n", self.files()[1])
+        code, out, _ = self.dsk("provider", "remove", "s")
+        self.assertEqual((code, out.split(" · ")[-1]), (0, "its key stays in KEY_S: web search uses it\n"))
+        # Removing these would change nothing, or leave no provider to run on: each is refused and writes nothing.
+        self.assertEqual(self.dsk("provider", "disable", "b")[0], 0)
+        kept = self.files()
+        for name, why in (("official", "official is built into dsk"), ("a", "a is the only enabled provider"),
+                          ("nope", "no provider named nope")):
+            code, out, _ = self.dsk("provider", "remove", name)
+            self.assertEqual(code, 1, out)
+            self.assertIn(why, out)
+            self.assertEqual(self.files(), kept)
+        code, out, _ = self.dsk("provider", "remove", "b")  # disabled: the route keeps a
+        self.assertEqual((code, out), (0, "dsk · removed b · route: a · its key stays in KEY_B: dsk did not name it, so "
+                                          "it may serve more than dsk\n"))
+
+    def test_remove_leaves_a_key_on_a_line_with_others_and_says_one_set_in_the_environment(self):
+        for name, key in (("z", "k1"), ("q", "k2")):
+            self.dsk("provider", "add", name, "--url", f"https://{name}.example/v1", "--model", "m", "--key-stdin", stdin=key)
+        env = "export KEEP=1 DSK_Z_API_KEY=k1\nexport DSK_Q_API_KEY=k2\n"
+        with open(f"{self.tmp}/config/dsk/env", "w") as f:
+            f.write(env)
+        code, out, _ = self.dsk("provider", "remove", "z")
+        self.assertEqual((code, out.split(" · ")[-1]), (0, "its key DSK_Z_API_KEY stays: a line of ~/.config/dsk/env sets "
+                                                           "it with other variables; take it out by hand\n"))
+        self.assertEqual(self.files()[1], env)
+        self.env["DSK_Q_API_KEY"] = "from-the-shell"
+        code, out, _ = self.dsk("provider", "remove", "q")
+        self.assertEqual((code, out.split(" · ")[-1]), (0, "its key DSK_Q_API_KEY is deleted from ~/.config/dsk/env; it is "
+                                                           "still set in your environment\n"))
+        self.assertEqual(self.files()[1], "export KEEP=1 DSK_Z_API_KEY=k1\n")
+
+    def test_a_session_fails_over_to_a_provider_renamed_since_it_started_but_not_to_one_removed(self):
+        s = self.session()
+        self.assertEqual(dsk.later_profiles(s, dsk.config()), ["b"])
+        self.assertEqual(self.dsk("provider", "rename", "b", "y")[0], 0)
+        self.assertEqual(dsk.later_profiles(s, dsk.config()), ["y"])
+        self.assertEqual(self.dsk("provider", "rename", "a", "x")[0], 0)  # the one it is on, too
+        self.assertEqual(dsk.later_profiles(s, dsk.config()), ["y"])
+        self.assertEqual(self.dsk("provider", "remove", "y")[0], 0)
+        self.assertEqual(dsk.later_profiles(s, dsk.config()), [])
+
+    def test_work_in_review_on_a_removed_provider_can_still_be_read_and_accepted(self):
+        repo = self.repo({"t.py": "t = 1\n"})
+        self.api.replies = [script('edit("t.py", "t = 1", "t = 2")\ndone("x")')]
+        _, sid = self.run_ok("--profile", "b", "--allow", "t.py", "edit", cwd=repo)
+        self.assertEqual(self.dsk("provider", "remove", "b")[0], 0)
+        for args in (("show", sid, "--review"), ("show", sid, "--diff"), ("status",), ("accept", sid)):
+            code, out, err = self.dsk(*args, cwd=repo)
+            self.assertEqual(code, 0, f"{args}: {out}{err}")
+        self.assertEqual(self.cat(repo, "t.py"), "t = 2\n")
+
+    def test_remove_waits_for_a_running_job_and_a_stopped_one_asks_for_another_provider(self):
+        self.dsk("provider", "add", "c", "--url", "https://c.example/v1", "--model", "m", "--key-stdin", stdin="k")
+        sleep = f"sleep 43.{os.getpid()}"  # its own: an earlier run's sleep outlives the dsk that started it
+        self.api.replies = [script(f'sh("{sleep}")')]
+        proc = subprocess.Popen([sys.executable, DSK, "run", "long one"], cwd=self.tmp, env=self.env,
+                                stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+        self.addCleanup(proc.kill)
+        self.addCleanup(subprocess.run, ["pkill", "-f", sleep])
+        Protocol.wait_for(self, sleep)
+        sid = os.listdir(f"{self.tmp}/state/dsk")[0]
+        # It runs on a, and may fail over to b or c with the config it started with: none of them can go, under a
+        # name given since either.
+        self.assertEqual(self.dsk("provider", "rename", "c", "d")[0], 0)
+        kept = self.files()
+        for name in ("a", "b", "d"):
+            code, out, _ = self.dsk("provider", "remove", name)
+            self.assertEqual((code, out), (1, f"dsk · error: {name} is in use by the running job {sid}; remove it once "
+                                              "it stopped\n"))
+            self.assertEqual(self.files(), kept)
+        proc.terminate()
+        proc.communicate(timeout=30)
+        self.api.replies = [script('ask("Which?")')]
+        _, sid = self.run_ok("--profile", "b", "a question", code=2)
+        self.assertEqual(self.dsk("provider", "remove", "b")[0], 0)
+        code, out, _ = self.dsk("answer", sid, "this one")
+        self.assertEqual((code, out), (1, f"dsk · error: session {sid} ran on b, which was removed; choose another with "
+                                          "--profile, one of: a, d\n"))
+        self.api.replies = [script('done("ok")')]
+        self.assertEqual(self.dsk("answer", sid, "this one", "--profile", "a")[0], 0)
+
     def test_move_sets_the_place_and_a_provider_goes_ahead_of_official_deepseek(self):
         path = f"{self.tmp}/config/dsk/config.json"
         with open(path) as f:

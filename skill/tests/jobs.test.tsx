@@ -710,3 +710,58 @@ test('the config pane opens a provider to set its priority, what official DeepSe
   expect(ran.at(-2)?.slice(1)).toEqual(['provider', 'order', 'fastest'])
   await ui.unmount()
 })
+
+test('a provider is deleted only after a question of its own, and one built into dsk not at all', async ($, on) => {
+  const { ran, world } = await start($, on, [])
+  const one = { base_url: 'https://x/v1', model: 'm', key_env: 'K', key: true, enabled: true, official: false }
+  const official = { ...one, name: 'official', enabled: false, position: null, official: true, builtin: 'dsk' }
+  world.providers = {
+    providers: [
+      { ...one, name: 'mine', position: 1 },
+      { ...one, name: 'other', position: 2, key_env: 'DSK_OTHER_API_KEY' },
+      official,
+    ],
+    search: true,
+    order: 'listed',
+  }
+  await $.command.run({
+    command: 'dsk',
+    args: 'config',
+    origin: { kind: 'composer' },
+    presentation: { isFullscreen: true, columns: 120 },
+  })
+  const ui = await $.ui.mount({
+    ...PANE,
+    requestId: 'dsk-providers',
+    props: { ...PANE.props, title: 'dsk config' },
+    surface: 'terminal',
+  })
+
+  await ui.press({ key: 'row-other' })
+  const before = ran.length
+  await ui.press({ key: 'act-delete' })
+  expect((await rowsOf(ui)).slice(0, 2)).toEqual([
+    'Delete other?',
+    'dsk forgets other (m · x/v1) and takes it off the route. Its API key in DSK_OTHER_API_KEY is deleted from ~/.config/dsk/env as well, unless another provider or web search uses it. This cannot be undone.',
+  ])
+  // Cancel goes back to the provider and runs nothing.
+  await ui.press({ key: 'delete-cancel' })
+  expect(ran.length).toBe(before)
+  expect((await rowsOf(ui))[0]).toBe('other')
+
+  await ui.press({ key: 'act-delete' })
+  world.providers = { providers: [{ ...one, name: 'mine', position: 1 }, official], search: true, order: 'listed' }
+  await ui.press({ key: 'delete-confirm' })
+  expect(ran.at(-2)?.slice(1)).toEqual(['provider', 'remove', 'other'])
+  // Back on the list, which dsk read again, with what it said.
+  expect(ran.at(-1)?.slice(1)).toEqual(['provider', 'list', '--json'])
+  expect(await rowsOf(ui)).toContain('✔ remove other')
+
+  // dsk would bring a built-in back: its Delete says so and runs nothing.
+  await ui.press({ key: 'row-official' })
+  const after = ran.length
+  await ui.press({ key: 'act-delete' })
+  expect(ran.length).toBe(after)
+  expect(await rowsOf(ui)).toContain('✘ official is built into dsk: it cannot be deleted, only disabled.')
+  await ui.unmount()
+})
