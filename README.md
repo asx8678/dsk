@@ -72,12 +72,13 @@ One command, typed like any other slash command, with a word after it for all bu
 | You type | What it does |
 |---|---|
 | `/dsk` | Opens the list of jobs: this session's jobs from the last day (running, waiting for you, finished) with their cost, and what runs in other sessions. `[ diff ]` and `[ turns ]` on a job open its whole diff or each of its turns |
-| `/dsk on` | Turns the live display on: running jobs show above the prompt, and `/dsk` lists them. It stays on in every session you start afterwards |
-| `/dsk off` | Turns the live display off. It stays off in every session you start afterwards, until `/dsk on`. Claude still delegates to dsk, and the review gate still holds: only the display stops |
+| `/dsk enable` | Turns delegation and the job display on: Claude hands work to dsk, running jobs show above the prompt, and `/dsk` lists them. It stays on in every session you start afterwards |
+| `/dsk disable` | Turns both off: Claude does the work itself, and new dsk runs are refused. A `dsk run`, `answer` or `continue` from Claude, and a `reject` that sends defects back, are not run; jobs that are running finish, and `dsk show`, `accept` and `reject --drop` still work on the jobs there are. Nothing is shown. It stays off in every session you start afterwards, until `/dsk enable` |
 | `/dsk update` | Fetches the newest dsk from this repository and installs it, then says which version you had and which you have now. Restart Claude Code, or run `/reload-plugins`, to load it |
-| `/dsk config` | Opens the settings pane: dsk's version, on or off, and the providers. Everything under [Providers and models](#providers-and-models) is done here |
+| `/dsk config` | Opens the settings pane: dsk's version, delegation and the display on or off, and the providers. Everything under [Providers and models](#providers-and-models) is done here |
 
-- **As you type `/dsk`,** the suggestions list `/dsk on`, `/dsk off`, `/dsk update` and `/dsk config` beneath `/dsk`, and a word begun after `/dsk ` is completed (`/dsk u` offers `update`).
+- **`/dsk enable` and `/dsk disable` take the place of `/dsk on` and `/dsk off`** (0.10.4), which are gone. They also do more: the old words turned only the display on and off, and Claude went on delegating either way. A `/dsk off` typed before 0.10.4 therefore leaves delegation on. To have the one without the other, `/dsk config` has a row for each: `Delegation` and `Job display`.
+- **As you type `/dsk`,** the suggestions list `/dsk enable`, `/dsk disable`, `/dsk update` and `/dsk config` beneath `/dsk`, and a word begun after `/dsk ` is completed (`/dsk u` offers `update`).
 - **The version** is shown at the top of `/dsk config`, by `/dsk update`, in the first line of `dsk configure`, and once at the start of the first session after an install or an update (`dsk 0.9.1 → 0.10.0 updated.`).
 - **`/dsk update` by hand** is these two commands, which also work from a shell; your keys and `~/.config/dsk` stay:
 
@@ -93,7 +94,8 @@ One command, typed like any other slash command, with a word after it for all bu
 A provider is an API that serves a DeepSeek model: DeepSeek's own (`official`), or any OpenAI-compatible endpoint you add (a custom provider). `/dsk config` lists them in the order a run tries them, each with its model, its endpoint and whether its key is set. It looks roughly like this:
 
 ```
-dsk 0.10.3 · settings
+dsk 0.10.4 · settings
+  Delegation   ● on  Claude hands the hands-on work to dsk
   Job display  ● on  running jobs show above the prompt, /dsk lists them
   Route order  your priority  providers are tried as numbered below
 
@@ -298,7 +300,7 @@ It is the session that wrote the first generator of this page's images: 7 turns 
 | Hooks module | `hooks/register.tsx` | the display and the command `/dsk`; TypeScript, because Claude Code runs it itself |
 | CLI | `scripts/dsk.py` | everything else. Claude Code never loads it, it only runs it |
 
-The Stop hook and the two configure hooks are always on. The display is not: `/dsk on` turns it on and `/dsk off` turns it off (or `Job display` in `/dsk config`), in the session where you type it and in the sessions you start afterwards. `/dsk` lists the jobs. Off, it reads nothing and draws nothing. Every command is in [In Claude Code](#in-claude-code).
+The Stop hook and the two configure hooks are always on. Delegation and the display are switches: `/dsk enable` turns both on and `/dsk disable` turns both off, in the session where you type it and in the sessions you start afterwards, and `Delegation` and `Job display` in `/dsk config` turn each by itself. An install that never chose hands work to dsk with the display off. Off, Claude is told to do the work itself (in its prompt, in the skill, and in the refusal of a `dsk run`), and the display reads nothing and draws nothing; a `dsk` you run yourself in a shell is not refused. `/dsk` lists the jobs. Every command is in [In Claude Code](#in-claude-code).
 
 What the display draws, and how the form's answers reach `dsk`: [docs/plugin.md](docs/plugin.md).
 

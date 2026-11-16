@@ -85,8 +85,10 @@ declare module 'claude-code' {
       calls: Shaped<Calls>
       // Which step of the working mark is drawn, moved on by a timer while a job runs.
       frame: number
-      // Whether the display is loaded in this session: `/dsk on` and `off`.
+      // Whether the display is loaded in this session: `/dsk enable` and `disable`, and its row in `/dsk config`.
       isOn: boolean
+      // Whether Claude may hand work to dsk in this session: `/dsk enable` and `disable`, and its row in `/dsk config`.
+      delegates: boolean
       view: Shaped<View | null>
       providers: Shaped<Providers>
     }
