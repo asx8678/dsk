@@ -142,4 +142,42 @@ mkdir -p "$project"
 install_dsk --local
 install_dsk --dev
 
+# 12. dsk's hooks mend a dsk command an older install.sh wrote, which ran scripts/dsk.py, with the very one install.sh
+#     writes now, and say so; a dsk command install.sh did not write is left alone.
+cp "$home/.local/bin/dsk" "$home/current"   # the one the --dev above wrote
+said="$home/said"
+hook() {   # dsk's prompt hook, or with --announce its session start hook, in the throwaway HOME
+    XDG_CONFIG_HOME="$home/.config" XDG_STATE_HOME="$home/.local/state" HOME="$home" \
+        "$checkout/skill/bin/dsk" configure --hook --data "$home/data" "$@" >"$said" 2>&1 || fail "configure --hook $* exited non-zero"
+}
+mended() {   # the dsk command must be install.sh's again, and the hook must have said so in one JSON object
+    cmp -s "$home/.local/bin/dsk" "$home/current" || fail "$1: the hook did not mend the dsk command into install.sh's"
+    [ -x "$home/.local/bin/dsk" ] && [ ! -L "$home/.local/bin/dsk" ] || fail "$1: the mended dsk command is not an executable file"
+    python3 -c 'import json, sys; assert "now runs this one" in json.load(open(sys.argv[1]))["systemMessage"]' "$said" \
+        || fail "$1: the hook did not say it mended the dsk command: $(cat "$said")"
+    command_works "$1"
+}
+cat >"$home/.local/bin/dsk" <<'OLD'
+#!/bin/sh
+# Written by dsk's install.sh: runs the dsk plugin that Claude Code has installed.
+exec python3 "$HOME/.claude/plugins/cache/asx8678/dsk/0.10.6/scripts/dsk.py" "$@"
+OLD
+chmod 755 "$home/.local/bin/dsk"
+hook --announce
+mended "a 0.10 dsk command, at session start"
+hook
+cmp -s "$home/.local/bin/dsk" "$home/current" || fail "the hook changed a dsk command that was already install.sh's"
+if grep -q 'now runs this one' "$said"; then fail "the hook said it mended a dsk command that needed nothing"; fi
+ln -sf "$home/.claude/skills/dsk/scripts/dsk.py" "$home/.local/bin/dsk"
+hook
+mended "the link to scripts/dsk.py the first versions made, before a prompt"
+printf '#!/bin/sh\nexec python3 "$HOME/src/dsk/skill/scripts/dsk.py" "$@"\n' >"$home/foreign"
+cp "$home/foreign" "$home/.local/bin/dsk"
+hook
+cmp -s "$home/.local/bin/dsk" "$home/foreign" || fail "the hook rewrote a dsk command that install.sh did not write"
+ln -sf "$home/foreign" "$home/.local/bin/dsk"
+hook
+[ "$(readlink "$home/.local/bin/dsk")" = "$home/foreign" ] || fail "the hook replaced a link to a dsk command that install.sh did not write"
+cp "$home/current" "$home/.local/bin/dsk"
+
 echo "install_test: ok"

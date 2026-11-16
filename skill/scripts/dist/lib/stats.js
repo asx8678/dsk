@@ -10,6 +10,7 @@ import { cachedShare, kilo } from './reports.js';
 import { Session } from './session.js';
 import { fastOrder, speeds } from './speed.js';
 import { OPTIONS, SETUP } from './texts.js';
+import { mendLauncher } from './launcher.js';
 import { paused, spent } from './wire.js';
 /** The first line of a file, without reading the rest of it. */
 function firstLine(file) {
@@ -522,19 +523,26 @@ export function cmdConfigure(args, cfg) {
                     python = e.message;
                 }
             }
+            // Before every prompt too, not only at session start: /reload-plugins after an update starts no session.
+            const mended = mendLauncher();
+            let said = null;
             if (python) {
-                print(pyJSONAscii({ systemMessage: `${news ? news + ' ' : ''}${python}.` }));
+                said = { systemMessage: `${news ? news + ' ' : ''}${python}.` };
             }
             else if (args.announce && ready && news) {
-                print(pyJSONAscii({ systemMessage: `${news} /dsk enable shows the jobs, /dsk config configures it.` }));
+                said = { systemMessage: `${news} /dsk enable shows the jobs, /dsk config configures it.` };
             }
             if (!python && args.announce && !ready) {
                 const how = `Run /plugin configure ${plugin('id')} and ${SETUP}. Then restart Claude Code.`;
-                print(pyJSONAscii({ systemMessage: `${news ? news + ' ' : ''}dsk is not set up yet: ${state}. ${how}`, hookSpecificOutput: {
+                said = { systemMessage: `${news ? news + ' ' : ''}dsk is not set up yet: ${state}. ${how}`, hookSpecificOutput: {
                         hookEventName: 'SessionStart', additionalContext: `The dsk plugin has no working provider (${state}), so ` +
                             '`dsk run` will fail. If the user wants to delegate with dsk, tell them: ' + `${how} Never ask for a key in the chat.`
-                    } }));
+                    } };
             }
+            if (mended)
+                said = said ? { ...said, systemMessage: `${said.systemMessage} ${mended}` } : { systemMessage: mended };
+            if (said)
+                print(pyJSONAscii(said));
         }
         catch (e) { // a hook must never stand in the way of a session or a prompt
             if (e instanceof Interrupted)

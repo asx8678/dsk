@@ -3,7 +3,7 @@
 //
 // This file is the command line: the port of dsk.py's argparse setup and main(). argparse has no counterpart in
 // Node, so the parser is a table of the same commands and flags, and it answers a mistake in argparse's words.
-import { Fail, G, Interrupted, dumps, eprint, interruptOnSignals, print, write, type Args, type Cfg } from './lib/base.ts'
+import { Fail, G, Interrupted, OutputClosed, dumps, eprint, interruptOnSignals, print, write, type Args, type Cfg } from './lib/base.ts'
 import { cmdAccept, cmdReject } from './lib/accept.ts'
 import { cmdAnswer, cmdBench, cmdContinue, cmdRun, cmdShow, cmdWait } from './lib/commands.ts'
 import { config } from './lib/config.ts'
@@ -386,6 +386,7 @@ export async function main(argv: string[] = process.argv.slice(2)): Promise<numb
   try {
     return Number(await RUN[args['command']]!(args, config())) || 0
   } catch (e: any) {
+    if (e instanceof OutputClosed) return 1  // `dsk status | head -1`: the reader has all it wanted
     const os = e && typeof e === 'object' && typeof e.code === 'string' && !(e instanceof Fail)
     if (e instanceof Fail || os) {
       const message = e instanceof Fail ? e.message : osErrorText(e)
@@ -400,6 +401,8 @@ export async function main(argv: string[] = process.argv.slice(2)): Promise<numb
 try {
   process.exit(await main())
 } catch (e: any) {
+  // The output closed while main() said something outside its own catch: the usage, or an error it was reporting.
+  if (e instanceof OutputClosed) process.exit(1)
   // What Python printed for an exception nobody caught: its traceback, and exit status 1.
   eprint(e?.stack ?? String(e))
   process.exit(1)
