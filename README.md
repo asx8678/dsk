@@ -96,7 +96,7 @@ One command, typed like any other slash command, with a word after it for all bu
 A provider is an API that serves a DeepSeek model: DeepSeek's own (`official`), or any OpenAI-compatible endpoint you add (a custom provider). `/dsk config` lists them in the order a run tries them, each with its model, its endpoint and whether its key is set. It looks roughly like this:
 
 ```
-dsk 0.11.1 · settings
+dsk 0.11.2 · settings
   Delegation   ● on  Claude hands the hands-on work to dsk
   Job display  ● on  running jobs show above the prompt, /dsk lists them
   Route order  your priority  providers are tried as numbered below
