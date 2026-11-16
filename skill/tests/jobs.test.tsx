@@ -290,7 +290,7 @@ test('the band draws a running job as a branch, on every surface', async ($, on)
       '· dsk · 1 worker (1m00s · ↑ 5.3k · ↓ 2.9k · 60% cached)',
       // The job: what it is for and its id, then what it does, three turns of twelve as a bar.
       '  └─ Write apps/todo/ with tests · ed3f',
-      '     ⎿  Working… ██       3/12 · ↑ 5.3k · ↓ 2.9k · 60% cached · sh python3 -m unittest',
+      '     ⎿  Working…     ██       3/12 · ↑ 5.3k · ↓ 2.9k · 60% cached · sh python3 -m unittest',
       '  ⏺ 1 waiting for you · /dsk',
     ])
     await ui.unmount()
@@ -313,13 +313,13 @@ test('a job says what it runs now, when it is quiet, and where it failed over fr
   expect(await rowsOf(ui)).toEqual([
     '· dsk · 6 workers (1m00s · ↑ 31.8k · ↓ 17.4k · 60% cached)',
     '  ├─ Job one · a001',
-    '  │  ⎿  Working… ██       3/12 · ↑ 5.3k · ↓ 2.9k · 60% cached · ▸ pytest -q',
+    '  │  ⎿  Working…     ██       3/12 · ↑ 5.3k · ↓ 2.9k · 60% cached · ▸ pytest -q',
     '  ├─ Job two · a002',
-    '  │  ⎿  Thinking… ██       3/12 · ↑ 5.3k · ↓ 2.9k · 60% cached · quiet 1m10s',
+    '  │  ⎿  Thinking…    ██       3/12 · ↑ 5.3k · ↓ 2.9k · 60% cached · quiet 1m10s',
     '  ├─ Job three · a003 · ↯ coralbricks 429 → thirdparty',
-    '  │  ⎿  Checking… ██       3/12 · ↑ 5.3k · ↓ 2.9k · 60% cached',
+    '  │  ⎿  Checking…    ██       3/12 · ↑ 5.3k · ↓ 2.9k · 60% cached',
     '  └─ Job a004 · a004',
-    '     ⎿  Working… ██       3/12 · ↑ 5.3k · ↓ 2.9k · 60% cached',
+    '     ⎿  Working…     ██       3/12 · ↑ 5.3k · ↓ 2.9k · 60% cached',
     '  … and 2 more running · /dsk',
   ])
   await ui.unmount()
@@ -351,11 +351,11 @@ test('the pane draws the jobs as trees with their cost, on every surface', async
       '↑ 15.9k  ↓ 8.7k  cache ███████▋   76% · $0.02 · this session, last day',
       'Running',
       '  └─ Write apps/todo/ with tests · ed3f · coralbricks · 1m00s',
-      '     ⎿  Working… ██       3/12 · ↑ 5.3k · ↓ 2.9k · 60% cached · $0.0031',
+      '     ⎿  Working…     ██       3/12 · ↑ 5.3k · ↓ 2.9k · 60% cached · $0.0031',
       '     ⎿  sh python3 -m unittest',
       'Other sessions',
       '  └─ Write apps/todo/ with tests · 88a0 · coralbricks · 1m00s · in aiharness',
-      '     ⎿  Working… ██       3/12 · ↑ 5.3k · ↓ 2.9k · 60% cached',
+      '     ⎿  Working…     ██       3/12 · ↑ 5.3k · ↓ 2.9k · 60% cached',
       'Waiting for you',
       '  └─ Write apps/tictactoe/ · b498',
       '     ⎿  ⏺ asks a question · 4 turns · 1m30s · ↑ 5.3k · ↓ 2.9k · 84% cached · $0.0004',
@@ -436,7 +436,7 @@ test('a dsk run row names the brief and shows its job while it runs', async ($, 
 
     expect(await rowsOf(ui)).toEqual([
       'Bash(dsk run: Write apps/todo/ with tests)',
-      '  ⎿  Working… ██       3/12 · ↑ 5.3k · ↓ 2.9k · 60% cached · ed3f · 1m00s',
+      '  ⎿  Working…     ██       3/12 · ↑ 5.3k · ↓ 2.9k · 60% cached · ed3f · 1m00s',
     ])
     // In the phone app the row is framed, which makes it a card drawn without a tap.
     expect((await ui.findAll({ type: 'Box' })).some(box => box.props.borderStyle === 'round')).toBe(
@@ -468,7 +468,7 @@ test('a run sent to the background keeps its line, and says how it stopped', asy
   })
   const running = await $.ui.mount(row)
 
-  expect((await running.find({ type: 'Text', text: /^ +⎿/ }))?.text).toMatch(/⎿ {2}Working… ██ /)
+  expect((await running.find({ type: 'Text', text: /^ +⎿/ }))?.text).toMatch(/⎿ {2}Working… {5}██ /)
   await running.unmount()
 
   world.jobs = [{ ...RUNNING, status: 'review', phase: '', turn: 4, turns: 4, act: '', active: 190 }]
@@ -763,5 +763,41 @@ test('a provider is deleted only after a question of its own, and one built into
   await ui.press({ key: 'act-delete' })
   expect(ran.length).toBe(after)
   expect(await rowsOf(ui)).toContain('✘ official is built into dsk: it cannot be deleted, only disabled.')
+  await ui.unmount()
+})
+
+test('a running job is named by what it works on, and the checks by name', async ($, on) => {
+  const steps = ['', 'read', 'grep', 'edit', 'sh', 'search', 'done', 'note']
+  const jobs = steps.map((step, index) => ({
+    ...RUNNING,
+    id: `b00${index}`,
+    phase: 'model',
+    act: step === '' ? '' : `${step} t/${step}`,
+    step,
+    brief: `Job ${step || 'new'}`,
+  }))
+
+  await start($, on, [...jobs, { ...RUNNING, id: 'b009', phase: 'checks', act: '', step: 'done', brief: 'Job checks' }])
+  const ui = await $.ui.mount({ ...PANE, surface: 'terminal' })
+  const words = (await rowsOf(ui))
+    .filter(row => row.includes('⎿') && row.includes('3/12'))
+    .map(row => row.replace(/^.*⎿ +/, '').replace(/ *█.*$/, ''))
+
+  // A step dsk has no word for keeps the phase's.
+  expect(words).toEqual([
+    'Planning…',
+    'Reading…',
+    'Searching…',
+    'Editing…',
+    'Running…',
+    'Researching…',
+    'Revising…',
+    'Thinking…',
+    'Checking…',
+  ])
+  // Under each, what its latest action was on; a kind without a word keeps its name.
+  expect(
+    (await rowsOf(ui)).filter(row => row.includes('⎿') && !row.includes('3/12')).map(row => row.replace(/^.*⎿ +/, '')),
+  ).toEqual(['t/read', 't/grep', 't/edit', 't/sh', 't/search', 't/done', 'note t/note'])
   await ui.unmount()
 })

@@ -2518,7 +2518,7 @@ def job(s, cfg):
     """One session as plain data, for `status --json`: what a progress display needs. All of it is measured."""
     head, usage, status, st, series = s.head, s.of("usage"), s.status(), s.last("state"), s.of("series")
     tail = s.recs[max(i for i, r in enumerate(s.recs) if r["t"] in ("req", "state")):]  # the turn in flight
-    acts = [r for r in tail if r["t"] == "ledger"]
+    acts, done = [r for r in tail if r["t"] == "ledger"], s.since("round", "ledger")
     checking = any(r["fn"] == "done" for r in acts) and not any(r["t"] == "checks" for r in tail)
     last = next((r for r in reversed(tail) if r["t"] in ("doing", "ledger", "checks", "result")), {"t": ""})
     checking = checking or last.get("review", False)  # the independent review runs after the checks
@@ -2532,7 +2532,10 @@ def job(s, cfg):
                               if b["why"] == "failover" and b.get("status") != "chosen"), ""), "cost": cost,
             "turn": len(s.since("round", "result")), "max_turns": round_limit(s.recs), "turns": s.turn,
             "in": sum(u["prompt"] for u in usage), "out": sum(u["out"] for u in usage), "cached": cached_share(usage),
-            "act": " ".join(f"{acts[-1]['fn']} {acts[-1]['arg']}".split())[:80] if acts else "",
+            # The round's latest action, also while the worker waits for its model after it, and its kind (`read`,
+            # `sh`, `done`...), which a display names the work by.
+            "act": " ".join(f"{done[-1]['fn']} {done[-1]['arg']}".split())[:80] if done and status == "running" else "",
+            "step": done[-1]["fn"] if done and status == "running" else "",
             "note": " ".join(str(st.get("question") or st.get("why") or st.get("error") or "").split())[:160],
             "changed": len(st.get("changed") or []),
             "brief": " ".join((scope(s).get("task") or head["brief"]).split())[:300],
@@ -2707,7 +2710,7 @@ def session_line(m):
 def cmd_status(args, cfg):
     if args.json:  # every session of the last day, on any project, newest first: for a display that polls
         # What a kept job was made with besides its log: this code's fields (bump the number) and the prices.
-        path, new = os.path.join(STATE, "status.json"), {"for": [2, {k: v.get("price") for k, v in cfg["profiles"].items()}]}
+        path, new = os.path.join(STATE, "status.json"), {"for": [3, {k: v.get("price") for k, v in cfg["profiles"].items()}]}
         try:
             with open(path, encoding="utf-8") as f:
                 old = json.load(f)
