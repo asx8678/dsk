@@ -577,9 +577,10 @@ const figures = (
   tail: string,
 ) => (
   <Text wrap="truncate-end">
-    <Text dimColor>{`↑ ${kilo(sent)}  ↓ ${kilo(received)}  cache `}</Text>
-    {meter(Text, cached ?? 0, 10, cacheTone(cached))}
-    <Text color={cacheTone(cached)}>{` ${percent(cached)}`}</Text>
+    <Text dimColor>{`↑ ${kilo(sent)}  ↓ ${kilo(received)}`}</Text>
+    {cached !== null && <Text dimColor>{'  cache '}</Text>}
+    {cached !== null && meter(Text, cached, 10, cacheTone(cached))}
+    {cached !== null && <Text color={cacheTone(cached)}>{` ${percent(cached)}`}</Text>}
     <Text dimColor>{tail}</Text>
   </Text>
 )
@@ -961,6 +962,44 @@ const toggle = async ($: EngineInterface, one: Provider, on = !one.enabled) => {
   await refresh($, { note: said(ran), isError: ran?.isOk !== true })
   // Its view lists other actions now: the ring stays on the one just pressed.
   await land($, 'act-toggle')
+}
+
+/**
+ * Asks before a provider is deleted, in a view of its own with the ring on Cancel, so a stray Enter deletes nothing.
+ * One that dsk built in, or the plugin's custom endpoint, would come back: its view says so instead.
+ */
+const askDelete = async ($: EngineInterface, one: Provider) => {
+  if (one.builtin === 'dsk' || one.builtin === 'plugin') {
+    const from = one.builtin === 'dsk' ? 'is built into dsk' : "is the plugin's custom endpoint, set in /plugin configure"
+    await update($, providers, was => ({ ...was, note: `${one.name} ${from}: it cannot be deleted, only disabled.`, isError: true }))
+
+    return
+  }
+
+  await update($, providers, (was): Providers => ({ ...was, mode: 'delete', editing: one.name, note: '', isError: false }))
+  await land($, 'delete-cancel')
+}
+
+/** Back from the question to the provider's view, the ring on Delete. */
+const keepIt = async ($: EngineInterface) => {
+  await update($, providers, (was): Providers => ({ ...was, mode: 'provider', note: '', isError: false }))
+  await land($, 'act-delete')
+}
+
+/** Deletes a provider (`dsk provider remove`): to the list once it is gone, else back to its view with why not. */
+const deleteIt = async ($: EngineInterface, one: Provider) => {
+  const ran = await dsk($, ['provider', 'remove', one.name])
+
+  if (ran?.isOk !== true) {
+    await refresh($, { mode: 'provider', note: said(ran), isError: true })
+    await land($, 'act-delete')
+
+    return
+  }
+
+  await refresh($, { mode: 'list', editing: '', note: said(ran), isError: false })
+  const now = await read($, providers)
+  await land($, now.list[0] === undefined ? 'provider-add' : `row-${now.list[0].name}`)
 }
 
 const hidden = (key: string) => (key === '' ? '' : `•••• ${key.slice(-4)}`)
@@ -1375,8 +1414,14 @@ export const register: Register = on => {
             }}
           />
           {draft.key !== '' && <Text dimColor>{`key entered: ${hidden(draft.key.trim())}`}</Text>}
-          {!isAdd && draft.name.trim() !== now.editing && draft.name.trim() !== '' && (
-            <Text dimColor wrap="wrap">{`Renames ${now.editing} to ${draft.name.trim()}; its key and place on the route stay. Running jobs carry on.`}</Text>
+          {draft.name.trim() !== now.editing && now.list.some(one => one.name === draft.name.trim()) ? (
+            <Text color="error" wrap="wrap">{`${draft.name.trim()} is already the name of another provider, with its own key; dsk will not save over it. Pick a name no provider has.`}</Text>
+          ) : (
+            !isAdd &&
+            draft.name.trim() !== now.editing &&
+            draft.name.trim() !== '' && (
+              <Text dimColor wrap="wrap">{`Renames ${now.editing} to ${draft.name.trim()}; its key and place on the route stay. Running jobs carry on.`}</Text>
+            )
           )}
           <Text> </Text>
           {item('provider-save', isAdd ? 'Add' : 'Save', [isAdd ? 'Add the provider' : 'Save the changes'], () => save($))}
@@ -1393,7 +1438,34 @@ export const register: Register = on => {
 
     const used = now.list.filter(one => one.enabled)
 
-    if (now.mode === 'provider') {
+    if (now.mode === 'delete') {
+      const one = now.list.find(it => it.name === now.editing)
+
+      if (one !== undefined) {
+        // dsk deletes only a key it named itself (`DSK_<NAME>_API_KEY`): one named by hand may serve more than dsk.
+        const keyGoes = /^DSK_[A-Z0-9_]+_API_KEY$/.test(one.key_env)
+          ? `Its API key in ${one.key_env} is deleted from ~/.config/dsk/env as well, unless another provider or web search uses it.`
+          : `Its API key stays in ${one.key_env}: dsk did not name it.`
+
+        return (
+          <Box flexDirection="column">
+            <Text bold>{`Delete ${one.name}?`}</Text>
+            <Text dimColor wrap="wrap">
+              {`dsk forgets ${one.name} (${one.model} · ${one.base_url.replace(/^https?:\/\//, '')}) and takes it off the route. ${keyGoes} This cannot be undone.`}
+            </Text>
+            <Text> </Text>
+            {/* Cancel first: where the ring lands before it is moved, and under a stray Enter. */}
+            {item('delete-cancel', 'Cancel', ['Cancel, keep it'], () => keepIt($), { isStart: true })}
+            {item('delete-confirm', `Delete ${one.name}`, [<Text color="error">{`Delete ${one.name}`}</Text>], () => deleteIt($, one))}
+            <Text> </Text>
+            {note}
+            <Text dimColor wrap="wrap">Enter to select · Esc to go back</Text>
+          </Box>
+        )
+      }
+    }
+
+    if (now.mode === 'provider' || now.mode === 'delete') {
       const one = now.list.find(it => it.name === now.editing)
 
       if (one === undefined) {
@@ -1442,7 +1514,7 @@ export const register: Register = on => {
       const need =
         1 + tall(state.text) + 1 + 3 + (typeof one.seconds === 'number' ? 1 : 0) +
         (canMove ? tall(`Route ${route}`) + (now.isFastest ? 2 : 0) : 0) +
-        1 + (canMove ? 6 : 3) + 1 + (now.note === '' ? 0 : now.note.split('\n').reduce((sum, line) => sum + tall(line), 0)) + 2
+        1 + (canMove ? 7 : 4) + 1 + (now.note === '' ? 0 : now.note.split('\n').reduce((sum, line) => sum + tall(line), 0)) + 2
 
       return (
         <Box flexDirection="column">
@@ -1488,6 +1560,15 @@ export const register: Register = on => {
                 ? 'Disable'
                 : 'Enable',
             () => toggle($, one),
+          )}
+          {item(
+            'act-delete',
+            'Delete',
+            one.builtin === 'dsk' || one.builtin === 'plugin'
+              ? ['Delete', <Text dimColor>{`  ${one.builtin === 'dsk' ? 'built into dsk' : "the plugin's"}, only disabled`}</Text>]
+              : ['Delete'],
+            () => askDelete($, one),
+            { isDim: one.builtin === 'dsk' || one.builtin === 'plugin' },
           )}
           {item('act-back', 'Back', ['Back to the list'], () => toList($), { hotkey: 'b' })}
           <Text> </Text>
@@ -1669,12 +1750,16 @@ export const register: Register = on => {
     await update($, view, () => null)
     await $.ui.open({ id: PANE, title: 'dsk jobs' })
     const now = await read($, board)
-    const sum = totals(now.jobs.filter(job => isMine(job, me, cwd)))
+    const ours = now.jobs.filter(job => isMine(job, me, cwd))
+    const sum = totals(ours)
     const cached = sum.cached === null ? '' : ` (${percent(sum.cached)} cached)`
     const cost = sum.cost > 0 ? ` · ${money(sum.cost)}${sum.isPriced ? '' : '+'}` : ''
 
     return {
-      text: `${sum.running} running · ${sum.waiting} waiting · ↑ ${kilo(sum.in)}${cached} · ↓ ${kilo(sum.out)}${cost} in the last day`,
+      text:
+        ours.length === 0
+          ? '0 sessions running'
+          : `${sum.running} running · ${sum.waiting} waiting · ↑ ${kilo(sum.in)}${cached} · ↓ ${kilo(sum.out)}${cost} in the last day`,
     }
   })
 
@@ -1988,16 +2073,26 @@ export const register: Register = on => {
 
     return (
       <Box flexDirection="column">
-        <Text wrap="truncate-end">
-          <Text color="claude">{`${running.length > 0 ? markAt(tick) : '✻'} `}</Text>
-          <Text bold>dsk</Text>
-          {` · ${running.length} running`}
-          <Text color="warning">{'   ⏺ '}</Text>
-          {`${waiting.length} waiting`}
-          <Text color="success">{'   ✔ '}</Text>
-          {`${finished.length} finished`}
-        </Text>
-        {figures(Text, sum.in, sum.out, sum.cached, `${spent} · this session, last day`)}
+        {mine.length === 0 ? (
+          // Nothing of this session in the last day: one line, no figures or bars.
+          <Text wrap="truncate-end">
+            <Text color="claude">{'✻ '}</Text>
+            <Text bold>dsk</Text>
+            {' · 0 sessions running'}
+          </Text>
+        ) : (
+          <Text wrap="truncate-end">
+            <Text color="claude">{`${running.length > 0 ? markAt(tick) : '✻'} `}</Text>
+            <Text bold>dsk</Text>
+            {` · ${running.length} running`}
+            <Text color="warning">{'   ⏺ '}</Text>
+            {`${waiting.length} waiting`}
+            <Text color="success">{'   ✔ '}</Text>
+            {`${finished.length} finished`}
+          </Text>
+        )}
+        {mine.length > 0 &&
+          figures(Text, sum.in, sum.out, sum.cached, `${spent} · this session, last day`)}
         {running.length > 0 &&
           section(kit, 'Running', running, columns, job => live(job, ''))}
         {elsewhere.length > 0 &&
@@ -2010,9 +2105,6 @@ export const register: Register = on => {
           section(kit, 'Finished', finished.slice(0, FINISHED_ROWS), columns, stopped)}
         {finished.length > FINISHED_ROWS && (
           <Text dimColor>{`  … and ${finished.length - FINISHED_ROWS} more`}</Text>
-        )}
-        {mine.length === 0 && elsewhere.length === 0 && (
-          <Text dimColor>No dsk jobs from this session in the last day.</Text>
         )}
       </Box>
     )

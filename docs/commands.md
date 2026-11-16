@@ -39,6 +39,7 @@ dsk provider rename NAME NEW
 dsk provider move NAME PLACE               its priority: 1 is tried first (`up NAME` moves it one place earlier)
 dsk provider order listed|fastest          what decides who is tried first: your priority, or the speed test
 dsk provider enable NAME | disable NAME    on or off the route; official DeepSeek off the route serves web search only
+dsk provider remove NAME                   delete a provider you added, and the key dsk named for it unless another provider or web search uses it
 ```
 
 ## A report

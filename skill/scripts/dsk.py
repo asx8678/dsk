@@ -513,13 +513,15 @@ def replayable(message, effort):
     return reply
 
 
-def later_profiles(s):
-    """The profiles a session may still move to: the rest of its route. None when the lead chose its profile with
-    --profile on reject, answer or continue: like `dsk run --profile`, that holds the session there."""
-    route, moved = s.head["route"], next((r for r in reversed(s.of("series")) if r["why"] == "failover"), None)
+def later_profiles(s, cfg):
+    """The profiles a session may still move to: the rest of its route, less any removed since it started (`dsk
+    provider remove`). None when the lead chose its profile with --profile on reject, answer or continue: like
+    `dsk run --profile`, that holds the session there. Its route is named as when it started: renames count."""
+    route = [ALIASES.get(n, n) for n in s.head["route"]]
+    moved = next((r for r in reversed(s.of("series")) if r["why"] == "failover"), None)
     if s.profile not in route or (moved and moved.get("status") == "chosen"):
         return []
-    return route[route.index(s.profile) + 1:]
+    return [n for n in route[route.index(s.profile) + 1:] if n in cfg["profiles"]]
 
 
 def chat(s, cfg, heat=0):
@@ -527,7 +529,7 @@ def chat(s, cfg, heat=0):
     while True:
         compact(s, cfg)  # a failover may have moved the series to a profile that compacts sooner
         name, profile = s.profile, cfg["profiles"][s.profile]
-        later = later_profiles(s)
+        later = later_profiles(s, cfg)
         if later and paused(name):  # its credit ran out (see pause): skip it, but always try the last profile
             release(cfg, name)
             s.add("series", why="failover", profile=later[0], status="paused")
@@ -1888,7 +1890,7 @@ def loop(s, cfg, extra=""):
         if stop and stop["fn"] == "ask":
             return halt(s, "question", question=stop["arg"])
         if repeats >= 2 or idle >= 3:  # another provider may break the loop, so it is tried before the run gives up
-            later = later_profiles(s)
+            later = later_profiles(s, cfg)
             if later:
                 release(cfg, s.profile)
                 s.add("series", why="failover", profile=later[0], status="repeat")
@@ -2282,6 +2284,9 @@ def choose_profile(s, cfg, name):
     """Run a session's next round on the profile the lead named with --profile, and hold it there (see
     later_profiles). It is logged as a failover, because that is the one kind of series record that keeps the messages."""
     if not name:
+        if s.profile not in cfg["profiles"]:  # `dsk provider remove` took it away after the last round
+            raise Fail(f"session {s.id} ran on {s.profile}, which was removed; choose another with --profile, one of: "
+                       f"{', '.join(n for n in cfg['route'] if n in cfg['profiles'])}")
         return
     if name not in cfg["profiles"]:
         raise Fail(f"unknown profile {name}")
@@ -2900,6 +2905,64 @@ def set_key(name, key):
     write_kept(path, "\n".join([line for line in lines if not sets(line)] + [f"export {name}={shlex.quote(key)}"]) + "\n")
 
 
+def drop_key(name):
+    """Takes the lines that set NAME and nothing else out of ~/.config/dsk/env; every other line stays. "gone" when it
+    took one, "mixed" when NAME is still set on a line that sets more, which it leaves alone, "" when none set it."""
+    path = os.path.join(xdg("XDG_CONFIG_HOME", "~/.config"), "env")
+    try:
+        with open(path, encoding="utf-8") as f:
+            lines = f.read().splitlines()
+    except FileNotFoundError:
+        return ""
+
+    def words(line):
+        try:
+            return [w for w in shlex.split(line, comments=True) if w != "export"]
+        except ValueError:
+            return []
+
+    kept = [line for line in lines if not (len(words(line)) == 1 and words(line)[0].startswith(name + "="))]
+    if len(kept) < len(lines):
+        write_kept(path, "\n".join(kept) + "\n")
+    if any(w.startswith(name + "=") for line in kept for w in words(line)):
+        return "mixed"
+    return "gone" if len(kept) < len(lines) else ""
+
+
+def running_on(name):
+    """The sessions a dsk process holds that run on provider `name`, or may fail over to it: their process keeps the
+    config it started with, key included. One still being set up, whose log has no head yet, counts too. Only a
+    session whose lock is held is read: there are hundreds of logs, and reading them all took seconds."""
+    found = []
+    for sid in sorted(os.listdir(STATE)) if os.path.isdir(STATE) else []:
+        lock = os.path.join(STATE, sid, "lock")
+        if not os.path.isfile(lock):
+            continue
+        try:
+            flock(lock, "").close()  # free: no process drives it
+            continue
+        except Fail:
+            pass
+        try:
+            s = Session(sid)
+        except Fail:
+            continue
+        route = {ALIASES.get(n, n) for n in s.head.get("route", [])} if s.recs else set()  # named as when it started
+        if not s.recs or name in route or (s.last("series") and s.profile == name):
+            found.append(sid)
+    return found
+
+
+def built_in(cfg, name):
+    """Where a provider comes from when config.json is not all of it: "dsk" for one built into dsk, "plugin" for the
+    plugin's custom endpoint, under whatever name it has now; "" for one config.json alone holds. Deleting it from
+    config.json would bring the first two back, so they can only be disabled."""
+    opts = plugin()
+    if name == ALIASES.get("custom", "custom") and opts.get("custom_base_url") and opts.get("custom_model"):
+        return "plugin"
+    return "dsk" if name in {ALIASES.get(n, n) for n in DEFAULTS["profiles"]} else ""
+
+
 def read_key(args):
     if not args.key_stdin:
         return None
@@ -2951,13 +3014,14 @@ def provider_rows(cfg):
     return [{"name": n, "base_url": p.get("base_url", ""), "model": p.get("model", ""), "key_env": p.get("key_env", ""),
              "key": bool(secret(p.get("key_env", ""))), "enabled": n in route,
              "position": route.index(n) + 1 if n in route else None, "official": is_official(cfg, n),
-             "seconds": (found.get(n) or {}).get("seconds")}
+             "seconds": (found.get(n) or {}).get("seconds"), "builtin": built_in(cfg, n)}
             for n, p in sorted(cfg["profiles"].items(), key=lambda kv: route.index(kv[0]) if kv[0] in route else len(route))]
 
 
 def cmd_provider(args, cfg):
-    """List, add, change, reorder, enable or disable the provider profiles. Writes ~/.config/dsk/config.json, keeping
-    every key in it, and a key to ~/.config/dsk/env, never into the config."""
+    """List, add, change, reorder, enable, disable or remove the provider profiles. Writes ~/.config/dsk/config.json,
+    keeping every key in it, and a key to ~/.config/dsk/env, never into the config. Remove deletes its key there too,
+    unless another provider or web search uses it."""
     if args.action == "list":
         rows, search = provider_rows(cfg), bool(secret(cfg["search"]["key_env"]))
         if args.json:
@@ -3031,6 +3095,49 @@ def cmd_provider(args, cfg):
             user["route"] = [new if n == name else n for n in user["route"]]
         write_kept(path, json.dumps(user, indent=2) + "\n")
         print(f"dsk · renamed {name} to {new}; its key stays in {cfg['profiles'][name]['key_env']}")
+        return 0
+    if args.action == "remove":
+        origin = built_in(cfg, name)
+        if origin == "plugin":
+            raise Fail(f"{name} is the plugin's custom endpoint, set in /plugin configure; it cannot be removed here, "
+                       f"only disabled: dsk provider disable {name}")
+        if origin:
+            raise Fail(f"{name} is built into dsk; it cannot be removed, only disabled: dsk provider disable {name}")
+        if name in route and not [n for n in route if n != name and n in cfg["profiles"]]:
+            raise Fail(f"{name} is the only enabled provider; enable or add another first")
+        busy = running_on(name)
+        if busy:
+            raise Fail(f"{name} is in use by the running {'jobs' if len(busy) > 1 else 'job'} {', '.join(busy)}; "
+                       f"remove it once {'they' if len(busy) > 1 else 'it'} stopped")
+        key_env = cfg["profiles"][name].get("key_env", "")
+        users = [n for n, p in cfg["profiles"].items() if n != name and p.get("key_env") == key_env]
+        why = (f"{', '.join(users)} {'use' if len(users) > 1 else 'uses'} it too" if users
+               else "web search uses it" if key_env == cfg["search"]["key_env"]
+               else "the plugin's options hold it" if key_env in OPTION_KEYS
+               else "dsk did not name it, so it may serve more than dsk" if not re.fullmatch(r"DSK_[A-Z0-9_]+_API_KEY", key_env)
+               else "")
+        profiles.pop(name, None)
+        if name in route:
+            user["route"] = [n for n in route if n != name]
+        renamed = user.get("renamed") if isinstance(user.get("renamed"), dict) else {}
+        renamed = {old: now for old, now in renamed.items() if now != name}  # its old names are free again
+        if renamed:
+            user["renamed"] = renamed
+        else:
+            user.pop("renamed", None)
+        write_kept(path, json.dumps(user, indent=2) + "\n")  # the config first: a key left behind is harmless
+        if not key_env:
+            said = ""
+        elif why:
+            said = f" · its key stays in {key_env}: {why}"
+        else:
+            said = f" · its key {key_env} " + {
+                "gone": "is deleted from ~/.config/dsk/env",
+                "mixed": "stays: a line of ~/.config/dsk/env sets it with other variables; take it out by hand",
+                "": "was not in ~/.config/dsk/env"}[drop_key(key_env)]
+            if os.environ.get(key_env):
+                said += "; it is still set in your environment"
+        print(f"dsk · removed {name} · route: {' → '.join(user.get('route', route))}{said}")
         return 0
     if args.action == "up":
         route = list(cfg["route"])
@@ -3277,8 +3384,9 @@ def main():
     configure.add_argument("--hook", action="store_true", help="act as a Claude Code hook: store the plugin's options first")
     configure.add_argument("--announce", action="store_true", help="with --hook: say what is still missing")
     configure.add_argument("--data", metavar="DIR", help="with --hook: the plugin's data folder")
-    provider = command("provider", "list, add, change, rename, reorder, enable or disable the provider profiles")
-    provider.add_argument("action", choices=["list", "add", "set", "rename", "up", "move", "order", "enable", "disable"])
+    provider = command("provider", "list, add, change, rename, reorder, enable, disable or remove the provider profiles")
+    provider.add_argument("action", choices=["list", "add", "set", "rename", "up", "move", "order", "enable", "disable",
+                                             "remove"])
     provider.add_argument("name", nargs="?", help="the provider; order: listed (your priority) or fastest")
     provider.add_argument("new", nargs="?", help="rename: the new name; move: the new place on the route, from 1")
     provider.add_argument("--url", help="add, set: the base URL of the OpenAI-compatible API")

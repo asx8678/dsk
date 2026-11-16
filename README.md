@@ -94,7 +94,7 @@ One command, typed like any other slash command, with a word after it for all bu
 A provider is an API that serves a DeepSeek model: DeepSeek's own (`official`), or any OpenAI-compatible endpoint you add (a custom provider). `/dsk config` lists them in the order a run tries them, each with its model, its endpoint and whether its key is set. It looks roughly like this:
 
 ```
-dsk 0.10.4 · settings
+dsk 0.10.5 · settings
   Delegation   ● on  Claude hands the hands-on work to dsk
   Job display  ● on  running jobs show above the prompt, /dsk lists them
   Route order  your priority  providers are tried as numbered below
@@ -144,7 +144,7 @@ Esc goes back to the list, and from the list closes the pane. In a pane too shor
 - **Priority.** With more than one provider enabled, a provider's view has `Try first`, `Move up` and `Move down`: the number on its row is its place, `1` is tried first, `2` takes over when it fails, and so on. The view stays open after a move, so pressing again moves it further.
 - **Your priority, or the fastest first.** `Route order` in the list chooses what decides who is tried first: `your priority`, the numbers, or `fastest first`, the speed test (`"route_order": "fastest"`). Giving a provider a place is a choice of priority, so it sets the order back to `your priority`; pressing `Route order` brings the fastest first back.
 - **The model.** `Edit` on a provider opens its name, API URL, model name and API key. Change **Model name** to the model id as that endpoint lists it and save. `official` starts as `deepseek-flash`; a custom provider uses whatever you entered. An empty API key field keeps the key you have. `dsk doctor` then tests the key and the model against the provider.
-- **Add, rename, disable.** `+ Add a provider` asks for a name, API URL, model name and API key. A rename keeps the key and the place on the route, and running jobs carry on. `Disable` takes a custom provider off the route without deleting it; `Enable` puts it back.
+- **Add, rename, disable, delete.** `+ Add a provider` asks for a name, API URL, model name and API key. A rename keeps the key and the place on the route, and running jobs carry on; a name another provider has is refused. `Disable` takes a custom provider off the route without deleting it; `Enable` puts it back. `Delete` asks first, then removes the provider and its API key from `~/.config/dsk/env`, unless another provider or web search uses that key or you named the key yourself (dsk names them `DSK_<NAME>_API_KEY`). It is refused while a running job uses the provider or could fail over to it; a stopped job that ran there takes `--profile` to go on. Official DeepSeek and the install form's `custom` would come back, so they can only be disabled.
 - **Where it is kept.** The pane writes `~/.config/dsk/config.json` (every other setting in it is kept) and puts keys in `~/.config/dsk/env`, readable by you alone. Both win over the install form.
 
 The same from a shell:
@@ -158,6 +158,7 @@ dsk provider order fastest                         # the speed test decides who 
 dsk provider disable official                      # official DeepSeek: web search only
 dsk provider enable official                       # official DeepSeek: web search and work, tried last
 dsk provider rename myhost fast
+dsk provider remove fast                           # and its key, unless another provider or web search uses it
 ```
 
 With `"route_order": "fastest"` in `config.json`, which `dsk provider order fastest` and `Route order` in the pane write, the provider measured fastest is tried first, whatever the priority says; `/dsk config` and `dsk provider list` say so when it is set. A `dsk provider move` or `up` after that sets it back to `listed`: a place you choose counts. See [docs/configuration.md](docs/configuration.md#providers).
