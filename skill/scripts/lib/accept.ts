@@ -87,10 +87,9 @@ export function cmdAccept(args: Args, cfg: Cfg): number {
       const inside = after.filter((p) => allowed(p))
       const outside = after.filter((p) => !allowed(p))
       if (outside.length) {  // not mine to apply, but it must not die with the worktree either
-        const kept = path.join(s.dir, 'late.patch')
         saved = String(git(head.root, ['diff', '--binary', start, now, '--',
                                       ...outside.map((p) => ':(literal)' + p)]))
-        late.push(`late:    not applied, outside --allow: ${outside.join(', ')} (kept as ${kept})`)
+        late.push(`late:    not applied, outside --allow: ${outside.join(', ')} (kept as ${path.join(s.dir, 'late.patch')})`)
       }
       if (inside.length) {
         const files = [...new Set([...st.changed.map((entry: any[]) => entry[2]), ...inside])]

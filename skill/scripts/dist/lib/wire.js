@@ -40,9 +40,7 @@ function need(value, key) {
 }
 /** The message records of the current series. Compaction restarts the list; failover does not. */
 export function seriesMsgs(recs) {
-    let start = -1;
-    recs.forEach((r, i) => { if (r.t === 'series' && r.why !== 'failover')
-        start = i; });
+    const start = recs.findLastIndex((r) => r.t === 'series' && r.why !== 'failover');
     if (start < 0)
         throw new Error('max() arg is an empty sequence');
     return recs.slice(start).filter((r) => r.t === 'msg');
@@ -81,15 +79,6 @@ export function requestBody(profile, effort, msgs, heat = 0, tools = true, maxTo
         if (body[k] !== null)
             filtered[k] = body[k];
     return dumps(filtered);
-}
-/** The value of a response header, as email.message's get_content_type() read it. */
-function contentType(res) {
-    const raw = res.headers['content-type'];
-    if (raw === undefined)
-        return 'text/plain';
-    const value = Array.isArray(raw) ? raw[0] : raw;
-    const ctype = String(value).split(';')[0].toLowerCase();
-    return ctype || 'text/plain';
 }
 /** Read a whole response body. */
 async function readAll(stream) {
@@ -174,7 +163,7 @@ export async function send(url, key, payload, extra = null, timeout = 600, idle 
         got = await request(url, payload, headers, timeoutMs);
         try {
             if (got.status >= 200 && got.status < 300) {
-                if (contentType(got.res) !== 'text/event-stream') {
+                if (String(got.res.headers['content-type'] ?? '').split(';')[0].toLowerCase() !== 'text/event-stream') {
                     const body = await readAll(got.res);
                     const text = new TextDecoder('utf-8', { fatal: true, ignoreBOM: true }).decode(body);
                     return [got.status, JSON.parse(text)];
@@ -337,6 +326,8 @@ export async function sse(r, began, deadline) {
     const reply = { choices: [{ message, finish_reason: finish }], usage: usage || {}, _stream: true };
     if (first !== null)
         reply._first = first;
+    if (cutShort)
+        reply._cut = true; // cut by the clock, not by the provider's token limit: chat() tells the two apart
     return reply;
 }
 // transient() and the retry decision are lib/retry.ts's, whose laws gdp-wired proves.
@@ -435,7 +426,23 @@ export function laterProfiles(s, cfg) {
         return [];
     return route.slice(route.indexOf(s.profile) + 1).filter((n) => has(cfg.profiles, n));
 }
-/** Send the current series and return (assistant message, finish_reason). Fails over along the route. */
+/**
+ * The thinking effort of the next request: the session's, or `low` once a reply of this round was still going at
+ * `reply_seconds`. In the logs of 43 sessions every one of the 24 cut-off replies was cut by that clock while the
+ * worker was still thinking, 21,004 s in all, and the turn after it was cut again 10 times of 19. On review briefs
+ * with their files attached, max was cut twice in a row and high first answered after 748 s (one run each), while
+ * low answered in 19 of 20 runs. Tested against the scripted server only: no real round has been seen to recover.
+ * Never `off`: that changes tool_choice and drops the reasoning the series replays.
+ */
+export function effortNow(s) {
+    const effort = s.head.effort;
+    const slow = s.of('round').length > 0 && s.since('round', 'result').some((r) => get(r, 'slow'));
+    return slow && (effort === 'max' || effort === 'high') ? 'low' : effort;
+}
+/**
+ * Send the current series and return (assistant message, finish_reason). Fails over along the route. A reply that
+ * was cut off at `reply_seconds` comes back with the finish reason `time`, which no provider sends.
+ */
 export async function chat(s, cfg, heat = 0) {
     while (true) {
         compact(s, cfg);
@@ -464,7 +471,8 @@ export async function chat(s, cfg, heat = 0) {
                 throw new Fail('bug: this request does not extend the previous one in its series');
             }
         }
-        const body = requestBody(profile, s.head.effort, msgs, heat);
+        const effort = effortNow(s);
+        const body = requestBody(profile, effort, msgs, heat);
         const key = apiKey(profile);
         s.add('req', { ...fingerprint(wire) });
         const session = `dsk-${s.id}-${fingerprint(dumps(s.head)).sha.slice(0, 8)}`;
@@ -474,7 +482,7 @@ export async function chat(s, cfg, heat = 0) {
             try {
                 choice = data.choices[0];
                 usage = data.usage || {};
-                reply = replayable(choice.message, s.head.effort);
+                reply = replayable(choice.message, effort);
             }
             catch (error) {
                 if (error instanceof Interrupted)
@@ -490,10 +498,10 @@ export async function chat(s, cfg, heat = 0) {
                 hit, out: get(usage, 'completion_tokens') || 0, first: get(data, '_first'),
             });
             let finish = get(choice, 'finish_reason');
-            const cap = get(get(profile, 'extra', {}) || {}, 'max_tokens') || MAX_TOKENS[s.head.effort];
+            const cap = get(get(profile, 'extra', {}) || {}, 'max_tokens') || MAX_TOKENS[effort];
             if (finish === null && (get(usage, 'completion_tokens') || 0) >= cap)
                 finish = 'length';
-            return [reply, finish];
+            return [reply, get(data, '_cut') ? 'time' : finish];
         }
         if (spent(status, data))
             pause(cfg, name, data);

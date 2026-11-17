@@ -72,9 +72,7 @@ export class Session {
     }
     /** Records of `types` after the last `marker` record. */
     since(marker, ...types) {
-        let start = -1;
-        this.recs.forEach((r, i) => { if (r.t === marker)
-            start = i; });
+        const start = this.recs.findLastIndex((r) => r.t === marker);
         if (start < 0)
             throw new Error(`no ${marker} record`); // max() of an empty sequence, as in dsk.py
         return this.recs.slice(start).filter((r) => types.includes(r.t));

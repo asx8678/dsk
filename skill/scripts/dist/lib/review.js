@@ -338,10 +338,9 @@ export async function independentReview(s, cfg, turn, over, done) {
         return '';
     }
     const keptAs = path.join(s.dir, `reviewer.${s.of('reviewer').length + 1}.json`); // numbered across rounds, not reused
-    const finish = get(choice, 'finish_reason', null);
     const content = get(message, 'content', null);
     const reasoning = get(message, 'reasoning_content') || get(message, 'reasoning');
-    fs.writeFileSync(keptAs, pyJson({ finish, content, reasoning }), 'utf8'); // what it said, in full
+    fs.writeFileSync(keptAs, pyJson({ finish: get(choice, 'finish_reason', null), content, reasoning }), 'utf8'); // what it said, in full
     const details = get(usage, 'prompt_tokens_details') || {};
     const hit = get(usage, 'prompt_cache_hit_tokens', get(details, 'cached_tokens'));
     Object.assign(rec, { prompt: get(usage, 'prompt_tokens') || 0, hit, out: get(usage, 'completion_tokens') || 0 });

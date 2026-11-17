@@ -8,7 +8,7 @@ import { gate, parse } from './reply.ts'
 import { turnLine } from './reports.ts'
 import { independentReview, secondLook } from './review.ts'
 import { turnKind } from './stats.ts'
-import { ALTERNATING, CONFIRMED, CUT_OFF, HEAT, NUDGE, ONE_CALL, REPEAT, SAME_FAILURE, SANDBOX_LINE, SCRATCH, STALE, TRUNCATED } from './texts.ts'
+import { ALTERNATING, CONFIRMED, CUT_OFF, HEAT, NUDGE, ONE_CALL, REPEAT, SAME_FAILURE, SANDBOX_LINE, SCRATCH, SPOKEN, SPOKEN_CHARS, STALE, TIMED_OUT, TIMED_OUT_REPLY, TRUNCATED } from './texts.ts'
 import { chat, laterProfiles, release } from './wire.ts'
 import type { Session } from './session.ts'
 import { tally, type Tally } from './stops.ts'
@@ -37,11 +37,33 @@ export function firstMessage(head: Head, digest = "", files: [string, string][] 
   return [facts, run, ...attached, '## Task\n' + head.brief, review, digest].filter(Boolean).join('\n\n')
 }
 
+/**
+ * The answer a read-only run gave as plain text, or null. A worker that has its findings often writes them as its
+ * reply and calls nothing. In the logs of 73 sessions all 34 replies that were no run_code call were such answers,
+ * 1,719 to 13,693 characters each, in runs with no --allow: sending them back cost 8,080 s, six runs ended at
+ * their turn limit with the answer thrown away, and one handed in "Review answer handed in." in its place. A run
+ * that may change files still hands in with done(), after its checks, and a short text is a remark, not an answer.
+ */
+function spokenAnswer(s: Session, reply: any): string | null {
+  const text = typeof reply?.content === 'string' ? reply.content.trim() : ''
+  const calls = get(reply, 'tool_calls', []) as any[]
+  return !scope(s).allow.length && !calls.length && cpLen(text) >= SPOKEN_CHARS ? text : null
+}
+
 /** Run one reply. Returns (text for the worker, why the turn failed or '', the ask/done record or None). */
 export async function takeTurn(s: Session, cfg: Cfg, env: NodeJS.ProcessEnv, turn: number, reply: any, finish: string | null): Promise<[string, string, Rec | null]> {
+  if (finish === 'time') return [format(TIMED_OUT, { seconds: cfg.limits.reply_seconds }), 'truncated', null]
   if (finish === 'length') return [TRUNCATED, 'truncated', null]
   const script = parse(reply)
-  if (script === null) return [NUDGE, 'malformed', null]
+  if (script === null) {
+    const answer = spokenAnswer(s, reply)
+    if (answer === null) return [NUDGE, 'malformed', null]
+    const stop: any = { fn: 'done', arg: answer, open: '' }  // the record done(answer) would have left
+    s.add('ledger', { turn, ...stop })
+    s.printed = ''
+    s.moved = false
+    return [SPOKEN, '', stop]
+  }
   const refusal = await gate(script)
   if (refusal) return [`refused, nothing was run: ${refusal}`, 'refused', null]
   const before = span(s)
@@ -83,17 +105,7 @@ export async function takeTurn(s: Session, cfg: Cfg, env: NodeJS.ProcessEnv, tur
 }
 
 /** Python's == for the JSON values a reply is made of: arrays and dicts compare by contents. */
-function equal(a: any, b: any): boolean {
-  if (a === b) return true
-  if (Array.isArray(a) || Array.isArray(b)) {
-    return Array.isArray(a) && Array.isArray(b) && a.length === b.length && a.every((v, i) => equal(v, b[i]))
-  }
-  if (a !== null && b !== null && typeof a === 'object' && typeof b === 'object') {
-    const keys = Object.keys(a)
-    return keys.length === Object.keys(b).length && keys.every((k) => has(b, k) && equal(a[k], b[k]))
-  }
-  return false
-}
+const { isDeepStrictEqual: equal } = process.getBuiltinModule('node:util')
 
 /** A JSON value whose dicts have their keys sorted, as json.dumps(sort_keys=True) writes them at every depth. */
 function sortKeys(value: any): any {
@@ -228,7 +240,7 @@ export async function loop(s: Session, cfg: Cfg, extra = ""): Promise<string> {
     const turn = s.turn + 1
     // A cut-off reply is not kept: resent with every later request, three of them cost one session 48,000 tokens.
     // The worker still hears that its reply was cut off, in the message that carries this turn's result.
-    s.add('msg', { turn, m: finish === 'length' ? CUT_OFF : reply })
+    s.add('msg', { turn, m: finish === 'length' ? CUT_OFF : finish === 'time' ? TIMED_OUT_REPLY : reply })
     const done = s.since('round', 'result').length, limitTurns = roundLimit(s.recs)
     left = Math.max(0, limitTurns - done - 1)
     const nowSaid = said(reply)
@@ -276,7 +288,7 @@ export async function loop(s: Session, cfg: Cfg, extra = ""): Promise<string> {
       text += `\n\nnote: the last ${reads} turns only read files. ${left} turns are left: start writing now, ` +
         'or call ask() if the task cannot be done as written.'
     }
-    s.add('result', { turn, text, fail: failed })
+    s.add('result', { turn, text, fail: failed, ...(finish === 'time' ? { slow: true } : {}) })  // `slow` lowers the effort: effortNow()
     if (G.verbose) eprint(turnLine(s, turn))
     const later = laterProfiles(s, cfg)
     t = tally(t, { repeat, failed: Boolean(failed), stale, finished, asked: Boolean(stop && stop.fn === 'ask'),

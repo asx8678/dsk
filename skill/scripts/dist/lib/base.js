@@ -133,7 +133,7 @@ const FLOAT_KEYS = new Set(['at', 'created', 'active', 'cached', 'first', 'until
  * which the log uses; dumps() passes the compact pair the requests use. Keys keep their insertion order. A number
  * that is not whole is written as Python writes a float; a whole one as Python wrote it, an int, unless its key says
  * dsk.py held a float there (FLOAT_KEYS; `cost` once any usage was counted; the seconds of a profile's `speed`).
- * `ascii` is json.dumps' default ensure_ascii, for the files dsk.py wrote that way. A BigInt is a nanosecond mtime.
+ * `ascii` is json.dumps' default ensure_ascii, for the files dsk.py wrote that way.
  */
 export function pyJson(value, sep = [', ', ': '], ascii = false) {
     const text = serialize(value, sep, false);
@@ -144,8 +144,6 @@ function serialize(value, sep, float) {
         return 'null';
     if (value instanceof PyFloat)
         return pyFloatRepr(value.value);
-    if (typeof value === 'bigint')
-        return value.toString();
     if (typeof value === 'number') {
         if (float || !Number.isInteger(value) || !Number.isFinite(value))
             return pyFloatRepr(value);
@@ -160,19 +158,9 @@ function serialize(value, sep, float) {
         const d = (value instanceof Map ? Object.fromEntries(value) : value);
         const items = (value instanceof Map ? [...value] : Object.entries(d)).filter(([, v]) => v !== undefined);
         return '{' + items.map(([k, v]) => {
-            let inner;
-            if (k === 'speed' && v !== null && typeof v === 'object' && !Array.isArray(v)) {
-                // metrics' {profile: [seconds, turns]}: the seconds were a float sum, the turns a count
-                inner = '{' + Object.entries(v).map(([name, pair]) => JSON.stringify(name) + sep[1] +
-                    (Array.isArray(pair) ? '[' + pair.map((x, i) => serialize(x, sep, i === 0)).join(sep[0]) + ']'
-                        : serialize(pair, sep, false))).join(sep[0]) + '}';
-            }
-            else {
-                // `cost` is sum() over the usage: a float, unless there was no usage and sum() gave its start, the int 0
-                const float = FLOAT_KEYS.has(k) || (k === 'cost' && (v !== 0 || Number(d['in']) > 0));
-                inner = serialize(v, sep, float);
-            }
-            return JSON.stringify(k) + sep[1] + inner;
+            // `cost` is sum() over the usage: a float, unless there was no usage and sum() gave its start, the int 0
+            const float = FLOAT_KEYS.has(k) || (k === 'cost' && (v !== 0 || Number(d['in']) > 0));
+            return JSON.stringify(k) + sep[1] + serialize(v, sep, float);
         }).join(sep[0]) + '}';
     }
     throw new TypeError(`Object of type ${typeof value} is not JSON serializable`);
@@ -192,27 +180,11 @@ export function dumps(value) {
 // ---------------------------------------------------------------- strings by code point
 /** Python's len() of a str: code points, not UTF-16 units. A fingerprint's `n` counts this way in every log. */
 export function cpLen(text) {
-    let n = text.length;
-    for (let i = 0; i < text.length - 1; i++) {
-        const c = text.charCodeAt(i);
-        if (c >= 0xd800 && c <= 0xdbff) {
-            const d = text.charCodeAt(i + 1);
-            if (d >= 0xdc00 && d <= 0xdfff) {
-                n--;
-                i++;
-            }
-        }
-    }
-    return n;
+    return text.length - (text.match(/[\ud800-\udbff][\udc00-\udfff]/g)?.length ?? 0);
 }
 /** Python's text[:n] for n >= 0: the first n code points. */
 export function cpHead(text, n) {
-    let i = 0;
-    for (let k = 0; k < n && i < text.length; k++) {
-        const c = text.charCodeAt(i);
-        i += c >= 0xd800 && c <= 0xdbff && i + 1 < text.length && (text.charCodeAt(i + 1) & 0xfc00) === 0xdc00 ? 2 : 1;
-    }
-    return text.slice(0, i);
+    return Array.from(text.slice(0, 2 * n)).slice(0, n).join('');
 }
 /** Python's " ".join(text.split()): the words of a text, with every run of whitespace made one space. */
 export function words(text) {
@@ -299,10 +271,7 @@ function tie(x, digits) {
 }
 /** Python's round(x, digits): half to even on exact ties. round(x) with no digits gives an integer as Python's did. */
 export function pyRound(x, digits = 0) {
-    const even = tie(x, digits);
-    if (even !== null)
-        return even / 10 ** digits;
-    return Number(x.toFixed(digits));
+    return Number(fixed(x, digits));
 }
 /**
  * Python's sum() of floats. Since 3.12 CPython adds floats with Neumaier's compensated summation, so a cost summed
@@ -350,18 +319,13 @@ export function pyFloat(x) {
     return Number.isInteger(x) && Math.abs(x) < 1e16 ? `${x}.0` : String(x);
 }
 /** Python's str.format for the templates dsk.py kept as constants: `{}`, `{0}` and `{name}`, and `{{`, `}}`. */
-export function format(template, ...args) {
-    const named = args.length && typeof args[args.length - 1] === 'object' && args[args.length - 1] !== null
-        && !Array.isArray(args[args.length - 1]) ? args[args.length - 1] : {};
-    let auto = 0;
+export function format(template, values) {
     return template.replace(/\{\{|\}\}|\{([^{}]*)\}/g, (whole, field) => {
         if (whole === '{{')
             return '{';
         if (whole === '}}')
             return '}';
-        const name = (field ?? '').split(':')[0] ?? '';
-        const value = name === '' ? args[auto++] : /^\d+$/.test(name) ? args[Number(name)] : named[name];
-        return String(value);
+        return String(values[(field ?? '').split(':')[0] ?? '']);
     });
 }
 /** Epoch seconds, as time.time() gave them. */

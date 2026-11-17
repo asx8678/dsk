@@ -24,25 +24,14 @@ function rmTree(dir) {
             throw e;
     }
 }
-/** Whether a path is a file, as os.path.isfile said: a missing or unreadable path is simply not one. */
-function isFile(p) {
+/** A path's stat, or null for a missing or unreadable path: to os.path.isfile and isdir it is simply neither. */
+function statOf(p) {
     try {
-        return fs.statSync(p).isFile();
+        return fs.statSync(p);
     }
     catch (e) {
         if (isOsError(e))
-            return false;
-        throw e;
-    }
-}
-/** Whether a path is a directory, as os.path.isdir said: a missing or unreadable path is simply not one. */
-function isDir(p) {
-    try {
-        return fs.statSync(p).isDirectory();
-    }
-    catch (e) {
-        if (isOsError(e))
-            return false;
+            return null;
         throw e;
     }
 }
@@ -55,15 +44,6 @@ function today() {
     const d = new Date();
     return `${String(d.getFullYear()).padStart(4, '0')}-${String(d.getMonth() + 1).padStart(2, '0')}-${String(d.getDate()).padStart(2, '0')}`;
 }
-/** str(e) for an exception: an Error's message, else the value itself. */
-function errorText(e) {
-    return e instanceof Error ? e.message : String(e);
-}
-/** type(e).__name__ for an exception: its constructor's name, as near as JavaScript has one. */
-function errorName(e) {
-    return e && typeof e === 'object' && e.constructor && typeof e.constructor.name === 'string' && e.constructor.name
-        ? e.constructor.name : typeof e;
-}
 /** Run the loop to its next stop, print the report, return the exit code. Any failure becomes `error`. */
 export async function drive(s, cfg, extra = "") {
     eprint(`dsk ${s.id} · running · ${s.profile}`);
@@ -72,9 +52,11 @@ export async function drive(s, cfg, extra = "") {
         await loop(s, cfg, extra);
     }
     catch (e) {
-        const message = e instanceof Fail ? errorText(e) : e instanceof Interrupted ? "interrupted" : `internal: ${errorName(e)}: ${errorText(e)}`;
+        // str(e) and type(e).__name__, as near as JavaScript has them: an Error's message, and its constructor's name.
+        const text = e instanceof Error ? e.message : String(e), named = `${(typeof e === 'object' && e?.constructor?.name) || typeof e}: ${text}`;
+        const message = e instanceof Fail ? text : e instanceof Interrupted ? "interrupted" : `internal: ${named}`;
         if (G.verbose)
-            eprint(e instanceof Error ? (e.stack ?? `${errorName(e)}: ${errorText(e)}`) : String(e));
+            eprint(e instanceof Error ? (e.stack ?? named) : String(e));
         try {
             halt(s, "error", { error: message });
         }
@@ -128,7 +110,7 @@ export function slurp(file) {
 /** [name, text] for one --file: the whole file, or lines A to B of it when the value is PATH:A-B and PATH exists. */
 export function attachment(value, workdir) {
     const match = /^(.+):(\d+)-(\d+)\n?$/s.exec(value);
-    if (!match || !isFile(match[1]))
+    if (!match || !statOf(match[1])?.isFile())
         return [value === "-" ? "@stdin" : relPath(value, workdir), slurp(value)];
     const path_ = match[1];
     const first = Number(match[2]), last = Number(match[3]);
@@ -274,14 +256,11 @@ export async function cmdContinue(args, cfg) {
     }
     const recheck = args.recheck == null ? get(scope(s), "recheck", false) : args.recheck;
     const reviewer = args.reviewer == null ? get(scope(s), "reviewer", false) : args.reviewer;
-    if (head["worktree"] && !isDir(head["workdir"])) {
+    if (head["worktree"] && !statOf(head["workdir"])?.isDirectory()) {
         // accept applied the last round and removed the worktree, so build a fresh one from the tree as it is now
         removeWorktree(head);
-        for (const name of ["index", "index.main"]) {
-            const p = path.join(s.dir, name);
-            if (fs.existsSync(p))
-                fs.unlinkSync(p);
-        }
+        for (const name of ["index", "index.main"])
+            fs.rmSync(path.join(s.dir, name), { force: true });
         makeWorktree(s, head["root"], head["workdir"]);
     }
     const answer = path.join(s.dir, "answer");

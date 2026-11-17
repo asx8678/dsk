@@ -175,15 +175,13 @@ function spentText(S: Session): string {
 
 /** The `last:` line: what the worker last printed, for a run that stopped badly without changing anything. */
 function lastText(S: Session): string {
-  let lastOutput = ''
   try {
-    lastOutput = cpHead(fs.readFileSync(path.join(S.dir, 'out', String(S.last('result')['turn'])), 'utf8')
-      .replace(/\r\n?/g, '\n'), 1500)  // universal newlines, as Python's text mode read it
+    return cpHead(fs.readFileSync(path.join(S.dir, 'out', String(S.last('result')['turn'])), 'utf8')
+      .replace(/\r\n?/g, '\n'), 1500).trim()  // universal newlines, as Python's text mode read it
   } catch (e) {  // a turn that was never run has no output file
     if (!isOsError(e)) throw e
-    lastOutput = ''
+    return ''
   }
-  return cpHead(lastOutput, 1500).trim()
 }
 
 /** The `context:` line: how full the next request would be, against the point where dsk compacts the series. */

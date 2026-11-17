@@ -114,7 +114,6 @@ export function secret(name: string): string {
   let words: string[] = []
   try {
     const text = fs.readFileSync(path.join(xdg('XDG_CONFIG_HOME', '~/.config'), 'env'), 'utf8')
-    words = []
     for (const line of text.split(/\r\n|\r|\n/)) words.push(...shlexSplit(line, true))
   } catch (e) {
     if (e instanceof Interrupted) throw e
@@ -153,10 +152,8 @@ export function setup(cfg: Cfg): [boolean, string] {
   const opts = plugin(), first = item(cfg, 'route')[0]
   const profile = get(get(cfg, 'profiles', {}), first, {})
   if (truthy(secret(get(profile, 'key_env', '') ?? ''))) return [true, `${first} · ${item(profile, 'base_url')} · ${item(profile, 'model')}`]
-  const need: string[] = []
-  for (const [field, needLabel] of [['custom_base_url', 'endpoint URL'], ['custom_model', 'model name'], ['custom_api_key', 'API key']] as [string, string][]) {
-    if (!truthy(get(opts, field))) need.push(needLabel)
-  }
+  const need = [['custom_base_url', 'endpoint URL'], ['custom_model', 'model name'], ['custom_api_key', 'API key']]
+    .filter(([field]) => !truthy(get(opts, field))).map(([, label]) => label)
   if (get(opts, 'provider') === 'custom' && need.length) return [false, 'provider custom still needs its ' + need.join(', ')]
   const key = get(profile, 'key_env', first)
   return [false, key === 'DEEPSEEK_API_KEY' ? 'it has no DeepSeek API key' : `${key} is not set`]

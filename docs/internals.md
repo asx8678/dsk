@@ -4,7 +4,7 @@ The protocol in full; the README has the short version.
 
 ## Reply format
 
-Every request carries one static tool, `run_code(code)`, and with thinking off the call is forced. A reply that is not exactly one valid call is not run and gets a fixed message back.
+Every request carries one static tool, `run_code(code)`, and with thinking off the call is forced. A reply that is not exactly one valid call is not run and gets a fixed message back, with one exception: in a read-only run, a reply of 400 characters or more of text with no call is taken as the worker's answer, as if it had called `done()` with it (all 34 such replies in the logs of 73 sessions were finished answers).
 
 ## Function API
 
