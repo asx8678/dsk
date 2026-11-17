@@ -41,10 +41,6 @@ function move(src, dst) {
     }
     fs.rmSync(src, { recursive: st.isDirectory(), force: true });
 }
-/** Python's text[-n:], in code points: n = 0 keeps the whole text. */
-function cpTail(text, n) {
-    return [...text].slice(-n).join('');
-}
 /** Run git in `cwd` and return what it printed. A failure is a Fail that names the subcommand and gives git's own words. */
 export function git(cwd, args = [], options = {}) {
     // errors="surrogateescape" in dsk.py: a diff of a file that is not UTF-8 goes back to `git apply` byte for byte.
@@ -79,24 +75,11 @@ export function scope(s) {
 }
 /** The turn limit of the round in flight: a `reject` may set one, and then it holds for that round alone. */
 export function roundLimit(recs) {
-    let start = null;
-    for (let i = recs.length - 1; i >= 0; i--) {
-        if (recs[i]['t'] === 'base' || recs[i]['t'] === 'reject') {
-            start = recs[i];
-            break;
-        }
-    }
+    const start = recs.findLast((r) => r['t'] === 'base' || r['t'] === 'reject');
     if (start && start['t'] === 'reject' && get(start, 'max_turns')) {
         return start['max_turns'];
     }
-    let base = null;
-    for (let i = recs.length - 1; i >= 0; i--) {
-        if (recs[i]['t'] === 'base') {
-            base = recs[i];
-            break;
-        }
-    }
-    return (base || recs[0])['max_turns'];
+    return (recs.findLast((r) => r['t'] === 'base') || recs[0])['max_turns'];
 }
 /**
  * Attribute to the worker what changed since the tree `before`, taken just before a script or the checks
@@ -181,7 +164,7 @@ export async function gates(s, cfg, env) {
             const [code, out] = await shell(cmd, cfg['limits']['turn_seconds'], env, s.head['workdir'], undefined, sandboxed(s, cfg), 8192);
             results.push([cmd, code]);
             if (code) {
-                problem = `check failed: ${cmd} → ${code}\n${cpTail(out, 2000).trim()}`;
+                problem = `check failed: ${cmd} → ${code}\n${[...out].slice(-2000).join('').trim()}`;
                 break;
             }
         }
@@ -203,12 +186,7 @@ export function changes(s) {
     }
     const windows = s.last('base') ? s.since('base', 'gate') : s.of('gate');
     const end = tree(s);
-    const touched = new Set();
-    for (const g of windows) {
-        for (const p of (has(g, 'touched') ? g['touched'] : [])) {
-            touched.add(p);
-        }
-    }
+    const touched = new Set(windows.flatMap((g) => (has(g, 'touched') ? g['touched'] : [])));
     const stat = git(head['workdir'], ['diff', '--numstat', '--no-renames', '-z', scope(s)['start'], end]);
     const changed = stat.split('\0').filter((entry) => entry).map((entry) => entry.split('\t'))
         .filter((entry) => touched.has(entry[2]));
@@ -231,12 +209,8 @@ export function ignoredWrites(s, changed) {
     if (!scope(s)['start']) {
         return [];
     }
-    let base = -1;
-    s.recs.forEach((r, i) => { if (r['t'] === 'base')
-        base = i; });
-    const tracked = new Set();
-    for (const row of changed)
-        tracked.add(row[2]);
+    const base = s.recs.findLastIndex((r) => r['t'] === 'base');
+    const tracked = new Set(changed.map((row) => row[2]));
     const workdir = realPath(s.head['workdir']);
     const paths = new Set();
     for (const r of s.recs.slice(base + 1)) {

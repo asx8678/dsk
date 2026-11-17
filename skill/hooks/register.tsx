@@ -985,12 +985,8 @@ const cancel = async ($: EngineInterface) => {
  * Takes a provider off the route, or puts it back: ahead of official DeepSeek, or last. For official DeepSeek
  * that is the choice between web search alone and work as well.
  */
-const toggle = async ($: EngineInterface, one: Provider, on = !one.enabled) => {
-  if (on === one.enabled) {
-    return
-  }
-
-  const ran = await dsk($, ['provider', on ? 'enable' : 'disable', one.name])
+const toggle = async ($: EngineInterface, one: Provider) => {
+  const ran = await dsk($, ['provider', one.enabled ? 'disable' : 'enable', one.name])
   await refresh($, { note: said(ran), isError: ran?.isOk !== true })
   // Its view lists other actions now: the ring stays on the one just pressed.
   await land($, 'act-toggle')

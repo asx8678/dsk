@@ -68,6 +68,9 @@ export const SLOT_POLL = 2
 export const BENCH_PROMPT = "Speed test. Reply with one run_code call whose code is print(1)."
 export const NUDGE = "Nothing was run: your reply was not exactly one run_code call with a `code` string. Reply with one run_code call and no other text."
 export const TRUNCATED = "Your reply reached the output limit and was cut off, so nothing was run. Take smaller steps: write one file per script, and use edit() for small changes."
+export const TIMED_OUT = "Your reply was still going after {seconds} seconds and was cut off before it reached a script, so nothing was run. You thought too long: do not work the whole task out in one reply. Reply now with one short script that takes the next step, or that hands in what you have with done()."
+export const SPOKEN = "taken as your answer: your reply was text with no run_code call"
+export const SPOKEN_CHARS = 400
 export const ONE_CALL = "not run: send exactly one run_code call per reply"
 export const REPEAT = "not run: this reply is identical to your previous one. If the work is finished, call done() with the result; otherwise send a different script."
 export const ALTERNATING = "not run: your last four replies alternate between the same two scripts and nothing changes. Do something different, or call done() or ask()."
@@ -85,6 +88,7 @@ export const MAX_FINDINGS = 8
 export const NO_FIX: Set<string> = new Set(["-", "n/a", "na", "no change", "no change needed", "no fix", "no fix needed", "none", "nothing"])
 export const HEAT: readonly any[] = [0, 0.7, 1.0]
 export const CUT_OFF: Record<string, any> = {"role": "assistant", "content": "(my reply was cut off at the output limit and was not kept)"}
+export const TIMED_OUT_REPLY: Record<string, any> = {"role": "assistant", "content": "(my reply ran past the time limit and was not kept)"}
 export const SCRATCH = "scratch: write(\"@scratch/name\", text) and $DSK_SCRATCH in sh() are for throwaway files; nothing there is part of your change. A script kept there resolves its imports from that folder, not from the project: give it the project's path, or keep the import absolute"
 export const SANDBOX_WRITE: readonly any[] = ["~/Library/Caches", "~/.cache", "~/.npm", "~/go/pkg/mod", "~/Library/Developer/Xcode/DerivedData", "~/Library/org.swift.swiftpm"]
 export const SANDBOX_HIDE: readonly any[] = ["~/.config/dsk", "~/.ssh", "~/.aws", "~/.gnupg", "~/.netrc", "~/.config/gh", "~/.docker", "~/.kube", "~/Library/Keychains"]
@@ -92,7 +96,6 @@ export const SANDBOX_EXEC = "/usr/bin/sandbox-exec"
 export const SANDBOX_LINE = "sandbox: writing outside the working directory, @scratch and the temp folders fails with \"Operation not permitted\"; so does writing in .git. That is policy, not a fault to work around"
 export const KEEP = 4000
 export const EXIT: Record<string, any> = {"question": 2, "stuck": 3, "limit": 3, "error": 1}
-export const TAKE_OVER = "dsk show {id} --diff | dsk accept {id} | dsk reject {id} \"guidance\" | dsk reject {id} --drop"
 export const NEXT: Record<string, any> = {
   "review": "dsk show {id} --review | dsk accept {id} | dsk reject {id} \"defects\"",
   "question": "dsk answer {id} \"...\"",

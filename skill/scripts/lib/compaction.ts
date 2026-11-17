@@ -10,11 +10,6 @@ import { KEEP } from './texts.ts'
 import { seriesMsgs } from './wire.ts'
 import type { Session } from './session.ts'
 
-/** Python's task.strip(): whether a finished task has anything in it worth a line of the digest. */
-function nonBlank(task: unknown): boolean {
-  return String(task).trim() !== ''
-}
-
 /** What the dropped turns did, as fixed-format text. */
 export function digest(recs: Rec[], upto: number, changed: string[]): string {
   const ledger = recs.filter((r) => r['t'] === 'ledger')
@@ -27,7 +22,7 @@ export function digest(recs: Rec[], upto: number, changed: string[]): string {
   const finished = bases.length
     ? [get(recs[0], 'brief') || '', ...bases.slice(0, -1).map((r) => r['task'])]
     : []
-  out.push(...finished.filter(nonBlank).map((task) => `earlier task, finished: ${cpHead(words(task), 300)}`))
+  out.push(...finished.filter((task) => String(task).trim() !== '').map((task) => `earlier task, finished: ${cpHead(words(task), 300)}`))
   for (const r of ledger) {
     if (r['fn'] === 'ask') {
       out.push(`you asked: ${r['arg']}`)
@@ -107,8 +102,7 @@ export function compaction(recs: Rec[], changed: string[], compactAt = 32000): {
  * goes to. A failover keeps the messages, so a request measured on the profile before it counts too: one run
  * failed over from a profile that compacts at 48k to one that compacts at 24k, and sent that one 37k. */
 export function compact(s: Session, cfg: Cfg): void {
-  let start = -1
-  s.recs.forEach((r, i) => { if (r['t'] === 'series' && r['why'] !== 'failover') start = i })
+  const start = s.recs.findLastIndex((r) => r['t'] === 'series' && r['why'] !== 'failover')
   if (start < 0) throw new Error('max() arg is an empty sequence')
   let last: any = null
   for (let i = s.recs.length - 1; i >= start; i--) if (s.recs[i]['t'] === 'usage') { last = s.recs[i]; break }

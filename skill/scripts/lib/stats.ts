@@ -2,7 +2,8 @@
 const fs = process.getBuiltinModule('node:fs')
 import type { BigIntStats } from 'node:fs'
 const path = process.getBuiltinModule('node:path')
-import { pySum, Fail, Interrupted, SCRIPTS, STATE, cpHead, cpLen, dumps, eprint, fixed, get, has, now, print, pyRound, pythonPath, xdg, pyJsonAscii, words, type Args, type Cfg, type Head, type Rec } from './base.ts'
+const { isDeepStrictEqual: sameJSON } = process.getBuiltinModule('node:util')
+import { PyFloat, pySum, Fail, Interrupted, SCRIPTS, STATE, cpHead, dumps, eprint, fixed, get, has, now, print, pyRound, pythonPath, xdg, pyJsonAscii, words, type Args, type Cfg, type Head, type Rec } from './base.ts'
 import { projectRoot } from './commands.ts'
 import { config, plugin, secret, setup } from './config.ts'
 import { roundLimit, scope } from './gates.ts'
@@ -35,44 +36,10 @@ function firstLine(file: string): string {
   return Buffer.concat(chunks).toString('utf8')
 }
 
-/** Python's equality for JSON values; key order does not matter. */
-function sameJSON(a: any, b: any): boolean {
-  if (typeof a === 'bigint' && typeof b === 'bigint') return a === b // a nanosecond mtime does not fit a JS number
-  if (typeof a === 'bigint') return typeof b === 'number' && Number.isInteger(b) && a === BigInt(b)
-  if (typeof b === 'bigint') return typeof a === 'number' && Number.isInteger(a) && BigInt(a) === b
-  if (typeof a === 'number' && typeof b === 'number') return a === b
-  if (a === b) return true
-  if (!a || !b || typeof a !== 'object' || typeof b !== 'object') return false
-  if (Array.isArray(a) || Array.isArray(b)) {
-    return Array.isArray(a) && Array.isArray(b) && a.length === b.length && a.every((x, i) => sameJSON(x, b[i]))
-  }
-  const ak = Object.keys(a), bk = Object.keys(b)
-  return ak.length === bk.length && ak.every((k) => has(b, k) && sameJSON(a[k], b[k]))
-}
-
 /** `time.strftime('%a %H:%M', time.localtime(x))`, in the local time zone. */
 function shortTime(x: number): string {
   const d = new Date(x * 1000), days = ['Sun', 'Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat']
   return `${days[d.getDay()]} ${String(d.getHours()).padStart(2, '0')}:${String(d.getMinutes()).padStart(2, '0')}`
-}
-
-/** Python's `f"{text:<n}"`: pad on the right to n characters, never cutting a longer string. */
-function ljust(text: string, n: number): string {
-  return text + ' '.repeat(Math.max(0, n - cpLen(text)))
-}
-
-/** Read the status cache keeping each `key` number exact: a nanosecond mtime is too large for a JSON number. */
-function readStatusCache(text: string): any {
-  const marked = text.replace(/("key"\s*:\s*\[\s*)(-?\d+)(\s*,\s*)(-?\d+)(\s*\])/g,
-    (_match: string, before: string, mtime: string, between: string, size: string, after: string) =>
-      `${before}"${mtime}"${between}"${size}"${after}`)
-  const old = JSON.parse(marked)
-  for (const [sid, entry] of Object.entries(old)) {
-    if (sid !== 'for' && entry && typeof entry === 'object' && Array.isArray((entry as any).key)) {
-      (entry as any).key = (entry as any).key.map((x: any) => BigInt(x))
-    }
-  }
-  return old
 }
 
 /** os.path.getmtime(): CPython makes the float as sec + nsec * 1e-9, which rounds otherwise than nanoseconds / 1e9. */
@@ -112,6 +79,20 @@ export function sessions(wanted: (head: Head) => unknown): Session[] {
   return found
 }
 
+/** What a session's usage cost at its profiles' prices, or null when one of them has no price. */
+function sessionCost(cfg: Cfg, usage: any[]): number | null {
+  const prices = usage.map((u) => get(get(cfg.profiles, u.profile, {}), 'price'))
+  return !prices.every((p) => p) ? null : pySum(usage.map((u, i) => {  // sum() in dsk.py: compensated, so the digits match
+    const p = prices[i]
+    return ((u.prompt - (u.hit || 0)) * p.in + (u.hit || 0) * p.cached + u.out * p.out) / 1e6
+  }))
+}
+
+/** Each failover of a session in order: the profile it left, and why. */
+function failovers(series: any[]): string[] {
+  return series.slice(1).flatMap((b, i) => b.why === 'failover' && b.status !== 'chosen' ? [`${series[i].profile} ${b.status || 'network'}`] : [])
+}
+
 /** One session as plain data, for `status --json`: what a progress display needs. All of it is measured. */
 export function job(s: Session, cfg: Cfg): Record<string, any> {
   const head = s.head, usage: any[] = s.of('usage'), status = s.status(), st: any = s.last('state') || {}, series: any[] = s.of('series')
@@ -122,22 +103,9 @@ export function job(s: Session, cfg: Cfg): Record<string, any> {
   const last = [...tail].reverse().find((r) => ['doing', 'ledger', 'checks', 'result'].includes(r.t)) || { t: '' }
   checking = checking || !!last.review // the independent review runs after the checks
   const phase = !tail.some((r) => r.t === 'usage') ? 'model' : checking ? 'checks' : 'script'
-  const prices = usage.map((u) => get(get(cfg.profiles, u.profile, {}), 'price'))
-  const cost = !prices.every((p) => p) ? null : pySum(usage.map((u, i) => {  // sum() in dsk.py: compensated, so the digits match
-    const p = prices[i]
-    return ((u.prompt - (u.hit || 0)) * p.in + (u.hit || 0) * p.cached + u.out * p.out) / 1e6
-  }))
-  let failover = ''
-  for (let i = series.length - 1; i > 0; i--) {
-    const a = series[i - 1], b = series[i]
-    if (b.why === 'failover' && b.status !== 'chosen') {
-      failover = `${a.profile} ${b.status || 'network'}`
-      break
-    }
-  }
   return { id: s.id, status, phase: status === 'running' ? phase : '', profile: s.profile,
     doing: last.t === 'doing' && status === 'running' ? cpHead(words(last.arg), 80) : '',
-    failover, cost,
+    failover: failovers(series).at(-1) ?? '', cost: sessionCost(cfg, usage),
     turn: s.since('round', 'result').length, max_turns: roundLimit(s.recs), turns: s.turn,
     in: usage.reduce((n, u) => n + u.prompt, 0), out: usage.reduce((n, u) => n + u.out, 0), cached: cachedShare(usage),
     act: done.length && status === 'running' ? cpHead(words(`${done[done.length - 1].fn} ${done[done.length - 1].arg}`), 80) : '',
@@ -194,11 +162,6 @@ export function metrics(s: Session, cfg: Cfg): Record<string, any> {
   const kindsList = results.map((r) => turnKind(r, acts.filter((a) => a.turn === r.turn)))
   const kinds = Object.create(null)
   for (const kind of kindsList) kinds[kind] = (has(kinds, kind) ? kinds[kind] : 0) + 1
-  const prices = usage.map((u) => get(get(cfg.profiles, u.profile, {}), 'price'))
-  const cost = !prices.every((p) => p) ? null : pySum(usage.map((u, i) => {  // sum() in dsk.py: compensated, so the digits match
-    const p = prices[i]
-    return ((u.prompt - (u.hit || 0)) * p.in + (u.hit || 0) * p.cached + u.out * p.out) / 1e6
-  }))
   const stamped = s.recs.filter((r: any) => has(r, 'at')).map((r: any) => r.at)
   const reqs = s.recs.map((r: any, i: number) => (r.t === 'req' && has(r, 'at') ? i : -1)).filter((i: number) => i >= 0)
   let model = 0.0
@@ -228,16 +191,13 @@ export function metrics(s: Session, cfg: Cfg): Record<string, any> {
     profiles: [...new Set(usage.map((u) => u.profile))], rounds: s.of('round').length,
     rejects: s.of('reject').length, continues: s.of('base').length,
     compactions: series.filter((r) => r.why === 'compact').length,
-    failovers: series.slice(1).flatMap((b, i) => {
-      const a = series[i]
-      return b.why === 'failover' && b.status !== 'chosen' ? [`${a.profile} ${b.status || 'network'}`] : []
-    }),
+    failovers: failovers(series),
     turns: results.length, kinds,
     lead_in: kindsList.findIndex((kind) => kind !== 'read') < 0 ? kindsList.length : kindsList.findIndex((kind) => kind !== 'read'),
     cut: results.filter((r) => String(r.text).includes('characters cut here')).length,
     in: usage.reduce((n, u) => n + u.prompt, 0), out: usage.reduce((n, u) => n + u.out, 0),
     hit: usage.reduce((n, u) => n + (u.hit || 0), 0), cached: cachedShare(usage),
-    max_out: usage.length ? Math.max(...usage.map((u) => u.out)) : 0, speed, cost,
+    max_out: usage.length ? Math.max(...usage.map((u) => u.out)) : 0, speed, cost: sessionCost(cfg, usage),
     // a session that began before timestamps is stamped only at its end: its time is unknown, not zero
     seconds: has(head, 'at') ? pyRound(stamped[stamped.length - 1] - head.at!, 1) : null,
     model_seconds: reqs.length ? pyRound(model, 1) : null,
@@ -246,7 +206,7 @@ export function metrics(s: Session, cfg: Cfg): Record<string, any> {
 
 /** One line of the plain stats report: a label in a column ten characters wide. */
 export function label(text: string, value: string): string {
-  return `${ljust(text + ':', 10)} ${value}`
+  return `${(text + ':').padEnd(10)} ${value}`
 }
 
 /** The plain `dsk stats` report, one line per label, over the sessions as (log, metrics) pairs. */
@@ -346,15 +306,14 @@ export function cmdStatus(args: Args, cfg: Cfg): number {
     const made = [3, Object.fromEntries(Object.entries(cfg.profiles).map(([k, v]: any) => [k, get(v, 'price')]))]
     const fresh = new Map<string, any>([['for', made]])
     let old = {}
-    try { old = readStatusCache(fs.readFileSync(cache, 'utf8')) } catch { old = {} }
+    try { old = JSON.parse(fs.readFileSync(cache, 'utf8')) } catch { old = {} }
     old = sameJSON(get(old, 'for'), made) ? old : {}
     const dirs = fs.existsSync(STATE) && fs.statSync(STATE).isDirectory() ? listdir(STATE) : []
     for (const sid of dirs) {
       let stat: BigIntStats
       try { stat = fs.statSync(path.join(STATE, sid, 'log.jsonl'), { bigint: true }) } catch { continue }
-      const key = [stat.mtimeNs, stat.size], had = get(old, sid)
-      const sameKey = had && Array.isArray(had.key) && had.key.length === 2 &&
-        BigInt(had.key[0]) === key[0] && BigInt(had.key[1]) === key[1]
+      const key = [String(stat.mtimeNs), String(stat.size)], had = get(old, sid)  // strings: a nanosecond mtime does not fit a JSON number
+      const sameKey = had && Array.isArray(had.key) && had.key[0] === key[0] && had.key[1] === key[1]
       if (sameKey && get(get(had, 'job', {}), 'status') !== 'running') {
         fresh.set(sid, had) // a log that has not moved since its session stopped is not read again
         continue
@@ -373,7 +332,12 @@ export function cmdStatus(args: Args, cfg: Cfg): number {
     return 0
   }
   if (args.hook) { // a Claude Code Stop hook: exit 2 sends Claude back to review what it delegated
-    const event = JSON.parse(fs.readFileSync(0, 'utf8'))
+    let event: any = {}
+    try {
+      event = JSON.parse(fs.readFileSync(0, 'utf8'))
+    } catch {
+      // no event, or not JSON: nothing is known to wait, and a hook that fails shows an error at every turn end
+    }
     const mine = (head: any) => get(head, 'owner') && get(head, 'owner') === get(event, 'session_id')
     const waiting = get(event, 'stop_hook_active') ? [] : sessions(mine).filter((s: Session) => s.status() === 'review')
     for (const s of waiting) {
@@ -412,7 +376,8 @@ export function cmdStats(args: Args, cfg: Cfg): number {
   }
   const pairs = found.map((s): [Session, Record<string, any>] => [s, metrics(s, cfg)]).sort((a, b) => b[1].created - a[1].created)
   if (args.json) {
-    print(dumps({ sessions: pairs.map((pair: any) => pair[1]) }))
+    // the seconds of `speed` were a float sum in dsk.py, the turns a count
+    print(dumps({ sessions: pairs.map(([, m]) => ({ ...m, speed: Object.fromEntries(Object.entries(m.speed).map(([name, [seconds, turns]]: any) => [name, [new PyFloat(seconds), turns]])) })) }))
     return 0
   }
   for (const row of statsSummary(pairs)) print(row)
@@ -612,14 +577,14 @@ export function cmdConfigure(args: Args, cfg: Cfg): number {
     const key = secret(get(profile, 'key_env', '') ?? '') ? 'set' : 'missing'
     let until = paused(name)
     const pause = until ? ` · paused until ${shortTime(until)}, credit used up` : ''
-    print(`${ljust(name + ':', 8)} ${get(profile, 'base_url')} · ${get(profile, 'model')} · key ${key}${pause}`)
+    print(`${(name + ':').padEnd(8)} ${get(profile, 'base_url')} · ${get(profile, 'model')} · key ${key}${pause}`)
   }
   if (get(cfg, 'effort', 'off') !== 'off') {
-    print(`${ljust('effort:', 10)}${cfg.effort} for a run that names none`)
+    print(`${'effort:'.padEnd(10)}${cfg.effort} for a run that names none`)
   }
   if (get(cfg, 'route_order') === 'fastest') {
     const found = speeds()
-    print(`${ljust('order:', 10)}fastest first: ` + fastOrder(found, cfg.route).map((name: string) => {
+    print(`${'order:'.padEnd(10)}fastest first: ` + fastOrder(found, cfg.route).map((name: string) => {
       const seconds = get(get(found, name, {}), 'seconds')
       return seconds !== null ? `${name} ${fixed(seconds, 2)}s` : `${name} (not measured)`
     }).join(', '))

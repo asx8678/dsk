@@ -18,11 +18,6 @@ function stripSlash(text: string): string {
   return text.replace(/\/+$/, '')
 }
 
-/** Python's repr of a string in the failure messages: one pair of single quotes. */
-function quoted(text: string): string {
-  return "'" + text + "'"
-}
-
 /** json.dumps(x, indent=2), which config.json is written with: Python escapes every non-ASCII code point. */
 function configJson(value: unknown): string {
   return asciiEscaped(JSON.stringify(value, null, 2))
@@ -86,6 +81,16 @@ export function userConfig(): [string, any] {
   return [file, user]
 }
 
+/** The words of one line of ~/.config/dsk/env as a shell reads them, without `export`; none for a line it cannot parse. */
+function envWords(line: string): string[] {
+  try {
+    return shlexSplit(line, true).filter((w) => w !== 'export')
+  } catch (e) {
+    if (e instanceof Interrupted) throw e
+    return []
+  }
+}
+
 /** Puts `export NAME='key'` in ~/.config/dsk/env in place of any line that set NAME; every other line stays. */
 export function setKey(name: string, key: string): void {
   const file = path.join(xdg('XDG_CONFIG_HOME', '~/.config'), 'env')
@@ -97,14 +102,7 @@ export function setKey(name: string, key: string): void {
     if (e?.code !== 'ENOENT') throw e
     lines = ['# API keys for dsk. Source this file from your shell profile, or leave it: dsk reads it as well.']
   }
-  const sets = (line: string): boolean => {
-    try {
-      return shlexSplit(line, true).some((w) => w.startsWith(name + '='))
-    } catch (e) {
-      if (e instanceof Interrupted) throw e
-      return false
-    }
-  }
+  const sets = (line: string): boolean => envWords(line).some((w) => w.startsWith(name + '='))
   writeKept(file, [...lines.filter((line) => !sets(line)), `export ${name}=${shlexQuote(key)}`].join('\n') + '\n')
 }
 
@@ -122,17 +120,9 @@ export function dropKey(name: string): '' | 'gone' | 'mixed' {
     if (e?.code !== 'ENOENT') throw e
     return ''
   }
-  const words = (line: string): string[] => {
-    try {
-      return shlexSplit(line, true).filter((w) => w !== 'export')
-    } catch (e) {
-      if (e instanceof Interrupted) throw e
-      return []
-    }
-  }
-  const kept = lines.filter((line) => !(words(line).length === 1 && words(line)[0].startsWith(name + '=')))
+  const kept = lines.filter((line) => !(envWords(line).length === 1 && envWords(line)[0].startsWith(name + '=')))
   if (kept.length < lines.length) writeKept(file, kept.join('\n') + '\n')
-  if (kept.some((line) => words(line).some((w) => w.startsWith(name + '=')))) return 'mixed'
+  if (kept.some((line) => envWords(line).some((w) => w.startsWith(name + '=')))) return 'mixed'
   return kept.length < lines.length ? 'gone' : ''
 }
 
@@ -190,7 +180,7 @@ export function readKey(args: Args): string | null {
 /** Fail unless the URL is an http(s) one and the model name holds no space. Either may be left out. */
 export function checkEndpoint(url: string | null | undefined, model: string | null | undefined): void {
   if (url !== null && url !== undefined && !/^https?:\/\/[^\s/]+(?:\/\S*)?$/.test(url)) {
-    throw new Fail(`${quoted(url)} is not an http(s) URL such as https://example.com/v1`)
+    throw new Fail(`'${url}' is not an http(s) URL such as https://example.com/v1`)
   }
   if (model !== null && model !== undefined && (!model.trim() || /\s/.test(model))) {
     throw new Fail('the model name is empty or holds a space')
@@ -297,7 +287,7 @@ function setOrder(cfg: Cfg, name: string, file: string, user: any): number {
 function addProvider(change: Change): number {
   const { args, cfg, name, file, user, profiles, route } = change
   if (!FULL_PROVIDER_NAME.test(name)) {
-    throw new Fail(`${quoted(name)}: a name is lower-case letters, digits, - and _, starting with a letter, at most 32`)
+    throw new Fail(`'${name}': a name is lower-case letters, digits, - and _, starting with a letter, at most 32`)
   }
   if (has(cfg.profiles, name)) {
     throw new Fail(`there is already a provider named ${name}; change it with: dsk provider set ${name}`)
@@ -325,7 +315,7 @@ function renameProvider(change: Change): number {
   const { args, cfg, name, file, user, profiles } = change
   const next = String(args.new || '').trim()
   if (!FULL_PROVIDER_NAME.test(next)) {
-    throw new Fail(`${quoted(next)}: a name is lower-case letters, digits, - and _, starting with a letter, at most 32`)
+    throw new Fail(`'${next}': a name is lower-case letters, digits, - and _, starting with a letter, at most 32`)
   }
   if (next === name) {
     print(`dsk · ${name} · nothing to change`)
@@ -390,11 +380,9 @@ function removeProvider(change: Change): number {
   else delete user.renamed
   writeKept(file, configJson(user) + '\n')  // the config first: a key left behind is harmless
   let extra = ''
-  if (!key_env) {
-    extra = ''
-  } else if (why) {
+  if (key_env && why) {
     extra = ` · its key stays in ${key_env}: ${why}`
-  } else {
+  } else if (key_env) {
     extra = ` · its key ${key_env} ` + ({
       "gone": 'is deleted from ~/.config/dsk/env',
       "mixed": 'stays: a line of ~/.config/dsk/env sets it with other variables; take it out by hand',

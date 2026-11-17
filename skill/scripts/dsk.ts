@@ -396,7 +396,6 @@ async function main(argv: string[] = process.argv.slice(2)): Promise<number> {
   try {
     return Number(await c.run(args, config())) || 0
   } catch (e: any) {
-    if (e instanceof OutputClosed) return 1  // `dsk status | head -1`: the reader has all it wanted
     if (e instanceof Fail || isOsError(e)) {
       const message = e instanceof Fail ? e.message : osErrorText(e)
       print(G.json ? dumps({ error: message }) : `dsk · error: ${message}`)

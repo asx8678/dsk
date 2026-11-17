@@ -8,10 +8,6 @@ import { firstMessage } from './loop.js';
 import { findingsText } from './review.js';
 import { KEEP } from './texts.js';
 import { seriesMsgs } from './wire.js';
-/** Python's task.strip(): whether a finished task has anything in it worth a line of the digest. */
-function nonBlank(task) {
-    return String(task).trim() !== '';
-}
 /** What the dropped turns did, as fixed-format text. */
 export function digest(recs, upto, changed) {
     const ledger = recs.filter((r) => r['t'] === 'ledger');
@@ -24,7 +20,7 @@ export function digest(recs, upto, changed) {
     const finished = bases.length
         ? [get(recs[0], 'brief') || '', ...bases.slice(0, -1).map((r) => r['task'])]
         : [];
-    out.push(...finished.filter(nonBlank).map((task) => `earlier task, finished: ${cpHead(words(task), 300)}`));
+    out.push(...finished.filter((task) => String(task).trim() !== '').map((task) => `earlier task, finished: ${cpHead(words(task), 300)}`));
     for (const r of ledger) {
         if (r['fn'] === 'ask') {
             out.push(`you asked: ${r['arg']}`);
@@ -105,9 +101,7 @@ export function compaction(recs, changed, compactAt = 32000) {
  * goes to. A failover keeps the messages, so a request measured on the profile before it counts too: one run
  * failed over from a profile that compacts at 48k to one that compacts at 24k, and sent that one 37k. */
 export function compact(s, cfg) {
-    let start = -1;
-    s.recs.forEach((r, i) => { if (r['t'] === 'series' && r['why'] !== 'failover')
-        start = i; });
+    const start = s.recs.findLastIndex((r) => r['t'] === 'series' && r['why'] !== 'failover');
     if (start < 0)
         throw new Error('max() arg is an empty sequence');
     let last = null;
