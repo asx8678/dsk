@@ -13,6 +13,27 @@ export function has(d, key) {
 export function get(d, key, fallback = null) {
     return has(d, key) ? d[key] : fallback;
 }
+/** Whether a value that came out of JSON is a dict, as Python's isinstance(value, dict) asked. */
+export function isDict(value) {
+    return value !== null && typeof value === 'object' && !Array.isArray(value);
+}
+/** Python's truth of a JSON value: false for null, false, 0 and "", and for an empty list or dict. */
+export function truthy(value) {
+    if (value === null || value === undefined || value === false || value === 0 || value === '')
+        return false;
+    if (Array.isArray(value))
+        return value.length > 0;
+    if (typeof value === 'object')
+        return Object.keys(value).length > 0;
+    return true;
+}
+/**
+ * Python's except OSError: an error with a code (ENOENT, EACCES, and Node's ERR_FS_EISDIR from rm or cp), unless it
+ * is a TypeError or RangeError, which Node throws for a call it was given wrongly: a bug, which keeps its stack.
+ */
+export function isOsError(e) {
+    return typeof e?.code === 'string' && !(e instanceof TypeError || e instanceof RangeError);
+}
 /** A failure dsk reports as `dsk · error: <message>`, as a Python `Fail` was. */
 export class Fail extends Error {
     name = 'Fail';
@@ -116,7 +137,7 @@ const FLOAT_KEYS = new Set(['at', 'created', 'active', 'cached', 'first', 'until
  */
 export function pyJson(value, sep = [', ', ': '], ascii = false) {
     const text = serialize(value, sep, false);
-    return ascii ? text.replace(/[\u0080-\uffff]/g, (c) => '\\u' + c.charCodeAt(0).toString(16).padStart(4, '0')) : text;
+    return ascii ? asciiEscaped(text) : text;
 }
 function serialize(value, sep, float) {
     if (value === null || value === undefined)
@@ -156,6 +177,14 @@ function serialize(value, sep, float) {
     }
     throw new TypeError(`Object of type ${typeof value} is not JSON serializable`);
 }
+/** json.dumps as Python calls it with no arguments: spaces after the separators, every non-ASCII character escaped. */
+export function pyJsonAscii(value) {
+    return pyJson(value, [', ', ': '], true);
+}
+/** A text with every character outside ASCII as a \\uXXXX escape, as json.dumps writes it by default. */
+export function asciiEscaped(text) {
+    return text.replace(/[\u0080-\uffff]/g, (c) => '\\u' + c.charCodeAt(0).toString(16).padStart(4, '0'));
+}
 /** dsk.py's dumps(): compact JSON, non-ASCII kept as it is. The only serializer of a request. */
 export function dumps(value) {
     return pyJson(value, [',', ':']);
@@ -185,6 +214,63 @@ export function cpHead(text, n) {
     }
     return text.slice(0, i);
 }
+/** Python's " ".join(text.split()): the words of a text, with every run of whitespace made one space. */
+export function words(text) {
+    const trimmed = String(text).trim();
+    return trimmed ? trimmed.split(/\s+/).join(' ') : '';
+}
+/** Python's str.splitlines(): every line separator Python knows, and no empty last line after a final one. */
+export function splitLines(text) {
+    if (!text)
+        return [];
+    const lines = text.split(/\r\n|[\n\r\v\f\x1c-\x1e\x85\u2028\u2029]/);
+    if (lines[lines.length - 1] === '')
+        lines.pop();
+    return lines;
+}
+/**
+ * Python's repr() of a value that came out of JSON, as dsk.py's messages quoted one: a string in the quote that saves
+ * escaping, with control characters escaped; None, True and False by name; lists and dicts as Python prints them.
+ */
+export function pyRepr(value) {
+    if (typeof value === 'string') {
+        const quote = value.includes("'") && !value.includes('"') ? '"' : "'";
+        let out = quote;
+        for (const ch of value) {
+            const code = ch.codePointAt(0) ?? 0;
+            if (ch === '\\' || ch === quote)
+                out += '\\' + ch;
+            else if (ch === '\n')
+                out += '\\n';
+            else if (ch === '\r')
+                out += '\\r';
+            else if (ch === '\t')
+                out += '\\t';
+            else if (code < 0x20 || (code >= 0x7f && code < 0xa0))
+                out += '\\x' + code.toString(16).padStart(2, '0');
+            else
+                out += ch;
+        }
+        return out + quote;
+    }
+    if (value === null || value === undefined)
+        return 'None';
+    if (typeof value === 'number') {
+        // Python keeps 7 and 7.0 distinct; an integer JSON value reads as an int here, and repr has no .0 then.
+        if (Object.is(value, -0))
+            return '-0.0';
+        return Number.isInteger(value) ? String(value) : pyFloat(value);
+    }
+    if (typeof value === 'boolean')
+        return value ? 'True' : 'False';
+    if (Array.isArray(value))
+        return '[' + value.map(pyRepr).join(', ') + ']';
+    if (typeof value === 'object') {
+        return '{' + Object.entries(value).map(([k, v]) => pyRepr(k) + ': ' + pyRepr(v)).join(', ') + '}';
+    }
+    return String(value);
+}
+/** The SHA-256 of a text or of bytes, in hex. */
 export function sha256(text) {
     return crypto.createHash('sha256').update(text).digest('hex');
 }
@@ -290,6 +376,25 @@ export function xdg(variable, fallback) {
 }
 /** Sessions, slots and caches: ~/.local/state/dsk. Read once, at startup, as dsk.py read it. */
 export const STATE = xdg('XDG_STATE_HOME', '~/.local/state');
+/**
+ * os.path.realpath(): symlinks resolved, and a path that does not exist yet kept as its resolved parent plus its own
+ * name, where Node's realpathSync throws. The scope gate compares written paths this way, and the sandbox profile names
+ * build caches that may not exist yet.
+ */
+export function realPath(p) {
+    const abs = path.resolve(p);
+    try {
+        return fs.realpathSync(abs);
+    }
+    catch {
+        const parent = path.dirname(abs);
+        return parent === abs ? abs : path.join(realPath(parent), path.basename(abs));
+    }
+}
+/** os.path.relpath(target, base): "." for the base itself, where Node says "". */
+export function relPath(target, base) {
+    return path.relative(path.resolve(base), path.resolve(target)) || '.';
+}
 /** os.path.expanduser. */
 export function expandUser(p) {
     return p.replace(/^~(?=$|\/)/, os.homedir());
@@ -486,13 +591,14 @@ export function exitStatus(code, signal) {
         return code;
     return -(os.constants.signals[signal] ?? 1);
 }
-/** Read a whole file through a descriptor, from its start, whatever its position. */
-export function readFd(fd) {
+/** Read a file through a descriptor, whatever its position: all of it, or its last `tail` bytes. */
+export function readFd(fd, tail = Infinity) {
     const size = fs.fstatSync(fd).size;
-    const buffer = Buffer.alloc(size);
+    const from = Math.max(0, size - tail);
+    const buffer = Buffer.alloc(size - from);
     let got = 0;
-    while (got < size) {
-        const n = fs.readSync(fd, buffer, got, size - got, got);
+    while (got < buffer.length) {
+        const n = fs.readSync(fd, buffer, got, buffer.length - got, from + got);
         if (n === 0)
             break;
         got += n;
@@ -510,9 +616,10 @@ export function tempFile() {
  * dsk.py's shell(): run a command in its own process group, output and errors together, and kill the group when it
  * returns, so nothing outlives it. `wrap` is a prefix such as the sandbox's, which the command then runs under.
  * Returns [exit code, output]; 124 and a note when it ran out of time. A signal kills the group and rejects with
- * Interrupted, as KeyboardInterrupt did.
+ * Interrupted, as KeyboardInterrupt did. `tail` keeps the last bytes of the output alone, for a caller that shows
+ * only its end: 50 MB of output, read whole and cut afterwards, took a second and 660 MB of memory.
  */
-export async function shell(cmd, timeout, env, cwd, started = () => { }, wrap = []) {
+export async function shell(cmd, timeout, env, cwd, started = () => { }, wrap = [], tail = Infinity) {
     const out = tempFile();
     try {
         const argv = [...wrap, '/bin/sh', '-c', cmd];
@@ -533,7 +640,7 @@ export async function shell(cmd, timeout, env, cwd, started = () => { }, wrap = 
         killGroup(pid);
         if (interrupted)
             throw new Interrupted();
-        const text = readFd(out).toString('utf8');
+        const text = readFd(out, tail).toString('utf8');
         return timedOut ? [124, text + `\n[killed after ${timeout}s]`] : [code, text];
     }
     finally {

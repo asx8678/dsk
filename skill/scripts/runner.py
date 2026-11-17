@@ -29,6 +29,8 @@ def gate(script):
         tree = ast.parse(script)
     except SyntaxError as e:
         return f"SyntaxError on line {e.lineno}: {e.msg}"
+    except (ValueError, RecursionError, MemoryError) as e:  # a lone surrogate, or nesting too deep to parse
+        return f"the script cannot be parsed: {type(e).__name__}: {e}"[:300]
     for node in ast.walk(tree):
         names = [node.id] if isinstance(node, ast.Name) else [node.attr] if isinstance(node, ast.Attribute) else []
         if isinstance(node, (ast.Import, ast.ImportFrom)):
@@ -52,15 +54,57 @@ def matcher(globs):
     return lambda path: any(p.match(path) for p in patterns)
 
 
+QUOTED = re.compile(r'"(?:[^"\\]|\\.)*"' + r"|'[^']*'")
+
+
+def spoken(flat):
+    """A command with the text it only carries blanked out, for the git check. A quoted string is an argument, such
+    as a grep pattern or a commit message, unless it is the script of `sh -c` or of `eval`, which the shell runs: of
+    29 git refusals in the logs of 720 sessions, 8 were the word git inside such a string, and each cost its worker
+    a turn. sudo and the deny list are matched on the whole command, as they were: `ssh host "kubectl delete ..."` runs what
+    its string says, and nothing measured says a quoted match there is a false one."""
+    def text(found):
+        runs = re.search(r"(?:\s-\w*c|\beval)\s*$", flat[:found.start()])
+        return found.group() if runs else found.group()[0] + " " * (len(found.group()) - 2) + found.group()[-1]
+    return QUOTED.sub(text, flat)
+
+
 def denied(cmd, deny):
     """Why sh() refuses this command, or None. It stops an obedient worker's mistake; it is not a sandbox."""
     flat = " ".join(cmd.split())
-    for found in re.finditer(r"""(?:^|[\s;&|(/"'])git\s+(?:-[cC]\s*\S+\s+|-\S+\s+)*([\w-]+)""", flat):
+    for found in re.finditer(r"""(?:^|[\s;&|(/"'])git\s+(?:-[cC]\s*\S+\s+|-\S+\s+)*([\w-]+)""", spoken(flat)):
         if found.group(1) not in GIT_READ_ONLY:
             return f"git {found.group(1)} is refused: git is read-only here ({', '.join(GIT_READ_ONLY)})"
     if re.search(r"(?:^|[\s;&|(/])sudo\s", flat + " "):
         return "sudo is refused"
-    return next((f"`{d}` is refused" for d in deny if d in flat), None)
+    return next((f"`{d.strip()}` is refused" for d in deny if d in flat + " "), None)
+
+
+CHANGES = ("os.remove", "os.rename", "os.truncate", "os.link", "os.symlink", "os.mkdir", "os.rmdir", "os.chmod", "os.chown")
+STARTS = ("os.system", "os.exec", "os.posix_spawn", "os.spawn", "os.fork", "os.forkpty", "subprocess.Popen", "pty.spawn")
+WRITING = os.O_WRONLY | os.O_RDWR | os.O_CREAT | os.O_TRUNC | os.O_APPEND
+
+
+def outside(event, args):
+    """Why a script may not do what this audit event says it is about to do, or None. A script acts through the
+    function API alone: it changes files with write() and edit() and starts commands with sh(). The gate reads the
+    script for that; this is asked about what the script then does, so io.FileIO() or a module's own `os` gets no
+    further than open() would. Reading is free, and so is Python's own bytecode cache, which an import may write."""
+    target = args[0] if args else None
+    path = os.fsdecode(target) if isinstance(target, (str, bytes, os.PathLike)) else ""
+    name = os.path.basename(path)
+    if event in STARTS:
+        return f"{event}() is not allowed; start commands with sh(cmd)"
+    if name == "__pycache__" or (".pyc" in name and "__pycache__" in path):
+        return None
+    if event == "open":
+        mode, flags = args[1], args[2]
+        writes = any(c in mode for c in "wax+") if isinstance(mode, str) else bool((flags or 0) & WRITING)
+        if writes and not isinstance(target, int):  # a number is a descriptor that is open already
+            return f"opening {path} for writing is not allowed; use write(path, text) or edit()"
+    elif event in CHANGES:
+        return f"{event}() is not allowed; change files with write() and edit(), or with sh()"
+    return None
 
 
 def kill_group(pgid):
@@ -77,16 +121,17 @@ def shell(cmd, timeout, env=None, cwd=None, started=lambda pid: None, wrap=()):
         proc = subprocess.Popen([*wrap, "/bin/sh", "-c", cmd] if wrap else cmd, shell=not wrap, cwd=cwd, env=env,
                                 stdin=subprocess.DEVNULL, stdout=out, stderr=out, start_new_session=True)
         started(proc.pid)
+        late = False
         try:
             code = proc.wait(timeout)
         except subprocess.TimeoutExpired:
-            code = 124
+            code, late = 124, True  # a command may exit 124 by itself, as `timeout` does: only this one was killed
         finally:
             kill_group(proc.pid)
             proc.wait()
         out.seek(0)
         text = out.read().decode("utf-8", "replace")
-    return code, text + (f"\n[killed after {timeout}s]" if code == 124 else "")
+    return code, text + (f"\n[killed after {timeout}s]" if late else "")
 
 
 def child(fd):
@@ -105,6 +150,16 @@ def child(fd):
     def tell(**record):
         chan.write(json.dumps(record) + "\n")
         chan.flush()
+
+    working = [0]  # above zero while a function of the API runs: those open files and start commands themselves
+
+    def audit(event, args):
+        """What the script does by itself, outside the API, is refused before it happens: outside() says which. So
+        a script that started no shell command has changed exactly the files it wrote with write() and edit(), which
+        is what the scope gate takes for granted (lib/revert.ts)."""
+        refusal = None if working[0] else outside(event, args)
+        if refusal:
+            raise PermissionError(refusal)
 
     def locate(path, change=False):
         """The only place that decides what a script may read or change."""
@@ -209,13 +264,23 @@ def child(fd):
 
     def logged(name, fn):
         def call(*args, **kwargs):
-            arg = str(next(iter([*args, *kwargs.values()]), ""))[:200]
+            first = next(iter([*args, *kwargs.values()]), "")
+            if name in ("write", "edit"):
+                first = kwargs.get("path", first)
+            arg = str(first)[:200]
+            # The scope gate tells what a script wrote from these records, so a written path longer than the 200
+            # characters kept of an argument is logged whole as well: cut, it named no file, and the change was
+            # taken for someone else's.
+            whole = {"path": str(first)} if name in ("write", "edit") and len(str(first)) > 200 else {}
+            working[0] += 1
             try:
                 result = fn(*args, **kwargs)
             except Exception as e:
-                tell(fn=name, arg=arg, err=f"{type(e).__name__}: {e}"[:200])
+                tell(fn=name, arg=arg, err=f"{type(e).__name__}: {e}"[:200], **whole)
                 raise
-            tell(fn=name, arg=arg, code=getattr(result, "code", 0))
+            finally:
+                working[0] -= 1
+            tell(fn=name, arg=arg, code=getattr(result, "code", 0), **whole)
             return result
         return call
 
@@ -238,6 +303,7 @@ def child(fd):
     every = {"__name__": "__main__", "__builtins__": {**vars(builtins), "__import__": importer},
              **{name: __import__(name) for name in IMPORTS}, **api,  # the modules are ready: re.search() needs no import
              "glob": globs}  # after the api, so that glob.glob() works without an import as well
+    sys.addaudithook(audit)  # from here on, and never taken off again: only the script runs after this line
     try:
         exec(compile(job["script"], "<script>", "exec"), every)
     except SystemExit:
@@ -296,7 +362,11 @@ def main():
         print(gate(sys.stdin.read()) or "")
     elif verb == ["gates"]:  # one script per line, as a JSON string; one JSON answer per line, until stdin closes
         for line in sys.stdin:
-            print(json.dumps(gate(json.loads(line))), flush=True)
+            try:
+                answer = gate(json.loads(line))
+            except Exception as e:  # this process serves a whole run: one script it cannot read must not end it
+                answer = f"the script could not be checked: {type(e).__name__}: {e}"[:300]
+            print(json.dumps(answer), flush=True)
     elif verb == ["locks"]:
         locks(sys.argv[2], sys.argv[3])
     else:

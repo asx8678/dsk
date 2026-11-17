@@ -169,8 +169,18 @@ remove_dev() {   # remove the other form of the plugin, so that it loads once; t
     fi
 }
 
+is_ours() {   # is $1 a dsk command install.sh wrote: its file, or the link to scripts/dsk.py the first versions made?
+    if [ -L "$1" ]; then   # any other link is the user's own, to another dsk or to a tool that shares the name
+        case "$(readlink "$1")" in
+            */scripts/dsk.py) return 0 ;;
+        esac
+        return 1
+    fi
+    [ -f "$1" ] && grep -q "Written by dsk's install.sh" "$1"
+}
+
 remove_command() {   # remove ~/.local/bin/dsk when it is the one install.sh writes
-    if [ -L "$bin/dsk" ] || { [ -f "$bin/dsk" ] && grep -q "Written by dsk's install.sh" "$bin/dsk"; }; then
+    if is_ours "$bin/dsk"; then
         rm -f "$bin/dsk"
         echo "dsk:    removed $bin/dsk"
     fi
@@ -281,9 +291,9 @@ write_command() {   # write ~/.local/bin/dsk, a small script that runs the plugi
         return 0
     fi
     target="$bin/dsk"
-    if [ -L "$target" ] || { [ -f "$target" ] && grep -q "Written by dsk's install.sh" "$target"; }; then
+    if is_ours "$target"; then
         :   # ours: replaced below in one step, so that a dsk run going on never finds half a file here
-    elif [ -e "$target" ]; then
+    elif [ -e "$target" ] || [ -L "$target" ]; then   # -L too: a link that points nowhere is still someone's
         echo "dsk:    left $target alone, because install.sh did not write it."
         return 0
     fi

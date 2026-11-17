@@ -1,9 +1,8 @@
 // dsk status, dsk stats and dsk configure: what the sessions on disk say, measured from their logs.
 const fs = process.getBuiltinModule('node:fs')
 import type { BigIntStats } from 'node:fs'
-const os = process.getBuiltinModule('node:os')
 const path = process.getBuiltinModule('node:path')
-import { pySum, Fail, G, Interrupted, RUNNER, SCRIPTS, STATE, checkInterrupt, comma, cpHead, cpLen, dumps, eprint, exitStatus, expandUser, fingerprint, fixed, flock, flockWait, fmtPercent, format, get, has, interruptOnSignals, killGroup, now, onInterrupt, print, pyFloat, pyJson, pyRound, pythonPath, readFd, runSync, sha256, shell, shlexQuote, shlexSplit, sleep, tempFile, tokenHex, write, xdg, type Args, type Cfg, type Head, type Profile, type Rec } from './base.ts'
+import { pySum, Fail, Interrupted, SCRIPTS, STATE, cpHead, cpLen, dumps, eprint, fixed, get, has, now, print, pyRound, pythonPath, xdg, pyJsonAscii, words, type Args, type Cfg, type Head, type Rec } from './base.ts'
 import { projectRoot } from './commands.ts'
 import { config, plugin, secret, setup } from './config.ts'
 import { roundLimit, scope } from './gates.ts'
@@ -12,7 +11,10 @@ import { Session } from './session.ts'
 import { fastOrder, speeds } from './speed.ts'
 import { OPTIONS, SETUP } from './texts.ts'
 import { mendLauncher } from './launcher.ts'
-import { paused, spent } from './wire.ts'
+import { paused } from './wire.ts'
+import { removeWorktree } from './accept.ts'
+import type { Status } from './lifecycle.ts'
+import { prunable } from './prune.ts'
 
 /** The first line of a file, without reading the rest of it. */
 function firstLine(file: string): string {
@@ -33,12 +35,6 @@ function firstLine(file: string): string {
   return Buffer.concat(chunks).toString('utf8')
 }
 
-/** Python's " ".join(text.split()): the words of a string, with runs of whitespace collapsed. */
-function words(text: unknown): string {
-  const s = String(text)
-  return s.trim() ? s.trim().split(/\s+/).join(' ') : ''
-}
-
 /** Python's equality for JSON values; key order does not matter. */
 function sameJSON(a: any, b: any): boolean {
   if (typeof a === 'bigint' && typeof b === 'bigint') return a === b // a nanosecond mtime does not fit a JS number
@@ -52,16 +48,6 @@ function sameJSON(a: any, b: any): boolean {
   }
   const ak = Object.keys(a), bk = Object.keys(b)
   return ak.length === bk.length && ak.every((k) => has(b, k) && sameJSON(a[k], b[k]))
-}
-
-/** Python's json.dumps defaults for the status cache: spaces, ASCII, floats as Python writes them, mtimes in full. */
-function statusJSON(value: any): string {
-  return pyJson(value, [', ', ': '], true)
-}
-
-/** Python's json.dumps defaults (spaces, ASCII) for the hook's JSON messages. */
-function pyJSONAscii(value: any): string {
-  return statusJSON(value)
 }
 
 /** `time.strftime('%a %H:%M', time.localtime(x))`, in the local time zone. */
@@ -108,7 +94,7 @@ function listdir(dir: string): string[] {
 }
 
 /** The sessions whose head satisfies `wanted`. Only the first line of the other logs is read. */
-export function sessions(wanted: any): any {
+export function sessions(wanted: (head: Head) => unknown): Session[] {
   const found: Session[] = []
   const dirs = fs.existsSync(STATE) && fs.statSync(STATE).isDirectory() ? fs.readdirSync(STATE).sort() : []
   for (const sid of dirs) {
@@ -127,13 +113,13 @@ export function sessions(wanted: any): any {
 }
 
 /** One session as plain data, for `status --json`: what a progress display needs. All of it is measured. */
-export function job(s: Session, cfg: Cfg): any {
-  const head: any = s.head, usage: any[] = s.of('usage'), status = s.status(), st: any = s.last('state') || {}, series: any[] = s.of('series')
-  const at = Math.max(...s.recs.map((r: any, i: number) => (r.t === 'req' || r.t === 'state' ? i : -1)))
-  const tail: any[] = s.recs.slice(at) // the turn in flight
-  const acts: any[] = tail.filter((r) => r.t === 'ledger'), done: any[] = s.since('round', 'ledger')
+export function job(s: Session, cfg: Cfg): Record<string, any> {
+  const head = s.head, usage: any[] = s.of('usage'), status = s.status(), st: any = s.last('state') || {}, series: any[] = s.of('series')
+  const at = Math.max(...s.recs.map((r, i: number) => (r.t === 'req' || r.t === 'state' ? i : -1)))
+  const tail = s.recs.slice(at) // the turn in flight
+  const acts = tail.filter((r) => r.t === 'ledger'), done: any[] = s.since('round', 'ledger')
   let checking = acts.some((r) => r.fn === 'done') && !tail.some((r) => r.t === 'checks')
-  const last: any = [...tail].reverse().find((r) => ['doing', 'ledger', 'checks', 'result'].includes(r.t)) || { t: '' }
+  const last = [...tail].reverse().find((r) => ['doing', 'ledger', 'checks', 'result'].includes(r.t)) || { t: '' }
   checking = checking || !!last.review // the independent review runs after the checks
   const phase = !tail.some((r) => r.t === 'usage') ? 'model' : checking ? 'checks' : 'script'
   const prices = usage.map((u) => get(get(cfg.profiles, u.profile, {}), 'price'))
@@ -164,34 +150,34 @@ export function job(s: Session, cfg: Cfg): any {
 }
 
 /** The middle value, the lower of the two in the middle of an even count, and 0 when there is nothing to measure. */
-export function median(values: any): any {
+export function median(values: Iterable<number>): number {
   const xs = [...values].sort((a, b) => a - b)
   return xs.length ? xs[Math.floor((xs.length - 1) / 2)] : 0
 }
 
 /** The 95th percentile by nearest rank, the lowest sample at or above 95% of them, and 0 with nothing to measure. */
-export function p95(values: any): any {
+export function p95(values: Iterable<number>): number {
   const xs = [...values].sort((a, b) => a - b)
   return xs.length ? xs[Math.max(0, Math.floor((xs.length * 95 + 99) / 100) - 1)] : 0
 }
 
 /** A whole-number percentage of `whole`, and 0 when there is nothing to be a share of. */
-export function share(part: any, whole: any): any {
+export function share(part: number, whole: number): number {
   return whole ? pyRound(part * 100 / whole) : 0
 }
 
 /** The same percentage, for a line that ends in it. */
-export function percent(part: any, whole: any): any {
+export function percent(part: number, whole: number): string {
   return `${share(part, whole)}%`
 }
 
 /** A number of seconds to one decimal, without a pointless .0. */
-export function duration(x: any): any {
+export function duration(x: number): string {
   return fixed(pyRound(x, 1), 1).replace(/\.0$/, '')
 }
 
 /** What one turn did, from its result and that turn's ledger records: a failure, files, commands, a stop, reading. */
-export function turnKind(result: any, acts: any): any {
+export function turnKind(result: { fail?: string; [field: string]: any }, acts: Rec[]): string {
   if (result.fail) return 'failed:' + result.fail
   const fns = new Set(acts.map((a: any) => a.fn))
   if (fns.has('write') || fns.has('edit')) return 'write'
@@ -199,11 +185,14 @@ export function turnKind(result: any, acts: any): any {
   return [...fns].some((fn) => fn !== 'ask' && fn !== 'done') ? 'read' : 'stop'
 }
 
-/** One session as plain numbers for `dsk stats`, all of it measured from its log. Logs written before */
-export function metrics(s: Session, cfg: Cfg): any {
-  const head: any = s.head, usage: any[] = s.of('usage'), results: any[] = s.of('result'), series: any[] = s.of('series'), acts: any[] = s.of('ledger')
+/**
+ * One session as plain numbers for `dsk stats`, all of it measured from its log. Logs written before
+ * timestamps existed have no `at`, and every duration they cannot give is null.
+ */
+export function metrics(s: Session, cfg: Cfg): Record<string, any> {
+  const head = s.head, usage: any[] = s.of('usage'), results: any[] = s.of('result'), series: any[] = s.of('series'), acts: any[] = s.of('ledger')
   const kindsList = results.map((r) => turnKind(r, acts.filter((a) => a.turn === r.turn)))
-  const kinds: any = Object.create(null)
+  const kinds = Object.create(null)
   for (const kind of kindsList) kinds[kind] = (has(kinds, kind) ? kinds[kind] : 0) + 1
   const prices = usage.map((u) => get(get(cfg.profiles, u.profile, {}), 'price'))
   const cost = !prices.every((p) => p) ? null : pySum(usage.map((u, i) => {  // sum() in dsk.py: compensated, so the digits match
@@ -250,38 +239,38 @@ export function metrics(s: Session, cfg: Cfg): any {
     hit: usage.reduce((n, u) => n + (u.hit || 0), 0), cached: cachedShare(usage),
     max_out: usage.length ? Math.max(...usage.map((u) => u.out)) : 0, speed, cost,
     // a session that began before timestamps is stamped only at its end: its time is unknown, not zero
-    seconds: has(head, 'at') ? pyRound(stamped[stamped.length - 1] - head.at, 1) : null,
+    seconds: has(head, 'at') ? pyRound(stamped[stamped.length - 1] - head.at!, 1) : null,
     model_seconds: reqs.length ? pyRound(model, 1) : null,
     lead_seconds: has(head, 'at') ? pyRound(waited, 1) : null }
 }
 
 /** One line of the plain stats report: a label in a column ten characters wide. */
-export function label(text: any, value: any): any {
+export function label(text: string, value: string): string {
   return `${ljust(text + ':', 10)} ${value}`
 }
 
 /** The plain `dsk stats` report, one line per label, over the sessions as (log, metrics) pairs. */
-export function statsSummary(pairs: any): any {
+export function statsSummary(pairs: [Session, Record<string, any>][]): string[] {
   const ms = pairs.map((pair: any) => pair[1])
   const turns = ms.reduce((n: number, m: any) => n + m.turns, 0)
-  const statuses: any = Object.create(null)
+  const statuses = Object.create(null)
   for (const m of ms) statuses[m.status] = (has(statuses, m.status) ? statuses[m.status] : 0) + 1
   const byCount = Object.entries(statuses).sort((a: any, b: any) => b[1] - a[1] || (a[0] < b[0] ? -1 : a[0] > b[0] ? 1 : 0))
-  const most = ms.reduce((a: any, b: any) => (b.turns > a.turns ? b : a))
+  const most = ms.reduce((a, b: any) => (b.turns > a.turns ? b : a))
   const lines = [label('sessions', `${ms.length} · ` + byCount.map(([status, n]) => `${status} ${n}`).join(' · ')),
     label('turns', `${turns} · median ${median(ms.map((m: any) => m.turns))} per session · ` +
       `most ${most.turns} (${most.id})`)]
-  const kinds: any = Object.create(null)
+  const kinds = Object.create(null)
   for (const m of ms) for (const [kind, n] of Object.entries(m.kinds)) kinds[kind] = (has(kinds, kind) ? kinds[kind] : 0) + Number(n)
   lines.push(label('kinds', Object.entries(kinds)
     .sort((a: any, b: any) => b[1] - a[1] || (a[0] < b[0] ? -1 : a[0] > b[0] ? 1 : 0))
-    .map(([kind, n]) => `${kind} ${percent(n, turns)}`).join(' · ')))
+    .map(([kind, n]) => `${kind} ${percent(Number(n), turns)}`).join(' · ')))
   const lead = ms.filter((m: any) => get(m.kinds, 'write')).map((m: any) => m.lead_in)
   lines.push(label('lead-in', `median ${median(lead)} read turns before the first change · ` +
     `${lead.filter((n: number) => n >= 5).length} sessions with 5 or more`))
   const cut = ms.reduce((n: number, m: any) => n + m.cut, 0)
   lines.push(label('cut', `${cut} of ${turns} turns had their output cut (${percent(cut, turns)})`))
-  const biggest = ms.reduce((a: any, b: any) => (b.max_out > a.max_out ? b : a))
+  const biggest = ms.reduce((a, b: any) => (b.max_out > a.max_out ? b : a))
   const truncated = ms.reduce((n: number, m: any) => n + (get(m.kinds, 'failed:truncated', 0) || 0), 0)
   const outs: number[] = []
   for (const [s, _] of pairs) for (const u of s.of('usage')) outs.push(u.out)
@@ -336,7 +325,7 @@ export function statsSummary(pairs: any): any {
 }
 
 /** One line per session for `dsk stats --sessions`: what it measured and where it ran. */
-export function sessionLine(m: any): any {
+export function sessionLine(m: Record<string, any>): string {
   const kinds = m.kinds
   const failed = Object.entries(kinds).filter(([kind]) => kind.startsWith('failed:')).reduce((n, [, v]) => n + Number(v), 0)
   return `${m.id} · ${m.status} · ${m.turns} turns (${get(kinds, 'read', 0)} r, ${get(kinds, 'write', 0)} w, ` +
@@ -344,7 +333,11 @@ export function sessionLine(m: any): any {
     `out ${kilo(m.out)} · ${path.basename(String(m.root).replace(/\/+$/, ''))}`
 }
 
-export function cmdStatus(args: Args, cfg: Cfg): any {
+/**
+ * `dsk status`: this project's open sessions. With --json, the last day's jobs on any project, for a display that
+ * polls; with --hook, the Claude Code Stop hook, which sends the lead back to work that waits for its review.
+ */
+export function cmdStatus(args: Args, cfg: Cfg): number {
   if (args.json) { // every session of the last day, on any project, newest first: for a display that polls
     // What a kept job was made with besides its log: this code's fields (bump the number) and the prices.
     const cache = path.join(STATE, 'status.json')
@@ -352,7 +345,7 @@ export function cmdStatus(args: Args, cfg: Cfg): any {
     // object would put ids made of digits first.
     const made = [3, Object.fromEntries(Object.entries(cfg.profiles).map(([k, v]: any) => [k, get(v, 'price')]))]
     const fresh = new Map<string, any>([['for', made]])
-    let old: any = {}
+    let old = {}
     try { old = readStatusCache(fs.readFileSync(cache, 'utf8')) } catch { old = {} }
     old = sameJSON(get(old, 'for'), made) ? old : {}
     const dirs = fs.existsSync(STATE) && fs.statSync(STATE).isDirectory() ? listdir(STATE) : []
@@ -370,17 +363,17 @@ export function cmdStatus(args: Args, cfg: Cfg): any {
       if (s.recs.length && get(s.head, 't') === 'head' && s.last('state')) fresh.set(sid, { key, job: job(s, cfg) })
     }
     if (!sameJSON(Object.fromEntries(fresh), old)) {
-      fs.writeFileSync(cache + `.${process.pid}`, statusJSON(fresh), 'utf8')
+      fs.writeFileSync(cache + `.${process.pid}`, pyJsonAscii(fresh), 'utf8')
       fs.renameSync(cache + `.${process.pid}`, cache)
     }
     const recent = [...fresh].filter(([sid]) => sid !== 'for').map(([, e]: any) => e.job)
       .filter((j: any) => j.created > now() - 86400)
-    recent.sort((a: any, b: any) => b.created - a.created)
+    recent.sort((a, b: any) => b.created - a.created)
     print(dumps({ jobs: recent }))
     return 0
   }
   if (args.hook) { // a Claude Code Stop hook: exit 2 sends Claude back to review what it delegated
-    const event: any = JSON.parse(fs.readFileSync(0, 'utf8'))
+    const event = JSON.parse(fs.readFileSync(0, 'utf8'))
     const mine = (head: any) => get(head, 'owner') && get(head, 'owner') === get(event, 'session_id')
     const waiting = get(event, 'stop_hook_active') ? [] : sessions(mine).filter((s: Session) => s.status() === 'review')
     for (const s of waiting) {
@@ -401,7 +394,7 @@ export function cmdStatus(args: Args, cfg: Cfg): any {
 }
 
 /** What the sessions measured, read from their logs: turns, kinds, tokens, time, rounds and profiles. */
-export function cmdStats(args: Args, cfg: Cfg): any {
+export function cmdStats(args: Args, cfg: Cfg): number {
   let found: Session[]
   if (args.id && args.id.length) { // nargs='*' gives [], which Python reads as false
     found = args.id.map((sid: string) => new Session(sid))
@@ -417,7 +410,7 @@ export function cmdStats(args: Args, cfg: Cfg): any {
     print(`no sessions in the last ${args.days} days`)
     return 0
   }
-  const pairs = found.map((s) => [s, metrics(s, cfg)]).sort((a: any, b: any) => b[1].created - a[1].created)
+  const pairs = found.map((s): [Session, Record<string, any>] => [s, metrics(s, cfg)]).sort((a, b) => b[1].created - a[1].created)
   if (args.json) {
     print(dumps({ sessions: pairs.map((pair: any) => pair[1]) }))
     return 0
@@ -430,8 +423,111 @@ export function cmdStats(args: Args, cfg: Cfg): any {
   return 0
 }
 
+/** The bytes a folder holds, links not followed: what deleting it frees. */
+function folderBytes(dir: string): number {
+  let total = 0
+  for (const entry of fs.readdirSync(dir, { withFileTypes: true })) {
+    const full = path.join(dir, entry.name)
+    total += entry.isDirectory() ? folderBytes(full) : fs.lstatSync(full).size
+  }
+  return total
+}
+
+/** A session `dsk prune` deleted, or one it kept because it waits for the lead's decision. */
+type Pruned = { id: string; bytes: number }
+type Waiting = Pruned & { status: string; worktree: boolean; root: string }
+
+/**
+ * Delete the folders of the sessions prunable() lets go (lib/prune.ts, whose laws gdp-wired proves): the settled
+ * ones nothing was written to for `keep` days. Each is locked first, so one that a dsk process drives stays. With
+ * `report`, every log is read and the sessions that still wait for a decision are named too; without it a log is
+ * read only once its age qualifies, so the daily call from `dsk run` costs one stat per session. `dry` deletes nothing.
+ */
+export function prune(keep: number, options: { dry?: boolean; report?: boolean } = {}): { gone: Pruned[]; waiting: Waiting[] } {
+  const gone: Pruned[] = [], waiting: Waiting[] = []
+  const dirs = fs.existsSync(STATE) && fs.statSync(STATE).isDirectory() ? fs.readdirSync(STATE).sort() : []
+  for (const sid of dirs) {
+    const dir = path.join(STATE, sid)
+    let age: number
+    let s: Session
+    try {
+      age = (now() - mtime(path.join(dir, 'log.jsonl'))) / 86400
+      if (age < keep && !options.report) continue
+      s = new Session(sid)
+    } catch {
+      continue // no session: the slots, a pause, a lock file; or a log that cannot be read, which is left as it is
+    }
+    if (!s.recs.length || get(s.head, 't') !== 'head' || !s.last('state')) continue
+    let held = false
+    try {
+      s.lock()
+    } catch (e) {
+      if (!(e instanceof Fail)) throw e
+      held = true
+    }
+    try {
+      const status = s.status() as Status
+      if (prunable(status, held, age, keep)) {
+        const bytes = folderBytes(dir)
+        if (!options.dry) {
+          // A settled session has no worktree left; one that does still has it registered in its repository.
+          if (s.head.worktree && fs.existsSync(s.head.workdir)) removeWorktree(s.head)
+          fs.rmSync(dir, { recursive: true, force: true })
+        }
+        gone.push({ id: sid, bytes })
+      } else if (options.report && ['review', 'question', 'stuck', 'limit', 'error'].includes(status)) {
+        waiting.push({ id: sid, status, bytes: folderBytes(dir), root: s.head.root,
+                       worktree: Boolean(s.head.worktree) && fs.existsSync(s.head.workdir) })
+      }
+    } finally {
+      s.lockHandle?.close()
+    }
+  }
+  return { gone, waiting }
+}
+
+/**
+ * Once a day, when the config sets `keep_days`: prune without a word, so that a state folder nobody tends stays
+ * bounded. `dsk run` calls it before it starts; a failure here never stops that run.
+ */
+export function autoPrune(cfg: Cfg): void {
+  const keep = Number(get(cfg, 'keep_days'))
+  if (!(keep > 0)) return
+  const stamp = path.join(STATE, 'pruned')
+  try {
+    if (now() - mtime(stamp) < 86400) return
+  } catch {
+    // never pruned yet
+  }
+  try {
+    fs.mkdirSync(STATE, { recursive: true })
+    fs.writeFileSync(stamp, '')
+    prune(keep)
+  } catch (e) {
+    if (e instanceof Interrupted) throw e
+  }
+}
+
+/** `dsk prune`: delete the settled sessions older than --days, and name the ones that still wait for a decision. */
+export function cmdPrune(args: Args, cfg: Cfg): number {
+  const kept = Number(get(cfg, 'keep_days'))
+  const keep: number = args.days ?? (kept > 0 ? kept : 30)
+  const { gone, waiting } = prune(keep, { dry: args.dry_run, report: true })
+  const mega = (bytes: number): string => `${fixed(bytes / 1e6, 1)} MB`
+  const freed = mega(gone.reduce((n, g) => n + g.bytes, 0))
+  const age = keep > 0 ? ` settled more than ${keep} day${keep === 1 ? '' : 's'} ago` : ', every settled one'
+  print(`dsk prune · ${args.dry_run ? 'would delete' : 'deleted'} ${gone.length} session${gone.length === 1 ? '' : 's'}${age} · ${freed}`)
+  for (const w of waiting) {
+    print(`kept:    ${w.id} · ${w.status} · ${mega(w.bytes)}${w.worktree ? ', its worktree included' : ''} · ${path.basename(w.root)}`)
+  }
+  if (waiting.length) {
+    print(`next:    ${waiting.length === 1 ? 'it waits' : 'they wait'} for your decision: dsk show ID, then dsk accept ID or dsk reject ID --drop`)
+  }
+  return 0
+}
+
 /** This dsk's version, from the plugin's manifest beside this script; '' when there is none (a bare checkout copy). */
-export function version(): any {
+export function version(): string {
   try {
     const data = JSON.parse(fs.readFileSync(path.join(SCRIPTS, '..', '.claude-plugin', 'plugin.json'), 'utf8'))
     return String(get(data, 'version', ''))
@@ -440,8 +536,11 @@ export function version(): any {
   }
 }
 
-/** How dsk is set up. As a Claude Code hook (--hook) it first stores the plugin's options, which Claude Code hands */
-export function cmdConfigure(args: Args, cfg: Cfg): any {
+/**
+ * How dsk is set up. As a Claude Code hook (--hook) it first stores the plugin's options, which Claude Code hands
+ * to hooks alone, where `config` and `secret` read them; at session start (--announce) it says what is still missing.
+ */
+export function cmdConfigure(args: Args, cfg: Cfg): number {
   if (args.hook) {
     try {
       const home = xdg('XDG_CONFIG_HOME', '~/.config')
@@ -459,7 +558,7 @@ export function cmdConfigure(args: Args, cfg: Cfg): any {
         if (!same) {
           fs.mkdirSync(path.dirname(file), { recursive: true })
           const fd = fs.openSync(file + '.new', 'w', 0o600)
-          try { fs.writeFileSync(fd, pyJSONAscii(value), 'utf8') } finally { fs.closeSync(fd) }
+          try { fs.writeFileSync(fd, pyJsonAscii(value), 'utf8') } finally { fs.closeSync(fd) }
           fs.renameSync(file + '.new', file)
         }
       }
@@ -487,7 +586,7 @@ export function cmdConfigure(args: Args, cfg: Cfg): any {
       }
       // Before every prompt too, not only at session start: /reload-plugins after an update starts no session.
       const mended = mendLauncher()
-      let said: any = null
+      let said = null
       if (python) {
         said = { systemMessage: `${news ? news + ' ' : ''}${python}.` }
       } else if (args.announce && ready && news) {
@@ -500,7 +599,7 @@ export function cmdConfigure(args: Args, cfg: Cfg): any {
             '`dsk run` will fail. If the user wants to delegate with dsk, tell them: ' + `${how} Never ask for a key in the chat.` } }
       }
       if (mended) said = said ? { ...said, systemMessage: `${said.systemMessage} ${mended}` } : { systemMessage: mended }
-      if (said) print(pyJSONAscii(said))
+      if (said) print(pyJsonAscii(said))
     } catch (e) { // a hook must never stand in the way of a session or a prompt
       if (e instanceof Interrupted) throw e
     }
@@ -509,8 +608,8 @@ export function cmdConfigure(args: Args, cfg: Cfg): any {
   const [ready, state] = setup(cfg)
   print(`dsk${version() ? ' ' + version() : ''} · ${ready ? 'ready' : 'not set up'} · ${state}`)
   for (const name of cfg.route) {
-    const profile: any = get(cfg.profiles, name, {})
-    const key = secret(get(profile, 'key_env', '')) ? 'set' : 'missing'
+    const profile = get(cfg.profiles, name, {})
+    const key = secret(get(profile, 'key_env', '') ?? '') ? 'set' : 'missing'
     let until = paused(name)
     const pause = until ? ` · paused until ${shortTime(until)}, credit used up` : ''
     print(`${ljust(name + ':', 8)} ${get(profile, 'base_url')} · ${get(profile, 'model')} · key ${key}${pause}`)

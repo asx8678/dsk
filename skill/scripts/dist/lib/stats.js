@@ -1,8 +1,7 @@
 // dsk status, dsk stats and dsk configure: what the sessions on disk say, measured from their logs.
 const fs = process.getBuiltinModule('node:fs');
-const os = process.getBuiltinModule('node:os');
 const path = process.getBuiltinModule('node:path');
-import { pySum, Fail, G, Interrupted, RUNNER, SCRIPTS, STATE, checkInterrupt, comma, cpHead, cpLen, dumps, eprint, exitStatus, expandUser, fingerprint, fixed, flock, flockWait, fmtPercent, format, get, has, interruptOnSignals, killGroup, now, onInterrupt, print, pyFloat, pyJson, pyRound, pythonPath, readFd, runSync, sha256, shell, shlexQuote, shlexSplit, sleep, tempFile, tokenHex, write, xdg } from './base.js';
+import { pySum, Fail, Interrupted, SCRIPTS, STATE, cpHead, cpLen, dumps, eprint, fixed, get, has, now, print, pyRound, pythonPath, xdg, pyJsonAscii, words } from './base.js';
 import { projectRoot } from './commands.js';
 import { config, plugin, secret, setup } from './config.js';
 import { roundLimit, scope } from './gates.js';
@@ -11,7 +10,9 @@ import { Session } from './session.js';
 import { fastOrder, speeds } from './speed.js';
 import { OPTIONS, SETUP } from './texts.js';
 import { mendLauncher } from './launcher.js';
-import { paused, spent } from './wire.js';
+import { paused } from './wire.js';
+import { removeWorktree } from './accept.js';
+import { prunable } from './prune.js';
 /** The first line of a file, without reading the rest of it. */
 function firstLine(file) {
     const fd = fs.openSync(file, 'r');
@@ -33,11 +34,6 @@ function firstLine(file) {
     }
     return Buffer.concat(chunks).toString('utf8');
 }
-/** Python's " ".join(text.split()): the words of a string, with runs of whitespace collapsed. */
-function words(text) {
-    const s = String(text);
-    return s.trim() ? s.trim().split(/\s+/).join(' ') : '';
-}
 /** Python's equality for JSON values; key order does not matter. */
 function sameJSON(a, b) {
     if (typeof a === 'bigint' && typeof b === 'bigint')
@@ -57,14 +53,6 @@ function sameJSON(a, b) {
     }
     const ak = Object.keys(a), bk = Object.keys(b);
     return ak.length === bk.length && ak.every((k) => has(b, k) && sameJSON(a[k], b[k]));
-}
-/** Python's json.dumps defaults for the status cache: spaces, ASCII, floats as Python writes them, mtimes in full. */
-function statusJSON(value) {
-    return pyJson(value, [', ', ': '], true);
-}
-/** Python's json.dumps defaults (spaces, ASCII) for the hook's JSON messages. */
-function pyJSONAscii(value) {
-    return statusJSON(value);
 }
 /** `time.strftime('%a %H:%M', time.localtime(x))`, in the local time zone. */
 function shortTime(x) {
@@ -193,7 +181,10 @@ export function turnKind(result, acts) {
         return 'run';
     return [...fns].some((fn) => fn !== 'ask' && fn !== 'done') ? 'read' : 'stop';
 }
-/** One session as plain numbers for `dsk stats`, all of it measured from its log. Logs written before */
+/**
+ * One session as plain numbers for `dsk stats`, all of it measured from its log. Logs written before
+ * timestamps existed have no `at`, and every duration they cannot give is null.
+ */
 export function metrics(s, cfg) {
     const head = s.head, usage = s.of('usage'), results = s.of('result'), series = s.of('series'), acts = s.of('ledger');
     const kindsList = results.map((r) => turnKind(r, acts.filter((a) => a.turn === r.turn)));
@@ -271,7 +262,7 @@ export function statsSummary(pairs) {
             kinds[kind] = (has(kinds, kind) ? kinds[kind] : 0) + Number(n);
     lines.push(label('kinds', Object.entries(kinds)
         .sort((a, b) => b[1] - a[1] || (a[0] < b[0] ? -1 : a[0] > b[0] ? 1 : 0))
-        .map(([kind, n]) => `${kind} ${percent(n, turns)}`).join(' · ')));
+        .map(([kind, n]) => `${kind} ${percent(Number(n), turns)}`).join(' · ')));
     const lead = ms.filter((m) => get(m.kinds, 'write')).map((m) => m.lead_in);
     lines.push(label('lead-in', `median ${median(lead)} read turns before the first change · ` +
         `${lead.filter((n) => n >= 5).length} sessions with 5 or more`));
@@ -351,6 +342,10 @@ export function sessionLine(m) {
         `${get(kinds, 'run', 0)} x, ${failed} f) · in ${kilo(m.in)} (${share(m.hit, m.in)}% cached) · ` +
         `out ${kilo(m.out)} · ${path.basename(String(m.root).replace(/\/+$/, ''))}`;
 }
+/**
+ * `dsk status`: this project's open sessions. With --json, the last day's jobs on any project, for a display that
+ * polls; with --hook, the Claude Code Stop hook, which sends the lead back to work that waits for its review.
+ */
 export function cmdStatus(args, cfg) {
     if (args.json) { // every session of the last day, on any project, newest first: for a display that polls
         // What a kept job was made with besides its log: this code's fields (bump the number) and the prices.
@@ -388,7 +383,7 @@ export function cmdStatus(args, cfg) {
                 fresh.set(sid, { key, job: job(s, cfg) });
         }
         if (!sameJSON(Object.fromEntries(fresh), old)) {
-            fs.writeFileSync(cache + `.${process.pid}`, statusJSON(fresh), 'utf8');
+            fs.writeFileSync(cache + `.${process.pid}`, pyJsonAscii(fresh), 'utf8');
             fs.renameSync(cache + `.${process.pid}`, cache);
         }
         const recent = [...fresh].filter(([sid]) => sid !== 'for').map(([, e]) => e.job)
@@ -449,6 +444,114 @@ export function cmdStats(args, cfg) {
     }
     return 0;
 }
+/** The bytes a folder holds, links not followed: what deleting it frees. */
+function folderBytes(dir) {
+    let total = 0;
+    for (const entry of fs.readdirSync(dir, { withFileTypes: true })) {
+        const full = path.join(dir, entry.name);
+        total += entry.isDirectory() ? folderBytes(full) : fs.lstatSync(full).size;
+    }
+    return total;
+}
+/**
+ * Delete the folders of the sessions prunable() lets go (lib/prune.ts, whose laws gdp-wired proves): the settled
+ * ones nothing was written to for `keep` days. Each is locked first, so one that a dsk process drives stays. With
+ * `report`, every log is read and the sessions that still wait for a decision are named too; without it a log is
+ * read only once its age qualifies, so the daily call from `dsk run` costs one stat per session. `dry` deletes nothing.
+ */
+export function prune(keep, options = {}) {
+    const gone = [], waiting = [];
+    const dirs = fs.existsSync(STATE) && fs.statSync(STATE).isDirectory() ? fs.readdirSync(STATE).sort() : [];
+    for (const sid of dirs) {
+        const dir = path.join(STATE, sid);
+        let age;
+        let s;
+        try {
+            age = (now() - mtime(path.join(dir, 'log.jsonl'))) / 86400;
+            if (age < keep && !options.report)
+                continue;
+            s = new Session(sid);
+        }
+        catch {
+            continue; // no session: the slots, a pause, a lock file; or a log that cannot be read, which is left as it is
+        }
+        if (!s.recs.length || get(s.head, 't') !== 'head' || !s.last('state'))
+            continue;
+        let held = false;
+        try {
+            s.lock();
+        }
+        catch (e) {
+            if (!(e instanceof Fail))
+                throw e;
+            held = true;
+        }
+        try {
+            const status = s.status();
+            if (prunable(status, held, age, keep)) {
+                const bytes = folderBytes(dir);
+                if (!options.dry) {
+                    // A settled session has no worktree left; one that does still has it registered in its repository.
+                    if (s.head.worktree && fs.existsSync(s.head.workdir))
+                        removeWorktree(s.head);
+                    fs.rmSync(dir, { recursive: true, force: true });
+                }
+                gone.push({ id: sid, bytes });
+            }
+            else if (options.report && ['review', 'question', 'stuck', 'limit', 'error'].includes(status)) {
+                waiting.push({ id: sid, status, bytes: folderBytes(dir), root: s.head.root,
+                    worktree: Boolean(s.head.worktree) && fs.existsSync(s.head.workdir) });
+            }
+        }
+        finally {
+            s.lockHandle?.close();
+        }
+    }
+    return { gone, waiting };
+}
+/**
+ * Once a day, when the config sets `keep_days`: prune without a word, so that a state folder nobody tends stays
+ * bounded. `dsk run` calls it before it starts; a failure here never stops that run.
+ */
+export function autoPrune(cfg) {
+    const keep = Number(get(cfg, 'keep_days'));
+    if (!(keep > 0))
+        return;
+    const stamp = path.join(STATE, 'pruned');
+    try {
+        if (now() - mtime(stamp) < 86400)
+            return;
+    }
+    catch {
+        // never pruned yet
+    }
+    try {
+        fs.mkdirSync(STATE, { recursive: true });
+        fs.writeFileSync(stamp, '');
+        prune(keep);
+    }
+    catch (e) {
+        if (e instanceof Interrupted)
+            throw e;
+    }
+}
+/** `dsk prune`: delete the settled sessions older than --days, and name the ones that still wait for a decision. */
+export function cmdPrune(args, cfg) {
+    const kept = Number(get(cfg, 'keep_days'));
+    const keep = args.days ?? (kept > 0 ? kept : 30);
+    const { gone, waiting } = prune(keep, { dry: args.dry_run, report: true });
+    const mega = (bytes) => `${fixed(bytes / 1e6, 1)} MB`;
+    const freed = mega(gone.reduce((n, g) => n + g.bytes, 0));
+    const age = keep > 0 ? ` settled more than ${keep} day${keep === 1 ? '' : 's'} ago` : ', every settled one';
+    print(`dsk prune · ${args.dry_run ? 'would delete' : 'deleted'} ${gone.length} session${gone.length === 1 ? '' : 's'}${age} · ${freed}`);
+    for (const w of waiting) {
+        print(`kept:    ${w.id} · ${w.status} · ${mega(w.bytes)}${w.worktree ? ', its worktree included' : ''} · ${path.basename(w.root)}`);
+    }
+    if (waiting.length) {
+        print(`next:    ${waiting.length === 1 ? 'it waits' : 'they wait'} for your decision: dsk show ID, then dsk accept ID or dsk reject ID --drop`);
+    }
+    return 0;
+}
 /** This dsk's version, from the plugin's manifest beside this script; '' when there is none (a bare checkout copy). */
 export function version() {
     try {
@@ -459,7 +562,10 @@ export function version() {
         return '';
     }
 }
-/** How dsk is set up. As a Claude Code hook (--hook) it first stores the plugin's options, which Claude Code hands */
+/**
+ * How dsk is set up. As a Claude Code hook (--hook) it first stores the plugin's options, which Claude Code hands
+ * to hooks alone, where `config` and `secret` read them; at session start (--announce) it says what is still missing.
+ */
 export function cmdConfigure(args, cfg) {
     if (args.hook) {
         try {
@@ -486,7 +592,7 @@ export function cmdConfigure(args, cfg) {
                     fs.mkdirSync(path.dirname(file), { recursive: true });
                     const fd = fs.openSync(file + '.new', 'w', 0o600);
                     try {
-                        fs.writeFileSync(fd, pyJSONAscii(value), 'utf8');
+                        fs.writeFileSync(fd, pyJsonAscii(value), 'utf8');
                     }
                     finally {
                         fs.closeSync(fd);
@@ -542,7 +648,7 @@ export function cmdConfigure(args, cfg) {
             if (mended)
                 said = said ? { ...said, systemMessage: `${said.systemMessage} ${mended}` } : { systemMessage: mended };
             if (said)
-                print(pyJSONAscii(said));
+                print(pyJsonAscii(said));
         }
         catch (e) { // a hook must never stand in the way of a session or a prompt
             if (e instanceof Interrupted)
@@ -554,7 +660,7 @@ export function cmdConfigure(args, cfg) {
     print(`dsk${version() ? ' ' + version() : ''} · ${ready ? 'ready' : 'not set up'} · ${state}`);
     for (const name of cfg.route) {
         const profile = get(cfg.profiles, name, {});
-        const key = secret(get(profile, 'key_env', '')) ? 'set' : 'missing';
+        const key = secret(get(profile, 'key_env', '') ?? '') ? 'set' : 'missing';
         let until = paused(name);
         const pause = until ? ` · paused until ${shortTime(until)}, credit used up` : '';
         print(`${ljust(name + ':', 8)} ${get(profile, 'base_url')} · ${get(profile, 'model')} · key ${key}${pause}`);

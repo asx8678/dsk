@@ -26,15 +26,16 @@ const RUNS = ['run', 'answer', 'reject', 'continue']
 // A Bash command that calls dsk, dsk standing where a command starts: the verb,
 // and the session id after it.
 const CALL =
-  /(?:^|[;&|(\n]|\bdo|\bthen)\s*(?:\S*\/)?dsk(?:\.py)?\s+(run|answer|reject|continue|accept|show|status)\b(?:\s+([0-9a-f]{4})\b)?/
+  /(?:^|[;&|(\n]|\bdo|\bthen)\s*(?:\S*\/)?dsk(?:\.py)?\s+(run|answer|reject|continue|accept|show|status)\b(?:\s+([0-9a-f]{4,8})\b)?/
 // A quoted argument, with the flag it belongs to when one stands right before it.
 const ARGUMENT = /(--[a-z-]+[ =]+)?(?:"((?:[^"\\]|\\.)*)"|'([^']*)')/g
 // What a command only carries as text: a here-document's body, and a quoted string.
 const HEREDOC = /<<-?\s*(['"]?)(\w+)\1[^\n]*\n[\s\S]*?\n[ \t]*\2[ \t]*(?=\n|$)/g
 const QUOTED = /"(?:[^"\\]|\\.)*"|'[^']*'/g
 // The first line of a dsk report: `dsk 7f3a · review · ...`, and its figures.
-const REPORT = /^dsk ([0-9a-f]{4}) · /m
-const HEAD = /^dsk ([0-9a-f]{4}) · ([a-z]+)(?: · (.*))?$/
+// An id is four hex characters, and six or eight once most of the shorter ones are taken (lib/session.ts).
+const REPORT = /^dsk ([0-9a-f]{4,8}) · /m
+const HEAD = /^dsk ([0-9a-f]{4,8}) · ([a-z]+)(?: · (.*))?$/
 const SPENT = /^(.*?) · (\d+ turns?) · in (\S+)(?: \((\d+)% cached\))? · out (\S+)(.*)$/
 // A line of a report after the first, a check and a changed file as it lists them.
 const FIELD = /^([a-z]+):\s+(.*)$/

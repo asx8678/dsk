@@ -48,6 +48,10 @@ export function makeWorktree(s, root, workdir) {
     if (seed)
         git(workdir, ['apply'], { stdin: seed });
 }
+/**
+ * `dsk accept`: mark the work as reviewed. A worktree session's change is applied to the main tree as the worktree
+ * stands, the lead's own edits inside --allow included, and the worktree goes; a change made in place is there already.
+ */
 export function cmdAccept(args, cfg) {
     const s = resume(args.id, 'accept');
     const st = s.last('state');
@@ -114,6 +118,10 @@ export function cmdAccept(args, cfg) {
         print(line);
     return 0;
 }
+/**
+ * `dsk reject`: send the lead's defects back into the session, which starts a new round, or with --drop discard the
+ * work: the worktree goes, or a change made in place is taken out of the tree again.
+ */
 export async function cmdReject(args, cfg) {
     if ((Number(Boolean(args.text)) + Number(Boolean(args.brief)) + Number(Boolean(args.drop))) !== 1)
         throw new Fail('give the defects as "text" or with --brief FILE, or --drop to discard the work, not two of them');

@@ -1,10 +1,7 @@
 // The worker loop: the run header and the first message, then one turn at a time until the worker asks, gets stuck,
 // hits a limit, or hands in.
-const fs = process.getBuiltinModule('node:fs');
-const os = process.getBuiltinModule('node:os');
-const path = process.getBuiltinModule('node:path');
-import { Fail, G, Interrupted, RUNNER, SCRIPTS, STATE, checkInterrupt, comma, cpHead, cpLen, dumps, eprint, exitStatus, expandUser, fingerprint, fixed, flock, flockWait, fmtPercent, format, get, has, interruptOnSignals, killGroup, now, onInterrupt, print, pyFloat, pyJson, pyRound, pythonPath, readFd, runSync, sha256, shell, shlexQuote, shlexSplit, sleep, tempFile, tokenHex, write, xdg } from './base.js';
-import { compact, digest } from './compaction.js';
+import { G, comma, cpHead, cpLen, eprint, format, get, has, now, pyJsonAscii, words } from './base.js';
+import { compact } from './compaction.js';
 import { cleanEnv, runScript } from './exec.js';
 import { changes, gates, halt, roundLimit, scope, settle, span, tree } from './gates.js';
 import { gate, parse } from './reply.js';
@@ -55,7 +52,7 @@ export async function takeTurn(s, cfg, env, turn, reply, finish) {
     }
     const wrote = [...new Set(s.of('ledger')
             .filter((r) => r.turn === turn && (r.fn === 'write' || r.fn === 'edit') && !has(r, 'err'))
-            .map((r) => r.arg))];
+            .map((r) => r.path ?? r.arg))];
     // A turn that only reads may show more: in the logs of 118 sessions, 505 of the 550 turns whose output was
     // cut only read files, and workers paged through one file up to 38 times.
     const fns = new Set(s.of('ledger').filter((r) => r.turn === turn).map((r) => r.fn));
@@ -105,17 +102,91 @@ function sortKeys(value) {
     }
     return value;
 }
-/** JSON as json.dumps writes it by default, with every character outside printable ASCII escaped. */
-function asciiJson(value) {
-    return pyJson(sortKeys(value)).replace(/[\u0080-\uffff]/g, (c) => '\\u' + c.charCodeAt(0).toString(16).padStart(4, '0'));
-}
 /** What a reply says, without the call ids that differ every time. */
 export function said(message) {
     return [message.content, get(message, 'tool_calls', []).map((call) => call.function)];
 }
 /** A reply with every number blanked: two scripts that differ only in a line number or a slice bound share it. */
 export function shape(message) {
-    return asciiJson(said(message)).replace(/\d+/g, '0');
+    return pyJsonAscii(sortKeys(said(message))).replace(/\d+/g, '0');
+}
+/**
+ * Send the pending turn result as the next message, with the lead's text after it. It is sent only now, so that an
+ * answer, a defect list or a failed check rides in the same message. Returns whether there was one to send.
+ */
+function sendPending(s, cfg, extra) {
+    const pending = s.last('result', 'msg');
+    if (pending.t !== 'result')
+        return false;
+    const calls = get(s.last('msg').m, 'tool_calls', []);
+    for (const call of calls.slice(0, -1)) {
+        s.add('msg', { turn: pending.turn, m: { role: 'tool', tool_call_id: call.id, content: ONE_CALL } });
+    }
+    const target = calls.length ? { role: 'tool', tool_call_id: calls[calls.length - 1].id } : { role: 'user' };
+    s.add('msg', { turn: pending.turn, m: { ...target, content: pending.text + extra } });
+    compact(s, cfg);
+    return true;
+}
+/** The tokens the round in flight has used, in and out: what `run_tokens` limits. */
+function roundTokens(s) {
+    return s.since('round', 'usage').reduce((sum, u) => sum + u.prompt + u.out, 0);
+}
+/** Halt at a bad stop, with the checks run first when the worker changed files and they are configured. */
+async function badStop(s, cfg, env, status, info = {}) {
+    // A second look that ends here without changing anything leaves the hand-in that passed its checks a turn
+    // or more ago: that is handed in as it was, and `why` says that the second look did not finish.
+    // Not after the reviewer sent findings back: then the hand-in has defects that nobody has answered.
+    const look = (s.of('round').length && !s.since('round', 'reviewer').length)
+        ? (s.since('round', 'recheck')[0] ?? null) : null;
+    if (look && get(look, 'tree') && look.tree === tree(s)) {
+        const handed = [...s.of('ledger')].reverse().find((r) => r.turn === look.turn && r.fn === 'done');
+        return halt(s, undefined, { summary: handed.arg, open: handed.open,
+            why: `${info.why} during the second look, which changed nothing` });
+    }
+    const run = changes(s)[1].length > 0 && scope(s).checks.length > 0;
+    if (run)
+        await gates(s, cfg, env); // its result is no use to a worker that is being stopped: only the record matters
+    return halt(s, status, { checked: run, ...info });
+}
+/**
+ * The notes a turn that ran has earned, and whether it was stale. The repeat check misses a script sent again with
+ * one number changed: one worker spent its last 15 turns printing ever shorter slices of the same lines. So a turn
+ * that is the previous script but for its numbers, changes nothing and prints nothing new counts as a reply that
+ * got nowhere, like a repeat. And a check that fails the same way after every change gets a note every third time:
+ * one worker ran 13 such turns to its limit.
+ */
+function notesFor(s, seen, reply, before, acts, stop) {
+    const printed = words(s.printed);
+    const stale = !stop && !s.moved && before !== null && shape(reply) === shape(before)
+        && acts.some((a) => a.fn !== 'note') && seen.shown.slice(-4).some((old) => old.includes(printed));
+    seen.shown.push(printed);
+    let note = stale ? '\n\n' + STALE : '';
+    const broken = acts.filter((a) => a.fn === 'sh' && get(a, 'code'));
+    if (acts.some((a) => a.fn === 'sh')) {
+        const mark = broken.length ? [broken.map((a) => [a.arg, a.code]), printed.replace(/\d+/g, '0')] : [];
+        seen.failing = [mark, mark.length && equal(mark, seen.failing[0]) ? seen.failing[1] + 1 : mark.length ? 1 : 0];
+        if (mark.length && seen.failing[1] % 3 === 0) {
+            const cmd = cpHead(words(broken[broken.length - 1].arg), 80);
+            note += '\n\n' + format(SAME_FAILURE, { cmd, n: seen.failing[1] });
+        }
+    }
+    return [stale, note];
+}
+/**
+ * After done(): the checks, then the second look, then the reviewer. The text of the first that sends the hand-in
+ * back to the worker, or '' when it stands. A confirmed hand-in ran and passed its checks a turn ago, and nothing
+ * moved since: only the reviewer, if any, is still to come.
+ */
+async function handedIn(s, cfg, env, turn, stop, confirms, over) {
+    const problem = confirms ? '' : (await gates(s, cfg, env)) || secondLook(s, cfg, turn, over());
+    return problem || (await independentReview(s, cfg, turn, over(), stop));
+}
+/** Why a run is stuck, in the words the report gives the lead. */
+function stuckWhy(t, alternates) {
+    return t.repeats < 2 && t.idle < 3 ? 'three failing turns in a row'
+        : alternates ? 'the same two replies, alternating'
+            : t.repeats >= 2 ? 'same reply three times in a row'
+                : 'three replies in a row that showed nothing new';
 }
 /** Drive the session to its next stop. `extra` is the lead's text, appended to the pending turn result. */
 export async function loop(s, cfg, extra = "") {
@@ -126,46 +197,16 @@ export async function loop(s, cfg, extra = "") {
     const env = cleanEnv(cfg, s.dir);
     const writing = Boolean(scope(s).allow.length);
     const saidHere = [];
-    const shown = [];
-    let failing = [null, 0]; // a failure and its run
+    const seen = { shown: [], failing: [null, 0] };
     let left = 0;
-    /** Halt at a bad stop, with the checks run first when the worker changed files and they are configured. */
-    const bad = async (status, info = {}) => {
-        // A second look that ends here without changing anything leaves the hand-in that passed its checks a turn
-        // or more ago: that is handed in as it was, and `why` says that the second look did not finish.
-        // Not after the reviewer sent findings back: then the hand-in has defects that nobody has answered.
-        const look = (s.of('round').length && !s.since('round', 'reviewer').length)
-            ? (s.since('round', 'recheck')[0] ?? null) : null;
-        if (look && get(look, 'tree') && look.tree === tree(s)) {
-            const handed = [...s.of('ledger')].reverse().find((r) => r.turn === look.turn && r.fn === 'done');
-            return halt(s, undefined, { summary: handed.arg, open: handed.open,
-                why: `${info.why} during the second look, which changed nothing` });
-        }
-        const run = changes(s)[1].length > 0 && scope(s).checks.length > 0;
-        if (run)
-            await gates(s, cfg, env); // its result is no use to a worker that is being stopped: only the record matters
-        return halt(s, status, { checked: run, ...info });
-    };
     /** Whether the run is past its time or its token limit. */
-    const spentLimit = () => now() - started > limits.run_seconds
-        || s.since('round', 'usage').reduce((sum, u) => sum + u.prompt + u.out, 0) > limits.run_tokens;
+    const spentLimit = () => now() - started > limits.run_seconds || roundTokens(s) > limits.run_tokens;
     /** The limit this round has reached, counting the turn in flight: `turn`, `time`, `token`, or ''. */
-    const over = () => {
-        const spent = s.since('round', 'usage').reduce((sum, u) => sum + u.prompt + u.out, 0);
-        return !left ? 'turn' : now() - started > limits.run_seconds ? 'time' : spent > limits.run_tokens ? 'token' : '';
-    };
+    const over = () => !left ? 'turn' : now() - started > limits.run_seconds ? 'time'
+        : roundTokens(s) > limits.run_tokens ? 'token' : '';
     while (true) {
-        const pending = s.last('result', 'msg');
-        if (pending.t === 'result') { // sent only now, so an answer, defect list or failed check rides in the same message
-            const calls = get(s.last('msg').m, 'tool_calls', []);
-            for (const call of calls.slice(0, -1)) {
-                s.add('msg', { turn: pending.turn, m: { role: 'tool', tool_call_id: call.id, content: ONE_CALL } });
-            }
-            const target = calls.length ? { role: 'tool', tool_call_id: calls[calls.length - 1].id } : { role: 'user' };
-            s.add('msg', { turn: pending.turn, m: { ...target, content: pending.text + extra } });
+        if (sendPending(s, cfg, extra))
             extra = '';
-            compact(s, cfg);
-        }
         const before = [...s.of('msg')].reverse().find((r) => r.m.role === 'assistant')?.m ?? null;
         const previous = before === null ? null : said(before);
         const [reply, finish] = await chat(s, cfg, HEAT[Math.min(t.idle, 2)]);
@@ -205,33 +246,14 @@ export async function loop(s, cfg, extra = "") {
         }
         const acts = s.of('ledger').filter((a) => a.turn === turn);
         if (!repeat && !failed && !confirms) {
-            const seen = s.printed.trim().split(/\s+/).join(' ');
-            // The repeat check above misses a script sent again with one number changed. One worker spent its last
-            // 15 turns printing ever shorter slices of the same lines; so a turn that is the previous script but for
-            // its numbers, changes nothing and prints nothing new counts as a reply that got nowhere, like a repeat.
-            stale = !stop && !s.moved && before !== null && shape(reply) === shape(before)
-                && acts.some((a) => a.fn !== 'note') && shown.slice(-4).some((old) => old.includes(seen));
-            shown.push(seen);
-            if (stale)
-                body += '\n\n' + STALE;
-            // A check that fails the same way after every change: one worker ran 13 such turns to its limit.
-            const broken = acts.filter((a) => a.fn === 'sh' && get(a, 'code'));
-            if (acts.some((a) => a.fn === 'sh')) {
-                const mark = broken.length ? [broken.map((a) => [a.arg, a.code]), seen.replace(/\d+/g, '0')] : [];
-                failing = [mark, mark.length && equal(mark, failing[0]) ? failing[1] + 1 : mark.length ? 1 : 0];
-                if (mark.length && failing[1] % 3 === 0) {
-                    const cmd = cpHead(broken[broken.length - 1].arg.trim().split(/\s+/).join(' '), 80);
-                    body += '\n\n' + format(SAME_FAILURE, { cmd, n: failing[1] });
-                }
-            }
+            const [was, note] = notesFor(s, seen, reply, before, acts, stop);
+            stale = was;
+            body += note;
         }
-        let text = `turn ${turn} \u00b7 ${left} left\n${body}`;
+        let text = `turn ${turn} · ${left} left\n${body}`;
         let finished = false;
-        if (stop && stop.fn === 'done') {
-            // A confirmed hand-in ran and passed its checks a turn ago, and nothing moved since: only the reviewer,
-            // if any, is still to come. Each step's text, when it has one, goes back to the worker instead.
-            let problem = confirms ? '' : (await gates(s, cfg, env)) || secondLook(s, cfg, turn, over());
-            problem = problem || (await independentReview(s, cfg, turn, over(), stop));
+        if (stop && stop.fn === 'done') { // each step's text, when it has one, goes back to the worker instead
+            const problem = await handedIn(s, cfg, env, turn, stop, confirms, over);
             text = text + (problem ? '\n\n' + problem : '');
             finished = !problem;
         }
@@ -255,14 +277,9 @@ export async function loop(s, cfg, extra = "") {
             release(cfg, s.profile);
             s.add('series', { why: 'failover', profile: later[0], status: 'repeat' });
         }
-        if (t.stop === 'stuck') {
-            return await bad('stuck', { why: t.repeats < 2 && t.idle < 3 ? 'three failing turns in a row'
-                    : alternates ? 'the same two replies, alternating'
-                        : t.repeats >= 2 ? 'same reply three times in a row'
-                            : 'three replies in a row that showed nothing new' });
-        }
-        if (t.stop === 'limit') {
-            return await bad('limit', { why: `${over()} limit reached` });
-        }
+        if (t.stop === 'stuck')
+            return await badStop(s, cfg, env, 'stuck', { why: stuckWhy(t, alternates) });
+        if (t.stop === 'limit')
+            return await badStop(s, cfg, env, 'limit', { why: `${over()} limit reached` });
     }
 }

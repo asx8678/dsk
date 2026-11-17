@@ -2,74 +2,59 @@
 // credit or a rate limit sets.
 const fs = process.getBuiltinModule('node:fs')
 const path = process.getBuiltinModule('node:path')
-import { PyFloat, Fail, Interrupted, STATE, checkInterrupt, cpHead, cpLen, dumps, fingerprint, get, has, now, onInterrupt, pyFloat, pyJson, sleep, type Cfg, type Profile, type Rec } from './base.ts'
+import { PyFloat, Fail, Interrupted, STATE, checkInterrupt, cpHead, cpLen, dumps, fingerprint, get, has, now, onInterrupt, pyFloat, sleep, isDict, pyJsonAscii, pyRepr, truthy, type Cfg, type Profile, type Rec } from './base.ts'
 import { compact } from './compaction.ts'
 import { ALIASES, apiKey, claimSlot, pool, slots } from './config.ts'
 import { MAX_TOKENS, NOT_SPENT, SLOT_POLL, SLOW, SPENT, TOOLS } from './texts.ts'
 import type { Session } from './session.ts'
 import { retries, transient } from './retry.ts'
 
-/** Whether a parsed JSON value is a dict, as Python's isinstance(value, dict) asked. */
-function isDict(value: any): boolean {
-  return value !== null && typeof value === 'object' && !Array.isArray(value)
-}
-
-/** Python's repr of a string, for str() of a dict that came from an error body. */
-function pyRepr(text: string): string {
-  if (!text.includes("'")) return "'" + text.replace(/\\/g, '\\\\').replace(/\n/g, '\\n').replace(/\r/g, '\\r').replace(/\t/g, '\\t') + "'"
-  if (!text.includes('"')) return '"' + text.replace(/\\/g, '\\\\').replace(/\n/g, '\\n').replace(/\r/g, '\\r').replace(/\t/g, '\\t') + '"'
-  return "'" + text.replace(/\\/g, '\\\\').replace(/'/g, "\\'").replace(/\n/g, '\\n').replace(/\r/g, '\\r').replace(/\t/g, '\\t') + "'"
-}
-
-/** Python's bool() of a JSON-decoded value: empty strings, lists and dicts are false. */
-function pyTruthy(value: any): boolean {
-  if (value === null || value === undefined || value === false || value === 0 || value === '') return false
-  if (Array.isArray(value)) return value.length > 0
-  if (isDict(value)) return Object.keys(value).length > 0
-  return true
-}
-
 /** str() of a value as Python printed a JSON-decoded one: dicts with single quotes, None and booleans by name. */
-function pyStr(value: any): string {
+function pyStr(value: unknown): string {
   if (value === null || value === undefined) return 'None'
   if (typeof value === 'string') return value
   if (typeof value === 'boolean') return value ? 'True' : 'False'
   if (typeof value === 'number') return Number.isInteger(value) ? String(value) : pyFloat(value)
   if (Array.isArray(value)) return '[' + value.map(pyStr).join(', ') + ']'
   if (typeof value === 'object') {
-    return '{' + Object.keys(value).map((k) => pyRepr(k) + ': ' + pyStr(value[k])).join(', ') + '}'
+    return '{' + Object.entries(value).map(([k, v]) => pyRepr(k) + ': ' + pyStr(v)).join(', ') + '}'
   }
   return String(value)
 }
 
-/** The last `n`-code-point prefix of `text`, as Python's wire[:prev["n"]] took it. */
-function joined(parts: any[]): string {
+/** Python's "".join(parts): the parts as one text, raising as Python did when one of them is not a string. */
+function joined(parts: unknown[]): string {
   for (const part of parts) {
     if (typeof part !== 'string') throw new TypeError('sequence item: expected str instance')
   }
   return parts.join('')
 }
 
-/** One non-exported value of a dict with a required key, raising as Python's c["key"] did. */
+/** d[key] of a dict that must hold the key, raising as Python's c["key"] did when it does not. */
 function need(value: any, key: string): any {
   if (!isDict(value) || !has(value, key)) throw new TypeError(`missing key ${key}`)
   return value[key]
 }
 
 /** The message records of the current series. Compaction restarts the list; failover does not. */
-export function seriesMsgs(recs: Rec[]): any {
+export function seriesMsgs(recs: Rec[]): Rec[] {
   let start = -1
   recs.forEach((r, i) => { if (r.t === 'series' && r.why !== 'failover') start = i })
   if (start < 0) throw new Error('max() arg is an empty sequence')
   return recs.slice(start).filter((r) => r.t === 'msg')
 }
 
-export function messages(recs: Rec[]): any {
+/** The messages of the current series, as the next request sends them. */
+export function messages(recs: Rec[]): any[] {
   return seriesMsgs(recs).map((r: any) => r.m)
 }
 
-/** The only place a chat request is serialized: fixed key order, one static tool, nothing volatile. `heat` is */
-export function requestBody(profile: Profile, effort: any, msgs: any, heat: any = 0, tools: any = true, maxTokens: any = null): any {
+/**
+ * The only place a chat request is serialized: fixed key order, one static tool, nothing volatile. `heat` is
+ * the temperature of a run without thinking: 0, except right after a reply that repeated itself (see HEAT).
+ * `tools=False` is the reviewer's request, which has neither the tool nor a tool_choice, and its own `max_tokens`.
+ */
+export function requestBody(profile: Profile, effort: string, msgs: unknown[], heat = 0, tools = true, maxTokens: number | null = null): string {
   const body: any = {
     model: profile.model, messages: msgs, tools: tools ? TOOLS : null,
     max_tokens: maxTokens || MAX_TOKENS[effort], stream: true, stream_options: { include_usage: true },
@@ -108,7 +93,7 @@ async function readAll(stream: any): Promise<Buffer> {
   return Buffer.concat(chunks)
 }
 
-/** A callback that fires when the socket has been idle for `ms` milliseconds. */
+/** The error of a socket that sent nothing for its timeout, as Python's socket.timeout was: its code names it. */
 function timeoutError(): Error {
   const error: any = new Error('timed out')
   error.code = 'ETIMEDOUT'
@@ -121,27 +106,28 @@ function request(url: string, payload: string, headers: Record<string, any>, tim
     const target = new URL(url)
     // Loaded here, not at the top: only a command that talks to a provider needs them, and an ESM import of
     // node:http also loads undici and http2 (60 internal modules, about 10 ms) for every other command.
-    const mod: any = process.getBuiltinModule(target.protocol === 'https:' ? 'node:https' : 'node:http')
+    const mod = process.getBuiltinModule(target.protocol === 'https:' ? 'node:https' : 'node:http')
     let response: any = null
-    let req: any
-    const off = onInterrupt(() => {
-      if (response) response.interrupted = true
-      req.destroy(new Interrupted())
-    })
+    let off = () => {}
     // The `timeout` option, not req.setTimeout(): it is set on the socket before it connects, so a connection that
     // never opens fails after the same time a silent one does, as Python's socket timeout did. setTimeout() starts
     // only once the socket has connected, and a blackholed address then waited for the system's own limit.
-    req = mod.request(target, { method: 'POST', headers, timeout: timeoutMs }, (res: any) => {
+    const req = mod.request(target, { method: 'POST', headers, timeout: timeoutMs }, (res: any) => {
       response = res
       res.timedOut = false
-      resolve({ status: res.statusCode || 0, res, off })
+      resolve({ status: res.statusCode || 0, res, off: () => off() })
     })
     req.on('timeout', () => {
       if (response) response.timedOut = true
       req.destroy(timeoutError())
     })
     req.on('error', (error: any) => { off(); reject(error) })
-    req.end(payload)
+    // Only now that there is a request to end: a signal that came before this call runs the handler at once.
+    off = onInterrupt(() => {
+      if (response) response.interrupted = true
+      req.destroy(new Interrupted())
+    })
+    if (!req.destroyed) req.end(payload)
   })
 }
 
@@ -163,8 +149,11 @@ function errorText(error: any): string {
   return name === 'URLError' ? `${name}: <urlopen error ${message}>` : `${name}: ${message}`
 }
 
-/** One POST. Returns (status, parsed JSON) on success, else (status, error text); status 0 is a network failure. */
-export async function send(url: any, key: any, payload: any, extra: any = null, timeout: any = 600, idle: any = null, deadline: any = null): Promise<any> {
+/**
+ * One POST. Returns (status, parsed JSON) on success, else (status, error text); status 0 is a network failure.
+ * A streamed reply is rebuilt from its server-sent events, with the seconds its first data took as `_first`.
+ */
+export async function send(url: string, key: string, payload: string, extra: Record<string, string> | null = null, timeout = 600, idle: number | null = null, deadline: number | null = null): Promise<[number, any]> {
   const headers: Record<string, any> = {
     Authorization: 'Bearer ' + key, 'Content-Type': 'application/json', 'User-Agent': 'dsk', ...(extra || {}),
   }
@@ -182,7 +171,7 @@ export async function send(url: any, key: any, payload: any, extra: any = null, 
           return [got.status, JSON.parse(text)]
         }
         const reply = await sse(got.res, began, deadline)
-        return Array.isArray(reply) ? reply : [got.status, reply]
+        return Array.isArray(reply) ? reply as [number, any] : [got.status, reply]
       }
     } finally {
       got.off()
@@ -220,15 +209,19 @@ async function* lines(stream: any): AsyncGenerator<string> {
   if (buffer.length) yield decoder.decode(buffer)
 }
 
-/** The reply a JSON response would carry, rebuilt from a stream's events: joined text, calls by index, the last */
-export async function sse(r: any, began: any, deadline: any): Promise<any> {
-  const content: any[] = []
+/**
+ * The reply a JSON response would carry, rebuilt from a stream's events: joined text, calls by index, the last
+ * finish_reason and the usage chunk. A stream that fails gives [status, why] instead: an error event, or an end
+ * with neither a finish_reason nor [DONE].
+ */
+export async function sse(r: any, began: number, deadline: number | null): Promise<any> {
+  const content = []
   const thoughts: Record<string, any[]> = {}
   const calls = new Map<any, any>()
-  let usage: any = null
+  let usage = null
   let first: number | null = null
-  let finish: any = null
-  let event: any = null
+  let finish = null
+  let event = null
   let cutShort = false
   let done = false
   for await (const raw of lines(r)) {
@@ -245,43 +238,43 @@ export async function sse(r: any, began: any, deadline: any): Promise<any> {
     if (data === '[DONE]') { done = true; break }
     const chunk = JSON.parse(data)
     if (first === null) first = now() - began
-    if (event === 'error' && !(isDict(chunk) && pyTruthy(chunk.error))) {
+    if (event === 'error' && !(isDict(chunk) && truthy(chunk.error))) {
       return [502, cpHead(pyStr(chunk), 300)]
     }
     if (!isDict(chunk)) return [0, 'not an event object: ' + cpHead(data, 200)]
-    if (pyTruthy(chunk.error)) {
+    if (truthy(chunk.error)) {
       const error = chunk.error
       const code = isDict(error) ? error.code : null
       const status = typeof code === 'number' && Number.isInteger(code) && code >= 400 && code <= 599 ? code : 502
       return [status, cpHead(pyStr(error), 300)]
     }
-    if (pyTruthy(chunk.usage)) usage = chunk.usage
-    if (pyTruthy(chunk.choices)) for (const choice of chunk.choices) {
+    if (truthy(chunk.usage)) usage = chunk.usage
+    if (truthy(chunk.choices)) for (const choice of chunk.choices) {
       if (!isDict(choice)) throw new TypeError("'object' has no attribute 'get'")
-      const delta = pyTruthy(choice.delta) ? choice.delta : (pyTruthy(choice.message) ? choice.message : {})
+      const delta = truthy(choice.delta) ? choice.delta : (truthy(choice.message) ? choice.message : {})
       if (!isDict(delta)) throw new TypeError("'object' has no attribute 'get'")
-      content.push(pyTruthy(delta.content) ? delta.content : '')
+      content.push(truthy(delta.content) ? delta.content : '')
       for (const field of ['reasoning_content', 'reasoning']) {
-        if (pyTruthy(delta[field])) {
+        if (truthy(delta[field])) {
           if (!has(thoughts, field)) thoughts[field] = []
           thoughts[field].push(delta[field])
         }
       }
-      const toolCalls = pyTruthy(delta.tool_calls) ? delta.tool_calls : []
+      const toolCalls = truthy(delta.tool_calls) ? delta.tool_calls : []
       if (!Array.isArray(toolCalls)) throw new TypeError("'object' is not iterable as calls")
       toolCalls.forEach((call: any, n: number) => {
         if (!isDict(call)) throw new TypeError("'object' has no attribute 'get'")
         const key = has(call, 'index') ? call.index : n
         let slot = calls.get(key)
         if (!slot) { slot = {}; calls.set(key, slot) }
-        slot.id = pyTruthy(slot.id) ? slot.id : call.id
-        slot.type = pyTruthy(slot.type) ? slot.type : (pyTruthy(call.type) ? call.type : 'function')
-        const fn = pyTruthy(call.function) ? call.function : {}
+        slot.id = truthy(slot.id) ? slot.id : call.id
+        slot.type = truthy(slot.type) ? slot.type : (truthy(call.type) ? call.type : 'function')
+        const fn = truthy(call.function) ? call.function : {}
         if (!isDict(fn)) throw new TypeError("'object' has no attribute 'get'")
-        slot.name = pyTruthy(slot.name) ? slot.name : fn.name
-        slot.arguments = get(slot, 'arguments', '') + (pyTruthy(fn.arguments) ? fn.arguments : '')
+        slot.name = truthy(slot.name) ? slot.name : fn.name
+        slot.arguments = get(slot, 'arguments', '') + (truthy(fn.arguments) ? fn.arguments : '')
       })
-      finish = pyTruthy(choice.finish_reason) ? choice.finish_reason : finish
+      finish = truthy(choice.finish_reason) ? choice.finish_reason : finish
     }
     if (deadline !== null && now() - began > deadline) {
       finish = 'length'
@@ -311,8 +304,11 @@ export async function sse(r: any, began: any, deadline: any): Promise<any> {
 // transient() and the retry decision are lib/retry.ts's, whose laws gdp-wired proves.
 export { transient } from './retry.ts'
 
-/** POST with backoff on transient failures. Every retry sends the identical bytes. When not `patient`, a */
-export async function post(url: any, key: any, payload: any, backoff: any, headers: any = null, patient: any = true, idle: any = null, deadline: any = null): Promise<any> {
+/**
+ * POST with backoff on transient failures. Every retry sends the identical bytes. When not `patient`, a
+ * failure that took more than SLOW seconds to arrive is returned at once, for the caller to try another profile.
+ */
+export async function post(url: string, key: string, payload: string, backoff: number[], headers: Record<string, string> | null = null, patient = true, idle: number | null = null, deadline: number | null = null): Promise<[number, any]> {
   for (const wait of [...backoff, null]) {
     const began = now()
     let [status, data] = await send(url, key, payload, headers, undefined, idle, deadline)
@@ -324,12 +320,13 @@ export async function post(url: any, key: any, payload: any, backoff: any, heade
     if (!retries(status, spent(status, data), wait === null, Boolean(patient), now() - began > SLOW)) {
       return [status, data]
     }
-    await sleep(wait)
+    await sleep(wait ?? 0)
   }
+  throw new Fail('bug: the last try of a request was retried')  // retries() never says so of the last one (lib/retry.ts)
 }
 
 /** The profile's `headers`, with {session} replaced by a value that stays the same for the whole run. */
-export function headers(profile: Profile, session: any): any {
+export function headers(profile: Profile, session: string): Record<string, string> {
   const out: Record<string, string> = {}
   for (const [k, v] of Object.entries(get(profile, 'headers', {}) || {})) {
     out[k] = String(v).replaceAll('{session}', session)
@@ -338,13 +335,13 @@ export function headers(profile: Profile, session: any): any {
 }
 
 /** Whether an error says the provider's credit or quota is used up: not busy, not a request that is too big. */
-export function spent(status: any, data: any): any {
+export function spent(status: number, data: unknown): boolean {
   const text = pyStr(data)
   return status === 402 || ([400, 403, 429].includes(status) && SPENT.test(text) && !NOT_SPENT.test(text))
 }
 
 /** Until when (epoch seconds) every run skips profile `name` because its credit ran out; 0 when it does not. */
-export function paused(name: any): any {
+export function paused(name: string): number {
   try {
     const state = JSON.parse(fs.readFileSync(path.join(STATE, 'paused', name), 'utf8'))
     const until = Number(state.until)
@@ -355,13 +352,8 @@ export function paused(name: any): any {
   }
 }
 
-/** Python's json.dump() for the pause file: the default ensure_ascii escapes every non-ASCII code unit. */
-function pyJsonAscii(value: any): string {
-  return pyJson(value).replace(/[\u0080-\uffff]/g, (ch) => '\\u' + ch.charCodeAt(0).toString(16).padStart(4, '0'))
-}
-
 /** Pause `name` until the reset time its error names, if within a week, else for its `pause_hours` (default 1). */
-export function pause(cfg: Cfg, name: any, data: any): any {
+export function pause(cfg: Cfg, name: string, data: unknown): void {
   const nowSeconds = now()
   const named = /\d{4}-\d\d-\d\dT\d\d:\d\d(:\d\d)?Z/.exec(pyStr(data))
   let reset = 0
@@ -380,12 +372,12 @@ export function pause(cfg: Cfg, name: any, data: any): any {
 }
 
 /** The assistant message as it is logged and sent back: content, the calls, and reasoning when thinking is on. */
-export function replayable(message: any, effort: any): any {
+export function replayable(message: any, effort: string): any {
   if (!isDict(message)) throw new TypeError("'object' has no attribute 'get'")
-  const reply: any = { role: 'assistant', content: pyTruthy(message.content) ? message.content : '' }
-  const thought = pyTruthy(message.reasoning_content) ? message.reasoning_content : message.reasoning
-  if (pyTruthy(thought) && effort !== 'off') reply.reasoning_content = thought
-  if (pyTruthy(message.tool_calls)) {
+  const reply: any = { role: 'assistant', content: truthy(message.content) ? message.content : '' }
+  const thought = truthy(message.reasoning_content) ? message.reasoning_content : message.reasoning
+  if (truthy(thought) && effort !== 'off') reply.reasoning_content = thought
+  if (truthy(message.tool_calls)) {
     reply.tool_calls = message.tool_calls.map((c: any) => ({
       id: need(c, 'id'), type: 'function',
       function: { name: need(need(c, 'function'), 'name'), arguments: need(c.function, 'arguments') },
@@ -394,8 +386,12 @@ export function replayable(message: any, effort: any): any {
   return reply
 }
 
-/** The profiles a session may still move to: the rest of its route, less any removed since it started (`dsk */
-export function laterProfiles(s: Session, cfg: Cfg): any {
+/**
+ * The profiles a session may still move to: the rest of its route, less any removed since it started (`dsk
+ * provider remove`). None is left when the lead chose its profile with --profile on reject, answer or continue: like
+ * `dsk run --profile`, that holds the session there. Its route is named as when it started: renames count.
+ */
+export function laterProfiles(s: Session, cfg: Cfg): string[] {
   const route = (s.head.route as any[]).map((n) => get(ALIASES, n, n))
   const moved = [...s.of('series')].reverse().find((r) => r.why === 'failover') || null
   if (!route.includes(s.profile) || (moved && get(moved, 'status') === 'chosen')) return []
@@ -403,11 +399,11 @@ export function laterProfiles(s: Session, cfg: Cfg): any {
 }
 
 /** Send the current series and return (assistant message, finish_reason). Fails over along the route. */
-export async function chat(s: Session, cfg: Cfg, heat: any = 0): Promise<any> {
+export async function chat(s: Session, cfg: Cfg, heat = 0): Promise<[any, string | null]> {
   while (true) {
     compact(s, cfg)
-    const name: any = s.profile
-    const profile: any = cfg.profiles[name]
+    const name = s.profile
+    const profile = cfg.profiles[name]
     const later = laterProfiles(s, cfg)
     if (later.length && paused(name)) {
       release(cfg, name)
@@ -423,7 +419,7 @@ export async function chat(s: Session, cfg: Cfg, heat: any = 0): Promise<any> {
     }
     const msgs = messages(s.recs)
     const wire = dumps(msgs).slice(0, -1)
-    const prev: any = s.last('req', 'series')
+    const prev = s.last('req', 'series')
     if (prev.t === 'req') {
       const print = fingerprint(cpHead(wire, prev.n))
       if (print.n !== prev.n || print.sha !== prev.sha) {
@@ -469,7 +465,7 @@ export async function chat(s: Session, cfg: Cfg, heat: any = 0): Promise<any> {
 }
 
 /** Give back this process's max_sessions slot on profile `name`, if it holds one. */
-export function release(cfg: Cfg, name: any): any {
+export function release(cfg: Cfg, name: string): void {
   const key = pool(cfg, name)[0]
   const held = get(slots, key)  // slots is a plain object, dsk.py's dict: pop(key, None)
   if (held) {

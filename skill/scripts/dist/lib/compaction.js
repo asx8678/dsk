@@ -1,9 +1,8 @@
 // Compaction: when a series outgrows its profile's compact_at, older turns are dropped for a digest of what they did,
 // built from the log alone, so the same log always compacts to the same bytes.
 const fs = process.getBuiltinModule('node:fs');
-const os = process.getBuiltinModule('node:os');
 const path = process.getBuiltinModule('node:path');
-import { Fail, G, Interrupted, RUNNER, SCRIPTS, STATE, checkInterrupt, comma, cpHead, cpLen, dumps, eprint, exitStatus, expandUser, fingerprint, fixed, flock, flockWait, fmtPercent, format, get, has, interruptOnSignals, killGroup, now, onInterrupt, print, pyFloat, pyJson, pyRound, pythonPath, readFd, runSync, sha256, shell, shlexQuote, shlexSplit, sleep, tempFile, tokenHex, write, xdg } from './base.js';
+import { cpHead, cpLen, dumps, get, has, words } from './base.js';
 import { changes, roundLimit } from './gates.js';
 import { firstMessage } from './loop.js';
 import { findingsText } from './review.js';
@@ -12,19 +11,6 @@ import { seriesMsgs } from './wire.js';
 /** Python's task.strip(): whether a finished task has anything in it worth a line of the digest. */
 function nonBlank(task) {
     return String(task).trim() !== '';
-}
-/** Python's " ".join(task.split()): the task's words, with every run of whitespace made one space. */
-function oneLine(task) {
-    const trimmed = String(task).trim();
-    return trimmed ? trimmed.split(/\s+/).join(' ') : '';
-}
-/** isAbsolute called where a `path` parameter would otherwise hide the module, as Python's os.path.isabs. */
-function isAbsolutePath(p) {
-    return path.isAbsolute(p);
-}
-/** path.join for name_again, whose own `path` parameter hides the node:path import. */
-function joinPath(a, b) {
-    return path.join(a, b);
 }
 /** What the dropped turns did, as fixed-format text. */
 export function digest(recs, upto, changed) {
@@ -38,7 +24,7 @@ export function digest(recs, upto, changed) {
     const finished = bases.length
         ? [get(recs[0], 'brief') || '', ...bases.slice(0, -1).map((r) => r['task'])]
         : [];
-    out.push(...finished.filter(nonBlank).map((task) => `earlier task, finished: ${cpHead(oneLine(task), 300)}`));
+    out.push(...finished.filter(nonBlank).map((task) => `earlier task, finished: ${cpHead(words(task), 300)}`));
     for (const r of ledger) {
         if (r['fn'] === 'ask') {
             out.push(`you asked: ${r['arg']}`);
@@ -55,12 +41,12 @@ export function digest(recs, upto, changed) {
 }
 /** A dropped attachment as the read() call that fetches it again: lines A to B of a file, or the whole file. A
  * file git ignores is not in a worktree, so there it is named by its path in the main tree, which read() takes. */
-export function nameAgain(path, head = null) {
-    const match = path.match(/^(.+):(\d+)-(\d+)\n?$/s);
-    let name = match ? match[1] : path;
-    if (head && get(head, 'worktree') && !name.startsWith('@') && !isAbsolutePath(name)
-        && !fs.existsSync(joinPath(head['workdir'], name)) && fs.existsSync(joinPath(head['root'], name))) {
-        name = joinPath(head['root'], name);
+export function nameAgain(attached, head = null) {
+    const match = attached.match(/^(.+):(\d+)-(\d+)\n?$/s);
+    let name = match ? match[1] : attached;
+    if (head && get(head, 'worktree') && !name.startsWith('@') && !path.isAbsolute(name)
+        && !fs.existsSync(path.join(head['workdir'], name)) && fs.existsSync(path.join(head['root'], name))) {
+        name = path.join(head['root'], name);
     }
     return match ? `read("${name}", ${match[2]}, ${match[3]})` : name;
 }
@@ -75,7 +61,7 @@ export function compaction(recs, changed, compactAt = 32000) {
     recs.forEach((r, i) => { if (r['t'] === 'base' || r['t'] === 'reject')
         start = i; });
     const rejected = recs[start]['t'] === 'reject' ? recs[start] : null; // the last base or reject starts the round in flight
-    const head = base ? { ...recs[0], ...base, brief: base['task'] } : { ...recs[0] };
+    const head = (base ? { ...recs[0], ...base, brief: base['task'] } : { ...recs[0] });
     head['max_turns'] = roundLimit(recs); // a round the lead started with a reject may have a limit of its own
     let review = rejected ? `## The lead's review\nThe lead reviewed your work on this task and rejected it. Fix these defects:\n${rejected['text']}` : '';
     let verdict = null;

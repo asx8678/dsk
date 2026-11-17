@@ -6,6 +6,7 @@
   "scripts": {
     "build": "tsc -p skill/scripts/tsconfig.build.json && node skill/scripts/stamp.mjs",
     "check": "tsc -p skill/scripts && node tools/unawaited.ts",
+    "check:display": "tsc -p skill && claude plugin test skill",
     "prove": "bun tools/prove.mjs"
   },
   "devDependencies": {

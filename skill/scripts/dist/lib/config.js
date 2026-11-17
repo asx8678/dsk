@@ -2,26 +2,8 @@
 // serves at once.
 const fs = process.getBuiltinModule('node:fs');
 const path = process.getBuiltinModule('node:path');
-import { Fail, Interrupted, STATE, flock, get, has, shlexSplit, xdg } from './base.js';
+import { Fail, Interrupted, STATE, flock, get, has, shlexSplit, xdg, isDict, truthy } from './base.js';
 import { DEFAULTS, OPTION_KEYS, SETUP } from './texts.js';
-/** Python's truth of a JSON value: false for null, false, 0, "", and for empty lists and dicts. */
-function truthy(value) {
-    if (value === null || value === undefined || value === false)
-        return false;
-    if (typeof value === 'number')
-        return value !== 0;
-    if (typeof value === 'string')
-        return value.length > 0;
-    if (Array.isArray(value))
-        return value.length > 0;
-    if (typeof value === 'object')
-        return Object.keys(value).length > 0;
-    return true;
-}
-/** Whether `value` is a JSON object, as Python's isinstance(value, dict) asked. */
-function isDict(value) {
-    return value !== null && typeof value === 'object' && !Array.isArray(value);
-}
 /** d[key], as Python read a dict: a missing key or a non-object raises, as KeyError or TypeError did. */
 function item(d, key) {
     if (!isDict(d) || !has(d, key))
@@ -134,7 +116,7 @@ export function config() {
  * plugin's options, else "". A key read from a file never enters os.environ, so it cannot reach scripts, sh() or checks. */
 export function secret(name) {
     const fromEnv = process.env[String(name)];
-    if (truthy(fromEnv))
+    if (fromEnv)
         return fromEnv;
     let words = [];
     try {
@@ -178,7 +160,7 @@ export function searchKey(cfg) {
 export function setup(cfg) {
     const opts = plugin(), first = item(cfg, 'route')[0];
     const profile = get(get(cfg, 'profiles', {}), first, {});
-    if (truthy(secret(get(profile, 'key_env', ''))))
+    if (truthy(secret(get(profile, 'key_env', '') ?? '')))
         return [true, `${first} · ${item(profile, 'base_url')} · ${item(profile, 'model')}`];
     const need = [];
     for (const [field, needLabel] of [['custom_base_url', 'endpoint URL'], ['custom_model', 'model name'], ['custom_api_key', 'API key']]) {

@@ -728,6 +728,48 @@ print([Box(n).v for n in range(3)], Counter("abc"), io.StringIO("x").read(), rea
     def test_syntax_errors_are_reported_not_run(self):
         self.assertRegex(dsk.gate("def broken(:\n    pass"), r"^SyntaxError on line 1")
 
+    def test_a_script_python_cannot_read_at_all_is_refused_in_one_line(self):
+        reason = dsk.gate('print("\ud800")')  # a lone surrogate: ast.parse raises UnicodeEncodeError, no SyntaxError
+        self.assertRegex(reason, r"^the script cannot be parsed: UnicodeEncodeError")
+        self.assertNotIn("\n", reason)
+
+    def test_what_a_script_does_outside_the_api_is_refused_and_reading_is_not(self):
+        write, read = os.O_WRONLY | os.O_CREAT, os.O_RDONLY
+        refused = [("open", ("a.txt", "w", 0)), ("open", ("a.txt", "ab", 0)), ("open", ("a.txt", "r+", 0)),
+                   ("open", ("a.txt", None, write)), ("open", (b"a.txt", "x", 0)), ("open", ("__pycache__/notes.txt", "w", 0)),
+                   ("os.remove", ("a.txt", -1)), ("os.rename", ("a.txt", "b.txt", -1, -1)), ("os.mkdir", ("d", 511, -1)),
+                   ("os.system", ("touch a.txt",)), ("os.system", ("touch __pycache__",)),
+                   ("subprocess.Popen", ("git", ["git"], None, None)), ("os.posix_spawn", ("/bin/sh", [], {}))]
+        allowed = [("open", ("a.txt", "r", 0)), ("open", ("a.txt", "rb", 0)), ("open", ("a.txt", None, read)),
+                   ("open", (3, "w", 0)),  # a descriptor that is open already
+                   ("open", ("/lib/__pycache__/json.cpython-313.pyc.4411", None, write)),  # an import writing its bytecode
+                   ("os.mkdir", ("/lib/__pycache__", 511, -1)), ("import", ("json",)), ("os.listdir", (".",)),
+                   ("compile", (None, "<script>")), ("exec", (None,))]
+        for event, args in refused:
+            reason = runner.outside(event, args)
+            self.assertIsNotNone(reason, (event, args))
+            self.assertRegex(reason, r"use write\(|with write\(\)|with sh\(cmd\)", (event, args))
+        for event, args in allowed:
+            self.assertIsNone(runner.outside(event, args), (event, args))
+
+    def test_git_named_in_quoted_text_is_no_git_command_and_the_deny_list_reads_the_whole_command(self):
+        deny = dsk.DEFAULTS["sh_deny"]
+        for cmd in ('grep -rn "git commit" docs', "printf '%s' 'use git checkout'", "git -C . status",
+                    "git log --oneline", "npm info left-pad"):
+            self.assertIsNone(runner.denied(cmd, deny), cmd)
+        for cmd, said in {'git commit -m "fix git push"': "git commit", "cd x && git add -A": "git add",
+                          'bash -c "git push"': "git push", "sh -lc 'git stash'": "git stash",
+                          'eval "git reset --hard"': "git reset", 'FOO="a b" git commit': "git commit",
+                          "sudo ls": "sudo", "pip install x": "`pip install`", "pip3 install x": "`pip3 install`",
+                          "npm install": "`npm install`", "npm i": "`npm i`", "npm i left-pad": "`npm i`",
+                          "npm ci": "`npm ci`", 'bash -c "pip install x"': "`pip install`",
+                          'ssh host "kubectl delete pod x"': "`kubectl delete`", 'ssh host "x; sudo reboot"': "sudo"}.items():
+            self.assertIn(said, runner.denied(cmd, deny) or "", cmd)
+
+    def test_only_a_command_that_was_killed_is_said_to_be_killed(self):
+        self.assertEqual(runner.shell("exit 124", 120), (124, ""))  # `timeout` exits 124 by itself
+        self.assertEqual(runner.shell("sleep 5", 0.2), (124, "\n[killed after 0.2s]"))
+
 
 class Loop(Cli):
     def test_ask_stops_the_script_and_the_answer_extends_the_same_request(self):
@@ -1034,6 +1076,65 @@ class Gates(Cli):
         self.assertEqual((self.cat(kept, "src/a.py"), self.cat(kept, "src/new.py"), self.cat(kept, "src/artifact.log")),
                          ("hacked\n", "new\n", ""))
         self.assertIn("changed: tests/t.py (+1)\n", out)
+
+    def test_a_script_that_opens_a_file_or_starts_a_command_by_itself_is_stopped_before_it_does(self):
+        # io is an allowed module and fnmatch has an `os` of its own, so the gate lets both scripts through. Before the
+        # audit hook each ran: the change counted as someone else's, stayed, and the run ended `done`.
+        repo = self.repo({"src/a.py": "old\n", "other.txt": "keep\n"})
+        self.api.replies = [script('io.FileIO("src/a.py", "w").write(b"in scope\\n")\ndone("x")'),
+                            script('io.FileIO("other.txt", "w").write(b"out of scope\\n")\ndone("x")'),
+                            script('print(io.StringIO("reading and plain io still work").read(), read("other.txt"))'),
+                            script('fnmatch.os.system("touch made.txt")\ndone("x")'),
+                            script('fnmatch.os.remove("other.txt")\ndone("x")'),
+                            script('write("src/a.py", "new\\n")\ndone("wrote it with write()")')]
+        out, _ = self.run_ok("--allow", "src/*.py", "edit it", cwd=repo)
+        self.assertIn("PermissionError: opening src/a.py for writing is not allowed; use write(path, text) or edit()", self.back(1))
+        self.assertIn("PermissionError: opening other.txt for writing is not allowed", self.back(2))
+        self.assertIn("output:\nreading and plain io still work keep", self.back(3))
+        self.assertIn("PermissionError: os.system() is not allowed; start commands with sh(cmd)", self.back(4))
+        self.assertIn("PermissionError: os.remove() is not allowed; change files with write() and edit(), or with sh()", self.back(5))
+        self.assertEqual((self.cat(repo, "src/a.py"), self.cat(repo, "other.txt"), os.path.exists(f"{repo}/made.txt")),
+                         ("new\n", "keep\n", False))
+        self.assertIn(" · review · ", out)
+        self.assertIn("changed: src/a.py (+1 -1)\n", out)
+        self.assertNotIn("scope:", out)
+
+    def test_a_write_to_a_path_longer_than_the_ledger_keeps_is_still_the_workers(self):
+        # The ledger keeps 200 characters of an argument. Cut there, the path named no file, so the write was taken
+        # for someone else's: inside --allow it was in no diff, and outside it was left in the tree.
+        repo = self.repo({"a.txt": "old\n"})
+        inside, outside = "in/" + "x" * 210 + ".txt", "out/" + "y" * 210 + ".txt"
+        self.api.replies = [script(f'write("{inside}", "hi\\n")\nsh("true")\ndone("x")')]
+        out, sid = self.run_ok("--allow", "in/**", "write it", cwd=repo)
+        self.assertIn(f"changed: {inside} (+1)\n", out)
+        self.assertEqual(dsk.Session(sid).last("gate")["touched"], [inside])
+        self.api.replies = [script(f'write("{inside}", "hi again\\n")\ndone("x")')]  # no shell command: only what it wrote counts
+        out, sid = self.run_ok("--allow", "in/**", "write it", cwd=repo)
+        self.assertIn(f"changed: {inside} (+1 -1)\n", out)
+        record = [r for r in dsk.Session(sid).of("ledger") if r["fn"] == "write"][0]
+        self.assertEqual((len(record["arg"]), record["path"]), (200, inside))
+        self.assertFalse(os.path.exists(f"{repo}/{outside}"))
+
+    def test_a_reverted_path_is_restored_by_its_name_and_not_as_a_pattern(self):
+        # `git restore -- src/[ab].txt` read the path as a pattern, which also names src/a.txt: the worker's own edit
+        # went back to what it was, and the run ended `done` with nothing changed.
+        repo = self.repo({"src/[ab].txt": "bracket\n", "src/a.txt": "old\n", "src/*.txt": "star\n"})
+        self.api.replies = [script('write("src/a.txt", "the worker\'s edit\\n")\n'
+                                   'sh("echo stray >> \'src/[ab].txt\'; echo stray >> \'src/*.txt\'")\ndone("x")')]
+        out, _ = self.run_ok("--allow", "src/a.txt", "edit it", cwd=repo)
+        self.assertEqual((self.cat(repo, "src/a.txt"), self.cat(repo, "src/[ab].txt"), self.cat(repo, "src/*.txt")),
+                         ("the worker's edit\n", "bracket\n", "star\n"))
+        self.assertIn("scope:   reverted src/*.txt, src/[ab].txt (copies in ", out)
+        self.assertIn("changed: src/a.txt (+1 -1)\n", out)
+
+    def test_a_script_python_cannot_parse_costs_a_turn_and_not_the_run(self):
+        # A lone surrogate in the script made ast.parse raise UnicodeEncodeError, which ended the gate's process, and
+        # the run with it: `internal: Error: runner.py gates stopped answering`.
+        repo = self.repo({"a.txt": "old\n"})
+        self.api.replies = [{"arguments": '{"code": "print(\\"\\ud800\\")"}'}, script('done("ok")')]
+        out, _ = self.run_ok("say it", cwd=repo)
+        self.assertIn("refused, nothing was run: the script cannot be parsed: UnicodeEncodeError", self.back(1))
+        self.assertIn(" · done · ", out)
 
     def test_diff_excludes_my_uncommitted_changes_and_my_index_is_untouched(self):
         repo = self.repo({"mine.txt": "v1\n", "tests/t.py": "t = 1\n"})
@@ -2037,6 +2138,72 @@ class Protocol(Cli):
         self.env["KEY_B"] = ""
         code, out, _ = self.dsk("doctor", "--profile", "b")
         self.assertEqual((code, out.splitlines()[1]), (1, "key:      KEY_B is not set"))
+
+class Prune(Cli):
+    """`dsk prune`: settled sessions that are old enough go; work that waits for a decision never does. The rule is
+    prunable() in lib/prune.ts, whose laws `bun run prove` proves; these hold the command to it on real folders."""
+
+    def aged(self, sid, days):
+        """Make a session look as if nothing was written to it for `days`."""
+        then = time.time() - days * 86400
+        os.utime(os.path.join(dsk.STATE, sid, "log.jsonl"), (then, then))
+
+    def there(self, *sids):
+        return [os.path.isdir(os.path.join(dsk.STATE, sid)) for sid in sids]
+
+    def answered(self, repo):
+        self.api.replies = [script('done("an answer")')]
+        return self.run_ok("what?", cwd=repo)[1]
+
+    def test_settled_sessions_past_the_days_kept_go_and_work_that_waits_stays_however_old(self):
+        repo = self.repo({"a.txt": "one\n"})
+        old, young = self.answered(repo), self.answered(repo)
+        self.api.replies = [script('write("a.txt", "two\\n")\ndone("x")')]
+        _, waits = self.run_ok("--allow", "a.txt", "--worktree", "edit", cwd=repo)
+        self.api.replies = [script('write("a.txt", "three\\n")\ndone("x")')]
+        _, dropped = self.run_ok("--allow", "a.txt", "--worktree", "edit", cwd=repo)
+        self.assertEqual(self.dsk("reject", dropped, "--drop", cwd=repo)[0], 0)
+        for sid in (old, waits, dropped):
+            self.aged(sid, 40)
+        code, out, _ = self.dsk("prune", "--dry-run")
+        self.assertEqual(code, 0)
+        self.assertRegex(out, r"^dsk prune · would delete 2 sessions settled more than 30 days ago · \d+\.\d MB\n")
+        self.assertEqual(self.there(old, dropped, young, waits), [True, True, True, True])
+        code, out, _ = self.dsk("prune")
+        self.assertEqual(code, 0)
+        self.assertRegex(out, r"^dsk prune · deleted 2 sessions settled more than 30 days ago · \d+\.\d MB\n")
+        self.assertRegex(out, rf"\nkept:    {waits} · review · \d+\.\d MB, its worktree included · ")
+        self.assertIn("\nnext:    it waits for your decision: dsk show ID, then dsk accept ID or dsk reject ID --drop\n", out)
+        self.assertEqual(self.there(old, dropped, young, waits), [False, False, True, True])
+        self.assertEqual(self.dsk("accept", waits, cwd=repo)[0], 0)  # 40 days on, the work it held is still whole
+        self.assertEqual(self.cat(repo, "a.txt"), "two\n")
+        code, out, _ = self.dsk("prune", "--days", "0")
+        self.assertRegex(out, r"^dsk prune · deleted 2 sessions, every settled one · ")
+        self.assertEqual(self.there(young, waits), [False, False])
+
+    def test_a_session_another_dsk_process_holds_stays(self):
+        repo = self.repo({"a.txt": "one\n"})
+        held, free = self.answered(repo), self.answered(repo)
+        with open(os.path.join(dsk.STATE, held, "lock"), "a") as lock:
+            fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            code, out, _ = self.dsk("prune", "--days", "0")
+        self.assertRegex(out, r"^dsk prune · deleted 1 session, every settled one · ")
+        self.assertEqual(self.there(held, free), [True, False])
+
+    def test_keep_days_in_the_config_prunes_once_a_day_when_a_run_starts(self):
+        repo = self.repo({"a.txt": "one\n"})
+        old = self.answered(repo)
+        self.aged(old, 10)
+        kept = self.answered(repo)  # no keep_days: a run deletes nothing
+        self.assertEqual(self.there(old, kept), [True, True])
+        self.config["keep_days"] = 7
+        self.write_config()
+        self.answered(repo)
+        self.assertEqual(self.there(old, kept), [False, True])
+        self.aged(kept, 10)
+        self.answered(repo)  # within the day of the last one: no second look
+        self.assertEqual(self.there(kept), [True])
+
 
 class Stats(Cli):
     """Timestamps in every record, and `dsk stats`: what a set of sessions measured, read back from their logs."""
