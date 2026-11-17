@@ -31,6 +31,9 @@ export function cleanEnv(cfg, sdir) {
         AWS_EC2_METADATA_DISABLED: 'true', CLOUDSDK_CONFIG: empty, AZURE_CONFIG_DIR: empty, DOCKER_CONFIG: empty,
         GIT_TERMINAL_PROMPT: '0', PYTHONHASHSEED: '0', LC_ALL: 'C.UTF-8', LANG: 'C.UTF-8', TZ: 'UTC',
         DSK_SCRATCH: scratch,
+        // A check's Python left __pycache__ in a repository that does not ignore it: outside --allow the scope gate
+        // undid it and the report and the worker were told so; inside, it would have been handed in as the change.
+        PYTHONDONTWRITEBYTECODE: '1',
     });
     return env;
 }

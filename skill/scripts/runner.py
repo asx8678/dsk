@@ -23,6 +23,44 @@ HINTS = {"os": "sh(), glob() and read()", "sys": "print() and done()", "subproce
          "requests": "fetch()"}
 
 
+def foreign(node):
+    """The modules an import statement names that a script may not import."""
+    modules = [a.name for a in node.names] if isinstance(node, ast.Import) else [node.module or "."]
+    return [m for m in modules if m.split(".")[0] not in IMPORTS + ("glob",)]  # glob is our function: `import glob` is harmless
+
+
+def unused(tree):
+    """The imports of modules a script may not import whose names it never uses, as in `import os` above a script
+    that calls only read() and glob(): 10 of the 12 refused imports in 111 logged sessions were such a line, and each
+    cost its worker a turn. They are dropped before the script runs (strip()), so they give it nothing. A name counts
+    as used wherever it appears as a name, an attribute, an argument or a definition, which is more than it needs."""
+    imports = [n for n in ast.walk(tree) if isinstance(n, (ast.Import, ast.ImportFrom)) and foreign(n)]
+    skip = {id(a) for n in imports for a in n.names}
+    used = set()
+    for node in ast.walk(tree):
+        if id(node) in skip:
+            continue
+        for field, value in ast.iter_fields(node):
+            if field in ("id", "arg", "name", "attr", "asname", "rest") and isinstance(value, str):
+                used.add(value.split(".")[0])
+            elif field == "names" and isinstance(node, (ast.Global, ast.Nonlocal)):
+                used.update(value)
+    bound = lambda n, a: a.asname or (a.name.split(".")[0] if isinstance(n, ast.Import) else a.name)
+    return [n for n in imports if all(a.name != "*" and bound(n, a) not in used for a in n.names)]
+
+
+def strip(tree, nodes):
+    """The tree with each of these import statements replaced by `pass`, which keeps every line where it was."""
+    gone = {id(n) for n in nodes}
+
+    class Drop(ast.NodeTransformer):
+        def visit_Import(self, node):
+            return ast.copy_location(ast.Pass(), node) if id(node) in gone else node
+        visit_ImportFrom = visit_Import
+
+    return ast.fix_missing_locations(Drop().visit(tree))
+
+
 def gate(script):
     """Refuse a script that would act outside the function API. Returns a one-line reason, or None."""
     try:
@@ -31,8 +69,11 @@ def gate(script):
         return f"SyntaxError on line {e.lineno}: {e.msg}"
     except (ValueError, RecursionError, MemoryError) as e:  # a lone surrogate, or nesting too deep to parse
         return f"the script cannot be parsed: {type(e).__name__}: {e}"[:300]
+    dropped = {id(n) for n in unused(tree)}
     for node in ast.walk(tree):
         names = [node.id] if isinstance(node, ast.Name) else [node.attr] if isinstance(node, ast.Attribute) else []
+        if id(node) in dropped:
+            continue
         if isinstance(node, (ast.Import, ast.ImportFrom)):
             imported = [a.name for a in node.names]
             for module in imported if isinstance(node, ast.Import) else [node.module or "."]:
@@ -147,6 +188,14 @@ def child(fd):
         """Whether a path names the scratch folder the short way, as "@scratch" or "@scratch/<rel>"."""
         return path == "@scratch" or path.startswith("@scratch/")
 
+    def in_scratch(cmd):
+        """The command with "@scratch" as a word's start made the scratch folder's path. Workers wrote a probe with
+        write("@scratch/t.mjs") and ran `node @scratch/t.mjs`, which failed: one spent three turns finding the path.
+        Only a path with no shell syntax in it is put in, so that no quoting can change what the command means."""
+        if not re.fullmatch(r"[\w./+-]+", scratch):
+            return cmd
+        return re.sub(r"(?<![\w@./~$-])@scratch(?=/|$|[\s'\";|&)<>])", lambda _: scratch, cmd)
+
     def tell(**record):
         chan.write(json.dumps(record) + "\n")
         chan.flush()
@@ -245,7 +294,7 @@ def child(fd):
         refusal = denied(cmd, job["sh_deny"])
         if refusal:
             raise PermissionError(refusal)
-        code, out = shell(cmd, timeout, started=lambda pid: tell(pgid=pid, cmd=cmd))
+        code, out = shell(in_scratch(cmd), timeout, started=lambda pid: tell(pgid=pid, cmd=cmd))
         return types.SimpleNamespace(code=code, out=out)
 
     def web(kind, *args):  # runs in the parent, which holds the key
@@ -305,7 +354,13 @@ def child(fd):
              "glob": globs}  # after the api, so that glob.glob() works without an import as well
     sys.addaudithook(audit)  # from here on, and never taken off again: only the script runs after this line
     try:
-        exec(compile(job["script"], "<script>", "exec"), every)
+        tree = ast.parse(job["script"])
+        dropped = unused(tree)
+        if dropped:  # said first, so that the worker stops writing them
+            lines = sorted({ast.get_source_segment(job["script"], n) or "import" for n in dropped})
+            print("dropped, not run: " + "; ".join(lines) + " (not allowed, and nothing in the script used it)")
+            tree = strip(tree, dropped)
+        exec(compile(tree, "<script>", "exec"), every)
     except SystemExit:
         pass
     except BaseException as e:

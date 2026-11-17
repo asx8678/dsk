@@ -96,7 +96,7 @@ One command, typed like any other slash command, with a word after it for all bu
 A provider is an API that serves a DeepSeek model: DeepSeek's own (`official`), or any OpenAI-compatible endpoint you add (a custom provider). `/dsk config` lists them in the order a run tries them, each with its model, its endpoint and whether its key is set. It looks roughly like this:
 
 ```
-dsk 0.13.0 · settings
+dsk 0.13.1 · settings
   Delegation   ● on  Claude hands the hands-on work to dsk
   Job display  ● on  running jobs show above the prompt, /dsk lists them
   Route order  your priority  providers are tried as numbered below
@@ -180,7 +180,7 @@ dsk run --allow 'test_*.py' --check 'python3 -m unittest' "Add unit tests for du
 </picture>
 </p>
 
-That's a real run against a 24-line module: 4 turns, 70 lines of tests, and the check run by `dsk` itself. The fastest provider was full, so the run moved to the next one in the route (`thirdparty after coralbricks`). A `cache:` line appears when less than 80% of the input after turn 3 came from the cache; here that is turn 4 alone, and what misses is what turn 3 appended. Once the diff is read, `dsk accept` marks the work as reviewed.
+That's a real run against a 24-line module: 4 turns, 70 lines of tests, and the check run by `dsk` itself. The fastest provider was full, so the run started on the next one in the route. A report names an earlier provider, as in `thirdparty after coralbricks`, only when the run left it after sending it a request. A `cache:` line appears when the provider missed its cache on more than a fifth of the input it had been sent already, which in 119 logged sessions never happened to a provider that caches. Once the diff is read, `dsk accept` marks the work as reviewed.
 
 Every command prints a short plain-text report on stdout. `--verbose` adds one line per turn on stderr. The last line of a report names the commands that are valid next.
 
