@@ -700,9 +700,11 @@ class Speed(Cli):
 
 class Gate(unittest.TestCase):
     def test_refusals_are_one_line_and_name_the_alternative(self):
-        cases = {"import os": "sh()", "import os.path as p": "sh()", "import subprocess": "sh()",
-                 "from pathlib import Path": "read()", "import requests": "fetch()", "import sys": "done()",
-                 "import mypackage.core": "sh('python3 ...') to run the project's own code", "from . import x": "import",
+        cases = {"import os\nos.getcwd()": "sh()", "import os.path as p\np.join('a')": "sh()",
+                 "import subprocess\nsubprocess.run([])": "sh()", "from pathlib import Path\nPath('x')": "read()",
+                 "import requests\nrequests.get('u')": "fetch()", "import sys\nsys.exit()": "done()",
+                 "import mypackage.core\nmypackage.core.f()": "sh('python3 ...') to run the project's own code",
+                 "from . import x\nx.f()": "import", "from os import *": "sh()",
                  "open('x')": "read()", "f = open": "read()", "import io\nio.open('x')": "read()",
                  "from io import open": "read()", "exec('1')": "plain code", "eval('1')": "plain code",
                  "compile('1', '', 'exec')": "plain code", "__import__('os')": "__",
@@ -713,6 +715,10 @@ class Gate(unittest.TestCase):
             self.assertIsNotNone(reason, code)
             self.assertIn(hint, reason)
             self.assertNotIn("\n", reason)
+
+    def test_an_import_the_script_never_uses_passes(self):
+        for code in ("import os\nprint(glob('*'))", "import sys, subprocess\nx = 1", "if 1:\n    from pathlib import Path\n"):
+            self.assertIsNone(dsk.gate(code), code)
 
     def test_allowed_modules_and_ordinary_code_pass(self):
         code = "\n".join(f"import {m}" for m in dsk.IMPORTS) + '''
@@ -782,7 +788,7 @@ class Loop(Cli):
                                                 f'next:    dsk answer {sid} "..."'])
         code, out, _ = self.dsk("answer", sid, "a.txt please", cwd=repo)
         self.assertEqual(code, 0, out)
-        self.assertEqual(out.splitlines()[1:], ["answer:  It says one.", "context: 1.2k of 32.0k",
+        self.assertEqual(out.splitlines()[1:], ["answer:  It says one.", "context: 1.3k of 32.0k",
                                                 f'next:    dsk show {sid} --answer | dsk continue {sid} "next task"'])
         self.assertIn("· done · a · 2 turns ·", out)
         first, second = self.api.bodies()
@@ -890,6 +896,22 @@ done("tried everything")"""
         self.assertLess(len(cut), 8400)
         self.assertIn("12002 characters cut here: a turn that only reads shows at most 8,000 characters", cut)
 
+    def test_a_configs_deny_list_adds_to_the_built_in_one(self):
+        self.config["sh_deny"] = ["make deploy"]  # written in full by an older dsk: no npm ci in it
+        self.write_config()
+        probe = ('for c in ("npm ci", "make deploy", "echo ran"):\n    try:\n        print(sh(c).out.strip())\n'
+                 '    except PermissionError as e:\n        print(e)')
+        self.api.replies = [script(probe), script('done("x")')]
+        _, sid = self.run_ok("try three commands")
+        self.assertEqual(self.output(sid, 1), "`npm ci` is refused\n`make deploy` is refused\nran\n")
+
+    def test_an_unused_import_is_dropped_and_sh_reaches_the_scratch_folder_by_its_short_name(self):
+        self.api.replies = [script('import os, subprocess\nwrite("@scratch/a.txt", "hi")\nprint(sh("cat @scratch/a.txt").out)'),
+                            script('done("x")')]
+        _, sid = self.run_ok("probe")
+        self.assertEqual(self.output(sid, 1), "dropped, not run: import os, subprocess (not allowed, and nothing in the "
+                                              "script used it)\nhi\n")
+
     def test_malformed_refused_and_truncated_replies_get_fixed_messages_then_stuck(self):
         self.api.replies = ["I think the answer is 4.", script("import os\nprint(os.getcwd())"),
                             {"arguments": '{"code": "print(1', "finish": "length"}]
@@ -989,7 +1011,7 @@ done("tried everything")"""
         out, _ = self.run_ok("--max-turns", "3", "never finishes", code=3)
         self.assertIn("· limit · a · 3 turns ·", out)
         self.assertIn("why:     turn limit reached", out)
-        self.assertEqual(self.back(2), "turn 2 · 1 left\noutput:\n1")
+        self.assertEqual(self.back(2), "turn 2 · 1 left\noutput:\n1\n\n" + dsk.LAST_TURN_READ)
 
     def test_thinking_mode_replays_reasoning_and_does_not_force_the_call(self):
         self.api.replies = [{"code": 'print("a")', "message": {"reasoning_content": "plan: print a"}}, script('done("x")')]
@@ -1007,8 +1029,8 @@ done("tried everything")"""
                                   "--allow", "sub dir/**", cwd=f"{repo}/sub dir", stdin="piped in\n")
         self.assertEqual(code, 0, out + err)
         first = self.api.bodies()[0]["messages"][1]["content"]
-        self.assertIn('<attached path="@stdin">\npiped in\n\n</attached>', first)
-        self.assertIn('<attached path="sub dir/ñandú notes.txt">\nhéllo\n', first)
+        self.assertIn('<attached path="@stdin">\n1\tpiped in\n\n</attached>', first)
+        self.assertIn('<attached path="sub dir/ñandú notes.txt">\n1\théllo\n', first)
         self.assertTrue(first.endswith("## Task\nSummarise the notes."))
         sid = out.split()[1]
         self.assertEqual(self.output(sid, 1), "piped in héllo ['sub dir/ñandú notes.txt']\n")
@@ -1022,8 +1044,8 @@ done("tried everything")"""
         self.api.replies = [script('done("x")')]
         self.run_ok("--file", "notes.txt:2-3", "--file", "notes.txt:1-1", "read", cwd=repo)
         first = self.api.bodies()[0]["messages"][1]["content"]
-        self.assertIn('<attached path="notes.txt:2-3">\ntwo\nthree\n\n</attached>', first)
-        self.assertIn('<attached path="notes.txt:1-1">\none\n\n</attached>', first)
+        self.assertIn('<attached path="notes.txt:2-3">\n2\ttwo\n3\tthree\n\n</attached>', first)
+        self.assertIn('<attached path="notes.txt:1-1">\n1\tone\n\n</attached>', first)
         self.assertNotIn("four", first)
         for bad in ("notes.txt:3-2", "notes.txt:1-9"):
             code, out, err = self.dsk("run", "--file", bad, "read", cwd=repo)
@@ -1230,7 +1252,7 @@ class Cache(Cli):
         first = self.api.bodies()[0]["messages"]
         self.assertEqual(first[0], {"role": "system", "content": dsk.SYSTEM})
         order = [first[1]["content"].index(part) for part in
-                 ('<attached path="DSK.md">\n# Project facts', "## Run", '<attached path="a.txt">\nattached text', "## Task\ncount to ten")]
+                 ('<attached path="DSK.md">\n# Project facts', "## Run", '<attached path="a.txt">\n1\tattached text', "## Task\ncount to ten")]
         self.assertEqual(order, sorted(order))
         self.assertEqual(order[0], 0)
         self.assertRegex(out, r"· done · a · 10 turns · in \d+\.\dk \(\d\d% cached\)")
@@ -1254,7 +1276,7 @@ class Cache(Cli):
         self.api.replies = [{"code": f'print({n})', "usage": usage} for n in range(5)] + \
                            [{"code": 'done("x")', "usage": usage}]
         out, _ = self.run_ok("uncached provider")
-        self.assertIn("cache:   low (10% cached after turn 3)\n", out)
+        self.assertIn("cache:   low: 90% of the input the provider had been sent already missed its cache\n", out)
 
 
 
@@ -1286,7 +1308,7 @@ class Compaction(Cli):
                                               "Read a file again before you rely on what it said.")
         first = after[1]["content"]
         self.assertNotIn('<attached path="big.txt">', first)
-        self.assertIn('<attached path="small.txt">\nthe rules, in 30 characters\n\n</attached>\n\n## Task\n', first)
+        self.assertIn('<attached path="small.txt">\n1\tthe rules, in 30 characters\n\n</attached>\n\n## Task\n', first)
         self.assertTrue(first.endswith(
             "## Task\nlong task\n\n## Digest of turns 1-1, whose messages were dropped\nnote: alpha is 1\n"
             "you asked: Which name?\nthe lead answered: Use beta.\nt1 edit tests/t.py\nt1 sh true → 0\n"

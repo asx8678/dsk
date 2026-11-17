@@ -54,6 +54,15 @@ export function plugin(part = 'options') {
         return get({ options: {}, path: '' }, part, 'dsk@<its marketplace>');
     }
 }
+/**
+ * The commands sh() refuses: the built-in list, then the config's own entries. A config's sh_deny adds to the
+ * defaults: written in full, as one was, it kept an older list, and the commands added to the defaults since
+ * (`pip3 install`, `npm i`, `npm ci`) were let through. Anything but a list of strings leaves the defaults alone.
+ */
+export function denyList(builtIn, user) {
+    const own = Array.isArray(user) ? user.filter((d) => typeof d === 'string') : [];
+    return [...new Set([...builtIn, ...own])];
+}
 /** Built-in defaults, then the plugin's options, then ~/.config/dsk/config.json. It names key variables, never keys. */
 export function config() {
     const cfg = JSON.parse(JSON.stringify(DEFAULTS));
@@ -101,6 +110,8 @@ export function config() {
             }
             updateDict(item(cfg, nested), part);
         }
+        if (has(user, 'sh_deny'))
+            user.sh_deny = denyList(DEFAULTS.sh_deny, user.sh_deny);
         updateDict(cfg, user);
         cfg.route = [...new Set([...item(cfg, 'route')].map((n) => has(profiles, n) ? n : get(renamed, n, n)))];
         clearDict(ALIASES);

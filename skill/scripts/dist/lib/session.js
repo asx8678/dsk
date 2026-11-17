@@ -12,9 +12,11 @@ export class Session {
     recs = [];
     /** The process group of the shell command a script is running, while it runs (run_script). */
     shelled = null;
-    /** What the worker was shown of the last turn's output, and whether that turn may have changed a file. */
+    /** What the worker was shown of the last turn's output, and whether that turn may have changed a file. `changed`
+     * leaves out the scratch folder and @answer: it is whether the project itself may have changed. */
     printed = '';
     moved = false;
+    changed = false;
     /** dsk.py's `_lock`: this process's lock on the session, while it drives it. */
     lockHandle = null;
     /** dsk.py's `_tree`: this process's lock on the working tree, for a run in place. */

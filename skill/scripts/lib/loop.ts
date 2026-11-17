@@ -8,7 +8,7 @@ import { gate, parse } from './reply.ts'
 import { turnLine } from './reports.ts'
 import { independentReview, secondLook } from './review.ts'
 import { turnKind } from './stats.ts'
-import { ALTERNATING, CONFIRMED, CUT_OFF, HEAT, NUDGE, ONE_CALL, REPEAT, SAME_FAILURE, SANDBOX_LINE, SCRATCH, SPOKEN, SPOKEN_CHARS, STALE, TIMED_OUT, TIMED_OUT_REPLY, TRUNCATED } from './texts.ts'
+import { ALTERNATING, CONFIRMED, CUT_OFF, HEAT, NUDGE, ONE_CALL, REPEAT, SAME_FAILURE, SANDBOX_LINE, SCRATCH, SPOKEN, SPOKEN_CHARS, STALE, NUMBERED, LAST_TURN_READ, LAST_TURN_WRITE, CHECK_PASSED, STILL_PASSED, RECHECK_OVER, RECHECK_TURNS, TIMED_OUT, TIMED_OUT_REPLY, TRUNCATED } from './texts.ts'
 import { chat, laterProfiles, release } from './wire.ts'
 import type { Session } from './session.ts'
 import { tally, type Tally } from './stops.ts'
@@ -28,13 +28,24 @@ export function runHeader(terms: Terms, web: boolean, date: string): string {
     get(terms, 'sandbox') ? SANDBOX_LINE : ''].filter(Boolean).join('\n')
 }
 
+/**
+ * An attached file's text with each line led by its number and a tab, counted from A for `PATH:A-B`. Workers asked
+ * for file:line read every attached file again to number it: 9 of 10 review runs spent their first turn on that.
+ */
+export function numbered(file: string, text: string): string {
+  const first = Number(/:(\d+)-\d+$/.exec(file)?.[1] ?? 1)
+  const lines = text.split('\n')
+  const end = lines.length > 1 && lines[lines.length - 1] === '' ? lines.pop() : undefined  // a final newline is no line
+  return lines.map((line, i) => `${first + i}\t${line}`).join('\n') + (end === undefined ? '' : '\n')
+}
+
 /** DSK.md, run header, attached files, brief, review: most stable first, so sessions share the longest prefix. */
 export function firstMessage(head: Head, digest = "", files: [string, string][] | null = null, review = ""): string {
   const run = runHeader(head, head.web, head.date)
   const attached = (files === null ? head.files : files).map(([file, text]: [string, string]) =>
-    `<attached path="${file}">\n${text}\n</attached>`)
+    `<attached path="${file}">\n${numbered(file, text)}\n</attached>`)
   const facts = head.dsk_md ? `<attached path="DSK.md">\n${head.dsk_md}\n</attached>` : ''
-  return [facts, run, ...attached, '## Task\n' + head.brief, review, digest].filter(Boolean).join('\n\n')
+  return [facts, run, attached.length ? NUMBERED : '', ...attached, '## Task\n' + head.brief, review, digest].filter(Boolean).join('\n\n')
 }
 
 /**
@@ -52,6 +63,7 @@ function spokenAnswer(s: Session, reply: any): string | null {
 
 /** Run one reply. Returns (text for the worker, why the turn failed or '', the ask/done record or None). */
 export async function takeTurn(s: Session, cfg: Cfg, env: NodeJS.ProcessEnv, turn: number, reply: any, finish: string | null): Promise<[string, string, Rec | null]> {
+  s.changed = false  // a turn that runs no script changes nothing
   if (finish === 'time') return [format(TIMED_OUT, { seconds: cfg.limits.reply_seconds }), 'truncated', null]
   if (finish === 'length') return [TRUNCATED, 'truncated', null]
   const script = parse(reply)
@@ -62,6 +74,7 @@ export async function takeTurn(s: Session, cfg: Cfg, env: NodeJS.ProcessEnv, tur
     s.add('ledger', { turn, ...stop })
     s.printed = ''
     s.moved = false
+    s.changed = false
     return [SPOKEN, '', stop]
   }
   const refusal = await gate(script)
@@ -95,6 +108,7 @@ export async function takeTurn(s: Session, cfg: Cfg, env: NodeJS.ProcessEnv, tur
   const touched = before ? s.last('gate').touched : []
   s.printed = output
   s.moved = Boolean(wrote.length || reverted.length || touched.length || (!before && fns.has('sh')))
+  s.changed = Boolean(wrote.some((p) => !String(p).startsWith('@')) || touched.length || (!before && fns.has('sh')))
   const parts = [
     wrote.length ? 'wrote: ' + wrote.join(', ') : '',
     output.trim() ? 'output:\n' + output.replace(/\n+$/, '') : 'output: (none)',
@@ -102,6 +116,20 @@ export async function takeTurn(s: Session, cfg: Cfg, env: NodeJS.ProcessEnv, tur
     reverted.length ? 'reverted, outside the allow patterns: ' + reverted.join(', ') : '',
   ]
   return [parts.filter(Boolean).join('\n'), error ? 'error' : '', stop]
+}
+
+/**
+ * What a hand-in answers. A read-only worker that printed its findings in the turn that called done() and passed
+ * done() a one-line summary of them lost the findings: in a measured batch, a review answered with that line alone.
+ * So the lines of that turn's output that the summary does not already hold go with it, when they are not short.
+ * Line by line, because a worker that prints its answer and then a line more ("lines: 14"), or that reflows its
+ * first line in done(), has neither text inside the other: whole-text matching doubled 2 of 4 answers in a batch.
+ */
+export function answerOf(printed: string, arg: string, writing: boolean): string {
+  if (writing) return arg
+  const summary = String(arg)
+  const rest = String(printed ?? '').split('\n').filter((line) => line.trim() && !summary.includes(line.trim())).join('\n')
+  return cpLen(rest.trim()) < SPOKEN_CHARS ? arg : `${arg}\n\n${rest.trim()}`
 }
 
 /** Python's == for the JSON values a reply is made of: arrays and dicts compare by contents. */
@@ -128,8 +156,24 @@ export function shape(message: any): string {
   return pyJsonAscii(sortKeys(said(message))).replace(/\d+/g, '0')
 }
 
-/** What loop() keeps of the turns that ran: what each one showed, and the commands that failed last with their run. */
-type Seen = { shown: string[]; failing: [any, number] }
+/** What loop() keeps of the turns that ran: what each one showed, the commands that failed last with their run, the
+ * last turn that may have changed the project, and the last one in which the run's check passed after a change. */
+type Seen = { shown: string[]; failing: [any, number]; changedAt: number; passedAt: number; passedCmd: string }
+
+/** The second look asked in the round in flight, if one was: a session logged before rounds were marked has none. */
+function secondLookOf(s: Session): Rec | undefined {
+  return s.of('round').length ? s.since('round', 'recheck').find((r) => !has(r, 'skipped')) : undefined
+}
+
+/**
+ * The check a shell command ran last, if it ended with one: then the command's exit code is the check's. Workers run
+ * the check behind other commands (`bash -n x.sh && bash tests/run.sh`), and an exact match missed those.
+ */
+function checkRun(a: Rec, checks: string[]): string | undefined {
+  if (a.fn !== 'sh' || !has(a, 'code')) return undefined
+  const cmd = words(a.arg)
+  return checks.find((c) => cmd === c || cmd.endsWith(`&& ${c}`) || cmd.endsWith(`; ${c}`))
+}
 
 /**
  * Send the pending turn result as the next message, with the lead's text after it. It is sent only now, so that an
@@ -177,12 +221,25 @@ async function badStop(s: Session, cfg: Cfg, env: NodeJS.ProcessEnv, status: str
  * got nowhere, like a repeat. And a check that fails the same way after every change gets a note every third time:
  * one worker ran 13 such turns to its limit.
  */
-function notesFor(s: Session, seen: Seen, reply: any, before: any, acts: Rec[], stop: Rec | null): [boolean, string] {
+function notesFor(s: Session, seen: Seen, turn: number, reply: any, before: any, acts: Rec[], stop: Rec | null): [boolean, string] {
   const printed = words(s.printed)
   const stale = !stop && !s.moved && before !== null && shape(reply) === shape(before)
     && acts.some((a) => a.fn !== 'note') && seen.shown.slice(-4).some((old) => old.includes(printed))
   seen.shown.push(printed)
   let note = stale ? '\n\n' + STALE : ''
+  // A worker that saw its check pass ran it again, or prove, or git status, for one or two more turns in every
+  // write run of a measured batch: dsk runs the checks at done() anyway. One careful run went on checking itself
+  // for 9 turns after that note, so it is said again every third turn in which nothing changes.
+  const checks: string[] = (scope(s).checks ?? []).map((c: string) => words(c))
+  const passed = stop ? undefined : acts.filter((a) => a.code === 0).map((a) => checkRun(a, checks)).find(Boolean)
+  const looking = Boolean(secondLookOf(s))  // the second look has its own note
+  if (passed && seen.changedAt) {
+    note += '\n\n' + format(CHECK_PASSED, { cmd: cpHead(passed, 80) })
+    Object.assign(seen, { passedAt: turn, passedCmd: passed })
+  } else if (!stop && !looking && seen.passedAt && seen.passedAt >= seen.changedAt) {
+    const n = turn - seen.passedAt
+    if (n >= 3 && n % 3 === 0) note += '\n\n' + format(STILL_PASSED, { cmd: cpHead(seen.passedCmd, 80), n })
+  }
   const broken = acts.filter((a) => a.fn === 'sh' && get(a, 'code'))
   if (acts.some((a) => a.fn === 'sh')) {
     const mark = broken.length ? [broken.map((a) => [a.arg, a.code]), printed.replace(/\d+/g, '0')] : []
@@ -222,7 +279,7 @@ export async function loop(s: Session, cfg: Cfg, extra = ""): Promise<string> {
   const env = cleanEnv(cfg, s.dir)
   const writing = Boolean(scope(s).allow.length)
   const saidHere = []
-  const seen: Seen = { shown: [], failing: [null, 0] }
+  const seen: Seen = { shown: [], failing: [null, 0], changedAt: 0, passedAt: 0, passedCmd: '' }
   let left = 0
 
   /** Whether the run is past its time or its token limit. */
@@ -270,8 +327,9 @@ export async function loop(s: Session, cfg: Cfg, extra = ""): Promise<string> {
       [body, failed, stop] = await takeTurn(s, cfg, env, turn, reply, finish)
     }
     const acts = s.of('ledger').filter((a) => a.turn === turn)
+    if (!repeat && !confirms && s.changed) seen.changedAt = turn  // a script that failed halfway may have changed files too
     if (!repeat && !failed && !confirms) {
-      const [was, note] = notesFor(s, seen, reply, before, acts, stop)
+      const [was, note] = notesFor(s, seen, turn, reply, before, acts, stop)
       stale = was
       body += note
     }
@@ -288,12 +346,20 @@ export async function loop(s: Session, cfg: Cfg, extra = ""): Promise<string> {
       text += `\n\nnote: the last ${reads} turns only read files. ${left} turns are left: start writing now, ` +
         'or call ask() if the task cannot be done as written.'
     }
+    // A scout that read to its turn limit lost everything it had found: say so while one reply is left.
+    if (left === 1 && !finished) text += '\n\n' + (writing ? LAST_TURN_WRITE : LAST_TURN_READ)
+    // The second look has no budget of its own: at effort max one worker ran 14 more turns of its own tests in it
+    // before it handed in, half the tokens of a batch of 16 sessions. From its third turn on, it is told to finish.
+    const look = secondLookOf(s)
+    if (look && !stop && !finished && left !== 1 && turn - look.turn >= RECHECK_TURNS) {
+      text += '\n\n' + format(RECHECK_OVER, { n: turn - look.turn })
+    }
     s.add('result', { turn, text, fail: failed, ...(finish === 'time' ? { slow: true } : {}) })  // `slow` lowers the effort: effortNow()
     if (G.verbose) eprint(turnLine(s, turn))
     const later = laterProfiles(s, cfg)
     t = tally(t, { repeat, failed: Boolean(failed), stale, finished, asked: Boolean(stop && stop.fn === 'ask'),
                    later: later.length > 0, done, limit: limitTurns, spent: spentLimit() })
-    if (t.stop === 'done') return halt(s, undefined, { summary: stop.arg, open: stop.open })
+    if (t.stop === 'done') return halt(s, undefined, { summary: answerOf(s.printed, stop.arg, writing), open: stop.open })
     if (t.stop === 'question') return halt(s, 'question', { question: stop.arg })
     if (t.failedOver) { // another provider may break the loop, so it is tried before the run gives up
       release(cfg, s.profile)

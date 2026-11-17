@@ -7,16 +7,17 @@ W, LOOP = 880, 20
 SIZE, TOP, ROW = 14, 74, 22
 CW = SIZE * kit.PITCH
 LIGHTS = ("#ff5f57", "#febc2e", "#28c840")  # the window's three buttons, the same in both themes
-# What the terminal shows is real output, verbatim: a repository with one 24-line module (2026-11-14, dsk 0.6.1).
+# What the terminal shows is real output: a repository with one 24-line module (2026-11-14, dsk 0.6.1), less two
+# things dsk 0.13.1 no longer prints for that run: `after coralbricks`, a provider passed over before any request
+# because it was full, and a `cache:` line about the misses that what each turn appends always makes.
 # Each entry is a command and what it printed, as (fill class, text).
 SESSION = [
     ("dsk run --allow 'test_*.py' --check 'python3 -m unittest' \"Add unit tests for durations.py\"", [
         ("mu", "dsk 054a · running · coralbricks"),
-        ("ink", "dsk 054a · review · thirdparty after coralbricks · 4 turns · in 7.7k (78% cached) · out 1.1k"),
+        ("ink", "dsk 054a · review · thirdparty · 4 turns · in 7.7k (78% cached) · out 1.1k"),
         ("t2", "summary: Added test_durations.py with 12 unittest cases covering parse_duration (single/compound units, whitespace and case, zero, repeated units, invalid inputs), format_duration (zero, single/compound, skipped units, negative) and a format/parse round trip. Ran `python3 -m unittest`: all 12 tests pass."),
         ("ok", "checks:  python3 -m unittest → 0"),
         ("t2", "changed: test_durations.py (+70)"),
-        ("t2", "cache:   low (62% cached after turn 3)"),
         ("t2", "context: 3.1k of 24.0k"),
         ("mu", "next:    dsk show 054a --review | dsk accept 054a | dsk reject 054a \"defects\""),
     ]),

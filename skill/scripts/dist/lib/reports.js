@@ -84,14 +84,49 @@ export function passedBefore(s) {
     }
     return [...new Set(passed)];
 }
+/**
+ * The profiles a session left after sending them a request, in order. A profile whose slots were all taken was
+ * passed over before any request: naming it ("thirdparty after opendesign") read as a failover in 4 of 16 reports
+ * of a batch whose runs had not failed anywhere.
+ */
+export function leftProfiles(S) {
+    const asked = [];
+    let current = '';
+    for (const r of S.recs) {
+        if (r['t'] === 'series')
+            current = get(r, 'profile');
+        else if (r['t'] === 'req' && current && !asked.includes(current))
+            asked.push(current);
+    }
+    return asked.filter((p) => p !== S.profile);
+}
+/**
+ * The share of the input a provider had been sent already, by the turn before on the same profile and with no
+ * compaction between, that it did not serve from its cache. What a turn adds is always a miss, so the share of all
+ * input that was cached flagged 23 of 119 logged sessions whose providers cached all they could: in those, this
+ * share never passed 7%. None when fewer than two turns can be compared, or the provider reports no cache.
+ */
+export function rereadShare(S) {
+    const compacted = new Set(S.of('series').filter((r) => r['why'] === 'compact').map((r) => r['turn']));
+    const usage = S.of('usage');
+    let sent = 0, missed = 0, pairs = 0;
+    for (let i = 1; i < usage.length; i++) {
+        const [a, b] = [usage[i - 1], usage[i]];
+        if (b['hit'] === null || b['profile'] !== a['profile'] || b['turn'] !== a['turn'] + 1 || compacted.has(a['turn']))
+            continue;
+        sent += a['prompt'];
+        missed += Math.max(0, a['prompt'] - b['hit']);
+        pairs += 1;
+    }
+    return pairs >= 2 && sent ? missed / sent : null;
+}
 /** The first line of a report: the session, how it stands, its profile and the ones it left, turns and tokens. */
 function headline(S, status) {
     const usage = S.of('usage');
     const ledger = S.of('ledger');
     const turns = S.turn;
     const cached = cachedShare(usage);
-    const earlier = [...new Set((S.of('series')).map((r) => get(r, 'profile')))]
-        .filter((p) => p && p !== S.profile);
+    const earlier = leftProfiles(S);
     const shown = S.profile + (earlier.length ? ' after ' + earlier.join(', ') : ''); // a failover says which profile came before
     const top = [`dsk ${S.id}`, status, shown, `${turns} turn${turns === 1 ? '' : 's'}`,
         `in ${kilo(usage.reduce((n, u) => n + u['prompt'], 0))}` + (cached === null ? '' : ` (${fmtPercent(cached, 0)} cached)`),
@@ -212,7 +247,6 @@ function diffLines(S, status, cap) {
 export function report(s, review = false, cfg = null) {
     const S = s;
     const st = S.last('state') || {};
-    const usage = S.of('usage');
     const ledger = S.of('ledger');
     const checks = S.last('checks') || { results: [] };
     const status = S.status();
@@ -254,9 +288,9 @@ export function report(s, review = false, cfg = null) {
         const bad = st['unverified'];
         line('sources', `${st['cited']} cited, ` + (bad && bad.length ? `${bad.length} unverified: ${bad.slice(0, 5).join(' ')}` : 'all opened in this session'));
     }
-    const lateShare = cachedShare(usage.filter((u) => u['turn'] > 3));
-    if (lateShare !== null && lateShare < 0.8)
-        line('cache', `low (${fmtPercent(lateShare, 0)} cached after turn 3)`);
+    const reread = rereadShare(S);
+    if (reread !== null && reread > 0.2)
+        line('cache', `low: ${fmtPercent(reread, 0)} of the input the provider had been sent already missed its cache`);
     if (status === 'stuck' || status === 'limit') { // where the turns went, and what the worker last saw when it changed nothing
         line('spent', spentText(S));
         const stChanged = get(st, 'changed');
@@ -286,7 +320,7 @@ export function reportJson(s, cfg) {
     const reverted = [...new Set((S.of('gate')).flatMap((g) => g['reverted']))];
     return {
         ...job(S, cfg),
-        left: [...new Set((S.of('series')).map((r) => get(r, 'profile')))].filter((p) => p && p !== S.profile),
+        left: leftProfiles(S),
         summary: get(st, 'summary', ''), answer: status === 'done' ? answerText(S) : '',
         question: get(st, 'question') || '', error: get(st, 'error') || '', why: get(st, 'why') || '',
         open: get(st, 'open') || '', notes: ledger.filter((r) => r['fn'] === 'note').map((r) => r['arg']),

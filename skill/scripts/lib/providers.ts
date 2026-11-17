@@ -532,9 +532,11 @@ export async function cmdWeb(args: Args, cfg: Cfg): Promise<number> {
   return 0
 }
 
-/** Per profile: key, model, thinking-off, well-formed replies over a three-turn exchange, cache reporting. */
+/** Per profile: key, model, thinking-off, well-formed replies over a three-turn exchange, cache reporting. The exit
+ * code is about the profiles a run can use: those on the route, or the one named. A profile left off the route is
+ * still checked, but its failure (a lapsed subscription, say) does not fail the doctor. */
 export async function cmdDoctor(args: Args, cfg: Cfg): Promise<number> {
-  let healthy = true
+  let healthy = true, profileOk = true
   const filler = Array.from({ length: 110 }, (_, n) => `filler line ${n}: the quick brown fox jumps over the lazy dog`).join('\n')
   const task = ('This is a connection test in three steps, one per reply. Step 1: print(1). Step 2: print(2). '
                 + `Step 3: call done('ok'). Ignore the filler below.\n` + filler)
@@ -542,10 +544,13 @@ export async function cmdDoctor(args: Args, cfg: Cfg): Promise<number> {
   for (const name of names) {
     if (!has(cfg.profiles, name)) throw new Fail(`unknown profile ${name}`)
     const profile = cfg.profiles[name]
-    print(`dsk doctor · ${name} · ${profile.base_url} · ${profile.model}`)
+    const counts = Boolean(args.profile) || cfg.route.includes(name)
+    profileOk = true
+    print(`dsk doctor · ${name} · ${profile.base_url} · ${profile.model}` + (counts ? '' : ' · not on the route'))
     if (!secret(profile.key_env)) {
-      healthy = false
+      profileOk = false
       print(`key:      ${profile.key_env} is not set`)
+      healthy = healthy && (profileOk || !counts)
       continue
     }
     if (!claimSlot(cfg, name)) {  // runs hold all of its max_sessions slots: a test request would be one too many
@@ -562,7 +567,7 @@ export async function cmdDoctor(args: Args, cfg: Cfg): Promise<number> {
     for (let step = 0; step < 5; step++) {  // the same request three times a few seconds apart, then two that extend it
       const [status, data] = await post(url, key, requestBody(profile, 'off', msgs), cfg.backoff, sent)
       if (status !== 200) {
-        healthy = false
+        profileOk = false
         print(`model:    HTTP ${status} ${typeof data === 'string' ? data : dumps(data)}`)
         broke = true
         break
@@ -587,7 +592,7 @@ export async function cmdDoctor(args: Args, cfg: Cfg): Promise<number> {
     }
     if (!broke) {
       const cached = field !== 'not reported' && !hits[2].startsWith('0/')
-      healthy = healthy && good === 5 && !thought
+      profileOk = profileOk && good === 5 && !thought
       print(`key:      ${profile.key_env} works, model accepted`)
       print('thinking: ' + (thought ? `NOT off: ${thought} reasoning tokens. Put this provider's switch in profiles.${name}.extra`
                             : 'off is honoured'))
@@ -598,6 +603,7 @@ export async function cmdDoctor(args: Args, cfg: Cfg): Promise<number> {
                             : 'no cache hits seen, so every turn is billed in full: set compact_at to 24000 or lower'))
     }
     release(cfg, name)
+    healthy = healthy && (profileOk || !counts)
   }
   const block = cfg.search
   if (secret(block.key_env)) {
