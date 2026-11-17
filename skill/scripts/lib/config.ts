@@ -2,23 +2,8 @@
 // serves at once.
 const fs = process.getBuiltinModule('node:fs')
 const path = process.getBuiltinModule('node:path')
-import { Fail, Interrupted, STATE, flock, get, has, shlexSplit, xdg, type Cfg, type Lock } from './base.ts'
+import { Fail, Interrupted, STATE, flock, get, has, shlexSplit, xdg, isDict, truthy, type Cfg, type Lock } from './base.ts'
 import { DEFAULTS, OPTION_KEYS, SETUP } from './texts.ts'
-
-/** Python's truth of a JSON value: false for null, false, 0, "", and for empty lists and dicts. */
-function truthy(value: any): boolean {
-  if (value === null || value === undefined || value === false) return false
-  if (typeof value === 'number') return value !== 0
-  if (typeof value === 'string') return value.length > 0
-  if (Array.isArray(value)) return value.length > 0
-  if (typeof value === 'object') return Object.keys(value).length > 0
-  return true
-}
-
-/** Whether `value` is a JSON object, as Python's isinstance(value, dict) asked. */
-function isDict(value: any): boolean {
-  return value !== null && typeof value === 'object' && !Array.isArray(value)
-}
 
 /** d[key], as Python read a dict: a missing key or a non-object raises, as KeyError or TypeError did. */
 function item(d: any, key: string): any {
@@ -27,23 +12,23 @@ function item(d: any, key: string): any {
 }
 
 /** d[key] = value, as Python wrote a dict: an own property even when the key is `__proto__` or `constructor`. */
-function defineKey(d: any, key: string, value: any): void {
+function defineKey(d: object, key: string, value: unknown): void {
   Object.defineProperty(d, key, { value, writable: true, enumerable: true, configurable: true })
 }
 
 /** dict.update(source): every own key of source, defined as defineKey did, so `__proto__` stays a key. */
-function updateDict(target: any, source: any): void {
+function updateDict(target: object, source: unknown): void {
   if (!isDict(source)) throw new TypeError('dict.update() needs a dict')
   for (const key of Object.keys(source)) defineKey(target, key, source[key])
 }
 
 /** dict.clear(). */
-function clearDict(d: any): void {
+function clearDict(d: Record<string, unknown>): void {
   for (const key of Object.keys(d)) delete d[key]
 }
 
 /** Python's int(value), for the whole numbers a configuration holds. */
-function pyInt(value: any): number {
+function pyInt(value: unknown): number {
   const n = Math.trunc(Number(value))
   if (!Number.isFinite(n)) throw new TypeError(`invalid int: ${value}`)
   return n
@@ -52,7 +37,7 @@ function pyInt(value: any): number {
 /** What the plugin's hooks last stored (`dsk configure --hook`): its options, the path of the file that holds
  * them, or its id. Empty when there is none. ~/.config/dsk/plugin.json only points at the options, which live in
  * the plugin's own data folder and go with it. */
-export function plugin(part: any = 'options'): any {
+export function plugin(part: 'options' | 'path' | 'id' = 'options'): any {
   try {
     const pointer = JSON.parse(fs.readFileSync(path.join(xdg('XDG_CONFIG_HOME', '~/.config'), 'plugin.json'), 'utf8'))
     if (part === 'id') return item(pointer, 'id')
@@ -67,9 +52,9 @@ export function plugin(part: any = 'options'): any {
 }
 
 /** Built-in defaults, then the plugin's options, then ~/.config/dsk/config.json. It names key variables, never keys. */
-export function config(): any {
+export function config(): Cfg {
   const cfg: Cfg = JSON.parse(JSON.stringify(DEFAULTS))
-  const opts: any = plugin()
+  const opts = plugin()
   if (truthy(get(opts, 'custom_base_url')) && truthy(get(opts, 'custom_model'))) {  // the plugin's `custom`: any OpenAI-compatible endpoint
     defineKey(item(cfg, 'profiles'), 'custom', {
       base_url: get(opts, 'custom_base_url'),
@@ -92,7 +77,7 @@ export function config(): any {
     // renamed: {old name: current name}, written by `dsk provider rename`. It renames a built-in or the plugin's
     // profile, which would otherwise come back under its first name, and lets a job started under an old name go on.
     const renamedValue = get(user, 'renamed')
-    const renamed: any = isDict(renamedValue) ? renamedValue : {}
+    const renamed = isDict(renamedValue) ? renamedValue : {}
     if (isDict(renamedValue)) delete user.renamed
     const profiles = item(cfg, 'profiles')
     for (const [old, now] of Object.entries(renamed)) {
@@ -103,7 +88,7 @@ export function config(): any {
       }
     }
     for (const nested of ['profiles', 'limits']) {
-      let part: any = {}
+      let part = {}
       if (has(user, nested)) {
         part = user[nested]
         delete user[nested]
@@ -123,9 +108,9 @@ export function config(): any {
 
 /** A key from the environment, else from ~/.config/dsk/env (lines like `export NAME='value'`), else from the
  * plugin's options, else "". A key read from a file never enters os.environ, so it cannot reach scripts, sh() or checks. */
-export function secret(name: any): any {
+export function secret(name: string): string {
   const fromEnv = process.env[String(name)]
-  if (truthy(fromEnv)) return fromEnv
+  if (fromEnv) return fromEnv
   let words: string[] = []
   try {
     const text = fs.readFileSync(path.join(xdg('XDG_CONFIG_HOME', '~/.config'), 'env'), 'utf8')
@@ -141,11 +126,11 @@ export function secret(name: any): any {
   const opts = plugin()
   const optionKey = get(OPTION_KEYS, String(name), null)
   const value = optionKey === null ? '' : get(opts, String(optionKey), '')
-  return truthy(value) ? value : ''
+  return truthy(value) ? value as string : ''
 }
 
 /** The block's key, or Fail when no place holds one. */
-export function apiKey(block: any): any {
+export function apiKey(block: { key_env: string }): string {
   const key = secret(item(block, 'key_env'))
   if (!truthy(key)) {
     throw new Fail(`${item(block, 'key_env')} is not set. In Claude Code, run /plugin configure ${plugin('id')} and ${SETUP}; or export it in ~/.config/dsk/env`)
@@ -154,7 +139,7 @@ export function apiKey(block: any): any {
 }
 
 /** The key for the official search and fetch tools, with its own message when the key that only they need is missing. */
-export function searchKey(cfg: Cfg): any {
+export function searchKey(cfg: Cfg): string {
   const block = item(cfg, 'search')
   const key = secret(item(block, 'key_env'))
   if (!truthy(key)) {
@@ -164,10 +149,10 @@ export function searchKey(cfg: Cfg): any {
 }
 
 /** (Whether the first provider on the route has its key, and what stands in the way or which provider it is.) */
-export function setup(cfg: Cfg): any {
+export function setup(cfg: Cfg): [boolean, string] {
   const opts = plugin(), first = item(cfg, 'route')[0]
   const profile = get(get(cfg, 'profiles', {}), first, {})
-  if (truthy(secret(get(profile, 'key_env', '')))) return [true, `${first} · ${item(profile, 'base_url')} · ${item(profile, 'model')}`]
+  if (truthy(secret(get(profile, 'key_env', '') ?? ''))) return [true, `${first} · ${item(profile, 'base_url')} · ${item(profile, 'model')}`]
   const need: string[] = []
   for (const [field, needLabel] of [['custom_base_url', 'endpoint URL'], ['custom_model', 'model name'], ['custom_api_key', 'API key']] as [string, string][]) {
     if (!truthy(get(opts, field))) need.push(needLabel)
@@ -179,7 +164,7 @@ export function setup(cfg: Cfg): any {
 
 /** (The slot file prefix, the limit) of profile `name`. Profiles that reach the same endpoint with the same key
  * share one set of slots, under the first one's name, limited by the smallest max_sessions any of them sets. */
-export function pool(cfg: Cfg, name: any): any {
+export function pool(cfg: Cfg, name: string): [string, number | null] {
   const profiles = item(cfg, 'profiles')
   const reach = (p: any): [string, any] => [(item(p, 'base_url') as string).replace(/\/+$/, ''), get(p, 'key_env') ?? null]
   const target = reach(item(profiles, name))
@@ -196,7 +181,7 @@ export function pool(cfg: Cfg, name: any): any {
 }
 
 /** Hold one of profile `name`'s max_sessions slots until this process exits. True if it has no limit. */
-export function claimSlot(cfg: Cfg, name: any): any {
+export function claimSlot(cfg: Cfg, name: string): boolean {
   const [key, limit] = pool(cfg, name) as [string, number | null]
   if (!limit || has(slots, key)) return true
   fs.mkdirSync(path.dirname(key), { recursive: true })

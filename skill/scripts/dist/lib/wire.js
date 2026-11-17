@@ -2,33 +2,11 @@
 // credit or a rate limit sets.
 const fs = process.getBuiltinModule('node:fs');
 const path = process.getBuiltinModule('node:path');
-import { PyFloat, Fail, Interrupted, STATE, checkInterrupt, cpHead, cpLen, dumps, fingerprint, get, has, now, onInterrupt, pyFloat, pyJson, sleep } from './base.js';
+import { PyFloat, Fail, Interrupted, STATE, checkInterrupt, cpHead, cpLen, dumps, fingerprint, get, has, now, onInterrupt, pyFloat, sleep, isDict, pyJsonAscii, pyRepr, truthy } from './base.js';
 import { compact } from './compaction.js';
 import { ALIASES, apiKey, claimSlot, pool, slots } from './config.js';
 import { MAX_TOKENS, NOT_SPENT, SLOT_POLL, SLOW, SPENT, TOOLS } from './texts.js';
 import { retries, transient } from './retry.js';
-/** Whether a parsed JSON value is a dict, as Python's isinstance(value, dict) asked. */
-function isDict(value) {
-    return value !== null && typeof value === 'object' && !Array.isArray(value);
-}
-/** Python's repr of a string, for str() of a dict that came from an error body. */
-function pyRepr(text) {
-    if (!text.includes("'"))
-        return "'" + text.replace(/\\/g, '\\\\').replace(/\n/g, '\\n').replace(/\r/g, '\\r').replace(/\t/g, '\\t') + "'";
-    if (!text.includes('"'))
-        return '"' + text.replace(/\\/g, '\\\\').replace(/\n/g, '\\n').replace(/\r/g, '\\r').replace(/\t/g, '\\t') + '"';
-    return "'" + text.replace(/\\/g, '\\\\').replace(/'/g, "\\'").replace(/\n/g, '\\n').replace(/\r/g, '\\r').replace(/\t/g, '\\t') + "'";
-}
-/** Python's bool() of a JSON-decoded value: empty strings, lists and dicts are false. */
-function pyTruthy(value) {
-    if (value === null || value === undefined || value === false || value === 0 || value === '')
-        return false;
-    if (Array.isArray(value))
-        return value.length > 0;
-    if (isDict(value))
-        return Object.keys(value).length > 0;
-    return true;
-}
 /** str() of a value as Python printed a JSON-decoded one: dicts with single quotes, None and booleans by name. */
 function pyStr(value) {
     if (value === null || value === undefined)
@@ -42,11 +20,11 @@ function pyStr(value) {
     if (Array.isArray(value))
         return '[' + value.map(pyStr).join(', ') + ']';
     if (typeof value === 'object') {
-        return '{' + Object.keys(value).map((k) => pyRepr(k) + ': ' + pyStr(value[k])).join(', ') + '}';
+        return '{' + Object.entries(value).map(([k, v]) => pyRepr(k) + ': ' + pyStr(v)).join(', ') + '}';
     }
     return String(value);
 }
-/** The last `n`-code-point prefix of `text`, as Python's wire[:prev["n"]] took it. */
+/** Python's "".join(parts): the parts as one text, raising as Python did when one of them is not a string. */
 function joined(parts) {
     for (const part of parts) {
         if (typeof part !== 'string')
@@ -54,7 +32,7 @@ function joined(parts) {
     }
     return parts.join('');
 }
-/** One non-exported value of a dict with a required key, raising as Python's c["key"] did. */
+/** d[key] of a dict that must hold the key, raising as Python's c["key"] did when it does not. */
 function need(value, key) {
     if (!isDict(value) || !has(value, key))
         throw new TypeError(`missing key ${key}`);
@@ -69,10 +47,15 @@ export function seriesMsgs(recs) {
         throw new Error('max() arg is an empty sequence');
     return recs.slice(start).filter((r) => r.t === 'msg');
 }
+/** The messages of the current series, as the next request sends them. */
 export function messages(recs) {
     return seriesMsgs(recs).map((r) => r.m);
 }
-/** The only place a chat request is serialized: fixed key order, one static tool, nothing volatile. `heat` is */
+/**
+ * The only place a chat request is serialized: fixed key order, one static tool, nothing volatile. `heat` is
+ * the temperature of a run without thinking: 0, except right after a reply that repeated itself (see HEAT).
+ * `tools=False` is the reviewer's request, which has neither the tool nor a tool_choice, and its own `max_tokens`.
+ */
 export function requestBody(profile, effort, msgs, heat = 0, tools = true, maxTokens = null) {
     const body = {
         model: profile.model, messages: msgs, tools: tools ? TOOLS : null,
@@ -115,7 +98,7 @@ async function readAll(stream) {
         chunks.push(Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk));
     return Buffer.concat(chunks);
 }
-/** A callback that fires when the socket has been idle for `ms` milliseconds. */
+/** The error of a socket that sent nothing for its timeout, as Python's socket.timeout was: its code names it. */
 function timeoutError() {
     const error = new Error('timed out');
     error.code = 'ETIMEDOUT';
@@ -129,19 +112,14 @@ function request(url, payload, headers, timeoutMs) {
         // node:http also loads undici and http2 (60 internal modules, about 10 ms) for every other command.
         const mod = process.getBuiltinModule(target.protocol === 'https:' ? 'node:https' : 'node:http');
         let response = null;
-        let req;
-        const off = onInterrupt(() => {
-            if (response)
-                response.interrupted = true;
-            req.destroy(new Interrupted());
-        });
+        let off = () => { };
         // The `timeout` option, not req.setTimeout(): it is set on the socket before it connects, so a connection that
         // never opens fails after the same time a silent one does, as Python's socket timeout did. setTimeout() starts
         // only once the socket has connected, and a blackholed address then waited for the system's own limit.
-        req = mod.request(target, { method: 'POST', headers, timeout: timeoutMs }, (res) => {
+        const req = mod.request(target, { method: 'POST', headers, timeout: timeoutMs }, (res) => {
             response = res;
             res.timedOut = false;
-            resolve({ status: res.statusCode || 0, res, off });
+            resolve({ status: res.statusCode || 0, res, off: () => off() });
         });
         req.on('timeout', () => {
             if (response)
@@ -149,7 +127,14 @@ function request(url, payload, headers, timeoutMs) {
             req.destroy(timeoutError());
         });
         req.on('error', (error) => { off(); reject(error); });
-        req.end(payload);
+        // Only now that there is a request to end: a signal that came before this call runs the handler at once.
+        off = onInterrupt(() => {
+            if (response)
+                response.interrupted = true;
+            req.destroy(new Interrupted());
+        });
+        if (!req.destroyed)
+            req.end(payload);
     });
 }
 /** The type name Python's except clause printed for a network or parsing failure. */
@@ -173,7 +158,10 @@ function errorText(error) {
     const message = error && error.message !== undefined ? String(error.message) : String(error);
     return name === 'URLError' ? `${name}: <urlopen error ${message}>` : `${name}: ${message}`;
 }
-/** One POST. Returns (status, parsed JSON) on success, else (status, error text); status 0 is a network failure. */
+/**
+ * One POST. Returns (status, parsed JSON) on success, else (status, error text); status 0 is a network failure.
+ * A streamed reply is rebuilt from its server-sent events, with the seconds its first data took as `_first`.
+ */
 export async function send(url, key, payload, extra = null, timeout = 600, idle = null, deadline = null) {
     const headers = {
         Authorization: 'Bearer ' + key, 'Content-Type': 'application/json', 'User-Agent': 'dsk', ...(extra || {}),
@@ -236,7 +224,11 @@ async function* lines(stream) {
     if (buffer.length)
         yield decoder.decode(buffer);
 }
-/** The reply a JSON response would carry, rebuilt from a stream's events: joined text, calls by index, the last */
+/**
+ * The reply a JSON response would carry, rebuilt from a stream's events: joined text, calls by index, the last
+ * finish_reason and the usage chunk. A stream that fails gives [status, why] instead: an error event, or an end
+ * with neither a finish_reason nor [DONE].
+ */
 export async function sse(r, began, deadline) {
     const content = [];
     const thoughts = {};
@@ -268,35 +260,35 @@ export async function sse(r, began, deadline) {
         const chunk = JSON.parse(data);
         if (first === null)
             first = now() - began;
-        if (event === 'error' && !(isDict(chunk) && pyTruthy(chunk.error))) {
+        if (event === 'error' && !(isDict(chunk) && truthy(chunk.error))) {
             return [502, cpHead(pyStr(chunk), 300)];
         }
         if (!isDict(chunk))
             return [0, 'not an event object: ' + cpHead(data, 200)];
-        if (pyTruthy(chunk.error)) {
+        if (truthy(chunk.error)) {
             const error = chunk.error;
             const code = isDict(error) ? error.code : null;
             const status = typeof code === 'number' && Number.isInteger(code) && code >= 400 && code <= 599 ? code : 502;
             return [status, cpHead(pyStr(error), 300)];
         }
-        if (pyTruthy(chunk.usage))
+        if (truthy(chunk.usage))
             usage = chunk.usage;
-        if (pyTruthy(chunk.choices))
+        if (truthy(chunk.choices))
             for (const choice of chunk.choices) {
                 if (!isDict(choice))
                     throw new TypeError("'object' has no attribute 'get'");
-                const delta = pyTruthy(choice.delta) ? choice.delta : (pyTruthy(choice.message) ? choice.message : {});
+                const delta = truthy(choice.delta) ? choice.delta : (truthy(choice.message) ? choice.message : {});
                 if (!isDict(delta))
                     throw new TypeError("'object' has no attribute 'get'");
-                content.push(pyTruthy(delta.content) ? delta.content : '');
+                content.push(truthy(delta.content) ? delta.content : '');
                 for (const field of ['reasoning_content', 'reasoning']) {
-                    if (pyTruthy(delta[field])) {
+                    if (truthy(delta[field])) {
                         if (!has(thoughts, field))
                             thoughts[field] = [];
                         thoughts[field].push(delta[field]);
                     }
                 }
-                const toolCalls = pyTruthy(delta.tool_calls) ? delta.tool_calls : [];
+                const toolCalls = truthy(delta.tool_calls) ? delta.tool_calls : [];
                 if (!Array.isArray(toolCalls))
                     throw new TypeError("'object' is not iterable as calls");
                 toolCalls.forEach((call, n) => {
@@ -308,15 +300,15 @@ export async function sse(r, began, deadline) {
                         slot = {};
                         calls.set(key, slot);
                     }
-                    slot.id = pyTruthy(slot.id) ? slot.id : call.id;
-                    slot.type = pyTruthy(slot.type) ? slot.type : (pyTruthy(call.type) ? call.type : 'function');
-                    const fn = pyTruthy(call.function) ? call.function : {};
+                    slot.id = truthy(slot.id) ? slot.id : call.id;
+                    slot.type = truthy(slot.type) ? slot.type : (truthy(call.type) ? call.type : 'function');
+                    const fn = truthy(call.function) ? call.function : {};
                     if (!isDict(fn))
                         throw new TypeError("'object' has no attribute 'get'");
-                    slot.name = pyTruthy(slot.name) ? slot.name : fn.name;
-                    slot.arguments = get(slot, 'arguments', '') + (pyTruthy(fn.arguments) ? fn.arguments : '');
+                    slot.name = truthy(slot.name) ? slot.name : fn.name;
+                    slot.arguments = get(slot, 'arguments', '') + (truthy(fn.arguments) ? fn.arguments : '');
                 });
-                finish = pyTruthy(choice.finish_reason) ? choice.finish_reason : finish;
+                finish = truthy(choice.finish_reason) ? choice.finish_reason : finish;
             }
         if (deadline !== null && now() - began > deadline) {
             finish = 'length';
@@ -349,7 +341,10 @@ export async function sse(r, began, deadline) {
 }
 // transient() and the retry decision are lib/retry.ts's, whose laws gdp-wired proves.
 export { transient } from './retry.js';
-/** POST with backoff on transient failures. Every retry sends the identical bytes. When not `patient`, a */
+/**
+ * POST with backoff on transient failures. Every retry sends the identical bytes. When not `patient`, a
+ * failure that took more than SLOW seconds to arrive is returned at once, for the caller to try another profile.
+ */
 export async function post(url, key, payload, backoff, headers = null, patient = true, idle = null, deadline = null) {
     for (const wait of [...backoff, null]) {
         const began = now();
@@ -363,8 +358,9 @@ export async function post(url, key, payload, backoff, headers = null, patient =
         if (!retries(status, spent(status, data), wait === null, Boolean(patient), now() - began > SLOW)) {
             return [status, data];
         }
-        await sleep(wait);
+        await sleep(wait ?? 0);
     }
+    throw new Fail('bug: the last try of a request was retried'); // retries() never says so of the last one (lib/retry.ts)
 }
 /** The profile's `headers`, with {session} replaced by a value that stays the same for the whole run. */
 export function headers(profile, session) {
@@ -392,10 +388,6 @@ export function paused(name) {
         return 0;
     }
 }
-/** Python's json.dump() for the pause file: the default ensure_ascii escapes every non-ASCII code unit. */
-function pyJsonAscii(value) {
-    return pyJson(value).replace(/[\u0080-\uffff]/g, (ch) => '\\u' + ch.charCodeAt(0).toString(16).padStart(4, '0'));
-}
 /** Pause `name` until the reset time its error names, if within a week, else for its `pause_hours` (default 1). */
 export function pause(cfg, name, data) {
     const nowSeconds = now();
@@ -419,11 +411,11 @@ export function pause(cfg, name, data) {
 export function replayable(message, effort) {
     if (!isDict(message))
         throw new TypeError("'object' has no attribute 'get'");
-    const reply = { role: 'assistant', content: pyTruthy(message.content) ? message.content : '' };
-    const thought = pyTruthy(message.reasoning_content) ? message.reasoning_content : message.reasoning;
-    if (pyTruthy(thought) && effort !== 'off')
+    const reply = { role: 'assistant', content: truthy(message.content) ? message.content : '' };
+    const thought = truthy(message.reasoning_content) ? message.reasoning_content : message.reasoning;
+    if (truthy(thought) && effort !== 'off')
         reply.reasoning_content = thought;
-    if (pyTruthy(message.tool_calls)) {
+    if (truthy(message.tool_calls)) {
         reply.tool_calls = message.tool_calls.map((c) => ({
             id: need(c, 'id'), type: 'function',
             function: { name: need(need(c, 'function'), 'name'), arguments: need(c.function, 'arguments') },
@@ -431,7 +423,11 @@ export function replayable(message, effort) {
     }
     return reply;
 }
-/** The profiles a session may still move to: the rest of its route, less any removed since it started (`dsk */
+/**
+ * The profiles a session may still move to: the rest of its route, less any removed since it started (`dsk
+ * provider remove`). None is left when the lead chose its profile with --profile on reject, answer or continue: like
+ * `dsk run --profile`, that holds the session there. Its route is named as when it started: renames count.
+ */
 export function laterProfiles(s, cfg) {
     const route = s.head.route.map((n) => get(ALIASES, n, n));
     const moved = [...s.of('series')].reverse().find((r) => r.why === 'failover') || null;

@@ -11,6 +11,7 @@
     "erasableSyntaxOnly": true,
     "verbatimModuleSyntax": true,
     "noFallthroughCasesInSwitch": true,
+    "noUnusedLocals": true,
     "skipLibCheck": true
   },
   "include": ["dsk.ts", "lib/*.ts"]

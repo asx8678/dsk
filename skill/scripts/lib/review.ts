@@ -2,21 +2,13 @@
 // file.
 const fs = process.getBuiltinModule('node:fs')
 const path = process.getBuiltinModule('node:path')
-import { Fail, cpHead, cpLen, fixed, format, get, has, now, pyJson, pyRound } from './base.ts'
+import { Fail, cpHead, cpLen, fixed, format, get, has, now, pyJson, pyRound, isDict, splitLines } from './base.ts'
 import { apiKey, claimSlot } from './config.ts'
 import { changes, git, scope } from './gates.ts'
 import { FINDING, MAX_FINDINGS, NO_FIX, RECHECK, RECHECK_DIFF, RECHECK_LONG, REVIEWER, REVIEWER_FINDINGS, SEVERITY } from './texts.ts'
 import { headers, post, requestBody } from './wire.ts'
-import type { Cfg } from './base.ts'
+import type { Cfg, Changed, Rec } from './base.ts'
 import type { Session } from './session.ts'
-
-/** Python's str.splitlines(): a trailing newline does not add an empty last line. */
-function splitLines(text: string): string[] {
-  if (!text) return []
-  const lines = text.split(/\r\n|[\n\r\v\f\x1c-\x1e\x85\u2028\u2029]/u)
-  if (lines[lines.length - 1] === '') lines.pop()
-  return lines
-}
 
 /** Python's idea of whitespace, for str.split() and str.strip(): U+200B is not one; U+001C-U+001F and U+0085 are. */
 const PY_SPACE = /[\t\n\v\f\r\x1c-\x1f \x85\xa0\u1680\u2000-\u200a\u2028\u2029\u202f\u205f\u3000]+/u
@@ -37,11 +29,6 @@ function pyStrip(text: string): string {
 /** text.rstrip("\n"): drop the newlines at the end, and only there. */
 function withoutEndNewlines(text: string): string {
   return text.replace(/\n+$/, '')
-}
-
-/** Python's isinstance(value, dict), for a value that came out of JSON. */
-function isDict(value: any): boolean {
-  return typeof value === 'object' && value !== null && !Array.isArray(value)
 }
 
 /** json.JSONDecoder().raw_decode(text, at) for an object at `at`: the value and the index just past it. */
@@ -65,14 +52,17 @@ function rawDecode(text: string, at: number): [any, number] {
   throw new Error('unterminated JSON value')
 }
 
+/** One finding of the reviewer that dsk could check: its id (R1-F2), the line its quote starts on, and the fields the reviewer gave. */
+export type Finding = { id: string; line: number; severity: string; path: string; quote: string; input: string; expected: string; actual: string; fix: string }
+
 /** After a done() whose checks pass: the text that sends the hand-in back for a second look, or '' when none is due.
  * One per round, and only for a change: an answer has no diff to check. `over` is the limit the round has reached, if
  * any: a hand-in that passes must not end as `limit` because dsk asked for one more turn. */
-export function secondLook(s: Session, cfg: Cfg, turn: any, over: any): any {
+export function secondLook(s: Session, cfg: Cfg, turn: number, over: string): string {
   const terms = scope(s)
   if (!get(terms, 'recheck') || s.since('round', 'recheck').length) return ''
   const [end, changed] = changes(s)
-  if (!changed.length) return ''
+  if (!changed.length || end === null) return ''  // no tree, no change: there is nothing to look at
   if (s.head['effort'] === 'off') { // the second look happens in the worker's reasoning, and a run without thinking has none
     s.add('recheck', { turn, skipped: 'thinking is off' })
     return ''
@@ -86,7 +76,7 @@ export function secondLook(s: Session, cfg: Cfg, turn: any, over: any): any {
   const diff = git(s.head['root'], ['diff', '--no-renames', terms['start'], end, '--',
     ...paths.map((p: string) => ':(literal)' + p)])
   // Half the window at most, as for the attached files: the conversation still has to fit beside it.
-  const profile = get((cfg as any)['profiles'], s.profile)
+  const profile = get(cfg['profiles'], s.profile)
   const fits = cpLen(diff) <= Math.floor((get(profile, 'compact_at', 32000) as number) * 3 / 2)
   const shown = fits ? format(RECHECK_DIFF, { diff: withoutEndNewlines(diff) })
     : format(RECHECK_LONG, { lines: splitLines(diff).length, files: paths.join(', ') })
@@ -96,13 +86,13 @@ export function secondLook(s: Session, cfg: Cfg, turn: any, over: any): any {
 /** The second look of the round in flight, measured from the log: null when none was due, else the turn it was asked
  * after or why it was skipped, the characters of reasoning in the reply that followed (null before there is one), and
  * the worker's files that changed after it. */
-export function rechecked(s: Session): any {
+export function rechecked(s: Session): { turn: number; skipped: string; reasoning: number | null; changed: string[] } | null {
   const marks = s.of('round').length ? s.since('round', 'recheck') : []
   const asked = marks.length ? marks[0] : null
   if (!asked) return null
   const st = s.last('state')
-  const found: any = s.of('msg').find((r: any) => r['turn'] === asked['turn'] + 1 && r['m']['role'] === 'assistant') ?? null
-  const reply: any = found === null ? null : found['m']
+  const found = s.of('msg').find((r: any) => r['turn'] === asked['turn'] + 1 && r['m']['role'] === 'assistant') ?? null
+  const reply = found === null ? null : found['m']
   // What the second look changed ends where the reviewer, if any, took over.
   const until = s.since('round', 'reviewer').find((r: any) => get(r, 'tree'))?.['tree'] || get(st, 'end')
   const moved = new Set<string>()
@@ -111,16 +101,16 @@ export function rechecked(s: Session): any {
   }
   return {
     turn: asked['turn'],
-    skipped: get(asked, 'skipped', ''),
+    skipped: get(asked, 'skipped', '') ?? '',
     reasoning: reply === null ? null : cpLen(get(reply, 'reasoning_content') || ''),
     changed: (get(st, 'changed') || []).map((entry: any[]) => entry[2]).filter((p: string) => moved.has(p)),
   }
 }
 
 /** A file's text in a tree object, or null when the tree has no such file. */
-export function blob(root: any, treeId: any, path: any): any {
+export function blob(root: string, treeId: string, file: string): string | null {
   try {
-    return git(root, ['show', `${treeId}:${path}`])
+    return git(root, ['show', `${treeId}:${file}`])
   } catch (e) {
     if (e instanceof Fail) return null
     throw e
@@ -129,7 +119,7 @@ export function blob(root: any, treeId: any, path: any): any {
 
 /** The line where `quote` starts in `text`, with every run of whitespace compared as one space, or null. The reviewer
  * names no line numbers: models miscount them, so dsk finds the line itself. */
-export function locate(text: any, quote: any): any {
+export function locate(text: string, quote: string): number | null {
   const want = folded(quote)
   let flat = '', flatCp = 0
   const starts: [number, number][] = []
@@ -150,7 +140,7 @@ export function locate(text: any, quote: any): any {
 }
 
 /** The one JSON object a reply holds, with or without a code fence around it, or null. */
-export function jsonObject(text: any): any {
+export function jsonObject(text: string | null): Record<string, any> | null {
   const body = pyStrip(text || '')
   const first = body.indexOf('{'), last = body.lastIndexOf('}')
   if (!(0 <= first && first < last)) return null
@@ -164,7 +154,7 @@ export function jsonObject(text: any): any {
 
 /** The list of findings in a reviewer's reply, or, when the reply broke off inside that list, every finding that
  * arrived whole. null when the reply has no such list. */
-export function findingsIn(text: any): any {
+export function findingsIn(text: string | null): any[] | null {
   const whole = jsonObject(text)
   if (whole !== null) {
     const findings = get(whole, 'findings')
@@ -173,7 +163,7 @@ export function findingsIn(text: any): any {
   const body = text || ''
   const start = /"findings"\s*:\s*\[/.exec(body)
   if (!start) return null
-  const found: any[] = []
+  const found = []
   let at = start.index + start[0].length
   while (true) {
     while (at < body.length && ' \t\r\n,'.includes(body[at])) at++
@@ -189,7 +179,7 @@ export function findingsIn(text: any): any {
 }
 
 /** Findings as the worker gets them: what to do with them, then each one with its proof. */
-export function findingsText(findings: any): any {
+export function findingsText(findings: Finding[]): string {
   const out = [REVIEWER_FINDINGS]
   for (const f of findings) {
     out.push(`${f['id']} ${f['severity']} ${f['path']}:${f['line']}: ${f['quote']}`, `  input: ${f['input']}`,
@@ -202,10 +192,10 @@ export function findingsText(findings: any): any {
  * attached files, the diff, the whole text of each changed file that is not new, and from the second review on the
  * findings sent back before, with the author's answer. Whole files only, while the message fits the profile's window
  * at 3 characters a token. Returns [text, [the files left out]], or [null, why] when the diff alone is too big. */
-export function reviewInput(s: Session, cfg: Cfg, end: any, changed: any, prior: any, answer: any): any {
+export function reviewInput(s: Session, cfg: Cfg, end: string, changed: Changed[], prior: Finding[], answer: Rec | null): [string, string[]] | [null, string] {
   const head = s.head, root = head['root'], terms = scope(s)
   const start = terms['start']
-  const profile = get((cfg as any)['profiles'], s.profile)
+  const profile = get(cfg['profiles'], s.profile)
   const cap = (get(profile, 'compact_at', 32000) as number) * 3
   const rejected = s.last('base', 'reject')
   const parts = ['## Task\n' + (get(terms, 'task') || head['brief'])]
@@ -252,26 +242,26 @@ export function reviewInput(s: Session, cfg: Cfg, end: any, changed: any, prior:
 /** The findings dsk can check, each with an id and the line its quote starts on, and how many it dropped: a finding
  * needs a known severity, a file of the change, every field filled in, and a quote that is in that file. A finding at
  * a place already reported, one whose fix is no fix (NO_FIX), and any past the first MAX_FINDINGS, is dropped too. */
-export function checkedFindings(s: Session, end: any, changed: any, raw: any, number: any): any {
+export function checkedFindings(s: Session, end: string, changed: Changed[], raw: any[], number: number): [Finding[], number] {
   const texts = new Map<string, string>()
   for (const [added, , p] of changed) {
     const text = added === '-' ? null : blob(s.head['root'], end, p)
     if (text !== null) texts.set(p, text)
   }
-  const kept: any[] = [], places = new Set<string>()
+  const kept = [], places = new Set<string>()
   let dropped = 0
   for (const f of raw) {
     const path = get(f, 'path') as string
     const ok = isDict(f) && SEVERITY.includes(get(f, 'severity')) && texts.has(path)
       && FINDING.every((k: string) => typeof get(f, k) === 'string' && pyStrip(get(f, k) as string))
       && !NO_FIX.has(folded((get(f, 'fix') as string).toLowerCase()).replace(/^[ .]+/, '').replace(/[ .]+$/, ''))
-    const line = ok ? locate(texts.get(path), get(f, 'quote') as string) : null
+    const line = ok ? locate(texts.get(path)!, get(f, 'quote') as string) : null
     const place = line && JSON.stringify([path, folded(get(f, 'quote') as string)])
     if (!line || (place && places.has(place)) || kept.length === MAX_FINDINGS) {
       dropped++
       continue
     }
-    places.add(place)
+    places.add(place as string)  // a line was found, so the place is its text
     const found: any = { id: `R${number}-F${kept.length + 1}` }
     for (const k of FINDING) found[k] = cpHead(folded(get(f, k) as string), 500)
     found['line'] = line
@@ -285,12 +275,12 @@ export function checkedFindings(s: Session, end: any, changed: any, raw: any, nu
  * hand in. A review that fails (an HTTP error, a reply cut off at reviewer_seconds, a reply that is not one JSON object)
  * is recorded and the hand-in goes ahead: the reviewer adds a check, it cannot fail a run by itself. The call is logged
  * as a `reviewer` record, never as msg, req or usage: those are the worker's series. */
-export async function independentReview(s: Session, cfg: Cfg, turn: any, over: any, done: any): Promise<any> {
+export async function independentReview(s: Session, cfg: Cfg, turn: number, over: string, done: Rec): Promise<string> {
   if (!get(scope(s), 'reviewer')) return ''
   const calls = s.since('round', 'reviewer')
   if (calls.length >= (get(cfg, 'reviewer_calls', 2) as number) || calls.some((r: any) => has(r, 'skipped'))) return ''
   const [end, changed] = changes(s)
-  if (!changed.length) return ''
+  if (!changed.length || end === null) return ''  // no tree, no change: there is nothing to look at
   if (over) {
     s.add('reviewer', { turn, skipped: `no ${over} left` })
     return ''
@@ -298,7 +288,7 @@ export async function independentReview(s: Session, cfg: Cfg, turn: any, over: a
   const prior: any[] = []
   for (const r of calls) for (const f of get(r, 'findings', []) as any[]) if (f['severity'] !== 'minor') prior.push(f)
   const [text, left] = reviewInput(s, cfg, end, changed, prior, done)
-  const name = s.profile, profile = get((cfg as any)['profiles'], name), effort = get(cfg, 'reviewer_effort', 'low')
+  const name = s.profile, profile = get(cfg['profiles'], name), effort: string = get(cfg, 'reviewer_effort', 'low') ?? 'low'
   if (text === null || !claimSlot(cfg, name)) { // the process holds a slot there already, unless a failover moved it
     s.add('reviewer', { turn, skipped: text === null ? left : `no free slot on ${name}` })
     return ''
@@ -307,10 +297,10 @@ export async function independentReview(s: Session, cfg: Cfg, turn: any, over: a
   s.add('doing', { turn, arg: `independent review on ${name}`, review: true })
   const msgs = [{ role: 'system', content: REVIEWER }, { role: 'user', content: text }]
   const [status, data] = await post(profile['base_url'].replace(/\/+$/, '') + '/chat/completions', apiKey(profile),
-    requestBody(profile, effort, msgs, 0, false, get(cfg, 'reviewer_tokens', 4000)), (cfg as any)['backoff'],
-    headers(profile, `dsk-${s.id}-reviewer`), false, (cfg as any)['limits']['idle_seconds'],
-    (cfg as any)['limits']['reviewer_seconds'])
-  const rec: any = {
+    requestBody(profile, effort, msgs, 0, false, get(cfg, 'reviewer_tokens', 4000)), cfg['backoff'],
+    headers(profile, `dsk-${s.id}-reviewer`), false, cfg['limits']['idle_seconds'],
+    cfg['limits']['reviewer_seconds'])
+  const rec = {
     turn, tree: end, profile: name, effort, seconds: pyRound(now() - began, 1), chars: cpLen(text), left_out: left,
   }
   if (status !== 200) {
@@ -351,7 +341,7 @@ export async function independentReview(s: Session, cfg: Cfg, turn: any, over: a
 
 /** The independent reviews of the round in flight, measured from the log: null when none was due, else each call as
  * recorded, and of the findings sent back, those whose quote is still in the file at the last stop. */
-export function reviewed(s: Session): any {
+export function reviewed(s: Session): { calls: Record<string, any>[]; sent: string[]; still_there: string[] } | null {
   const calls = s.of('round').length ? s.since('round', 'reviewer') : []
   if (!calls.length) return null
   const st = s.last('state'), root = s.head['root']

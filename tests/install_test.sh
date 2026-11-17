@@ -88,6 +88,17 @@ cp "$home/.local/bin/dsk" "$home/foreign"
 install_dsk --local
 cmp -s "$home/foreign" "$home/.local/bin/dsk" || fail "--local replaced ~/.local/bin/dsk, which install.sh did not write"
 
+# 6b. Nor a link install.sh did not make: to the user's own dsk, or one that points nowhere. --uninstall leaves both too.
+for aim in "$home/foreign" "$home/nowhere"; do
+    ln -sf "$aim" "$home/.local/bin/dsk"
+    install_dsk --local
+    [ "$(readlink "$home/.local/bin/dsk")" = "$aim" ] || fail "--local replaced a link to $aim, which install.sh did not make"
+    install_dsk --uninstall
+    [ "$(readlink "$home/.local/bin/dsk")" = "$aim" ] || fail "--uninstall removed a link to $aim, which install.sh did not make"
+done
+[ ! -e "$home/nowhere" ] || fail "install.sh wrote through a link that pointed nowhere"
+grep -q 'echo not dsk' "$home/foreign" || fail "install.sh wrote through a link to the user's own dsk"
+
 # 7. An argument that is not a mode prints the usage and exits 2.
 status=0
 HOME="$home" "$checkout/install.sh" --nonsense >/dev/null 2>&1 || status=$?

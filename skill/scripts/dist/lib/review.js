@@ -2,20 +2,11 @@
 // file.
 const fs = process.getBuiltinModule('node:fs');
 const path = process.getBuiltinModule('node:path');
-import { Fail, cpHead, cpLen, fixed, format, get, has, now, pyJson, pyRound } from './base.js';
+import { Fail, cpHead, cpLen, fixed, format, get, has, now, pyJson, pyRound, isDict, splitLines } from './base.js';
 import { apiKey, claimSlot } from './config.js';
 import { changes, git, scope } from './gates.js';
 import { FINDING, MAX_FINDINGS, NO_FIX, RECHECK, RECHECK_DIFF, RECHECK_LONG, REVIEWER, REVIEWER_FINDINGS, SEVERITY } from './texts.js';
 import { headers, post, requestBody } from './wire.js';
-/** Python's str.splitlines(): a trailing newline does not add an empty last line. */
-function splitLines(text) {
-    if (!text)
-        return [];
-    const lines = text.split(/\r\n|[\n\r\v\f\x1c-\x1e\x85\u2028\u2029]/u);
-    if (lines[lines.length - 1] === '')
-        lines.pop();
-    return lines;
-}
 /** Python's idea of whitespace, for str.split() and str.strip(): U+200B is not one; U+001C-U+001F and U+0085 are. */
 const PY_SPACE = /[\t\n\v\f\r\x1c-\x1f \x85\xa0\u1680\u2000-\u200a\u2028\u2029\u202f\u205f\u3000]+/u;
 /** Python's " ".join(text.split()): every run of whitespace becomes one space, with no ends. */
@@ -34,10 +25,6 @@ function pyStrip(text) {
 /** text.rstrip("\n"): drop the newlines at the end, and only there. */
 function withoutEndNewlines(text) {
     return text.replace(/\n+$/, '');
-}
-/** Python's isinstance(value, dict), for a value that came out of JSON. */
-function isDict(value) {
-    return typeof value === 'object' && value !== null && !Array.isArray(value);
 }
 /** json.JSONDecoder().raw_decode(text, at) for an object at `at`: the value and the index just past it. */
 function rawDecode(text, at) {
@@ -73,8 +60,8 @@ export function secondLook(s, cfg, turn, over) {
     if (!get(terms, 'recheck') || s.since('round', 'recheck').length)
         return '';
     const [end, changed] = changes(s);
-    if (!changed.length)
-        return '';
+    if (!changed.length || end === null)
+        return ''; // no tree, no change: there is nothing to look at
     if (s.head['effort'] === 'off') { // the second look happens in the worker's reasoning, and a run without thinking has none
         s.add('recheck', { turn, skipped: 'thinking is off' });
         return '';
@@ -114,15 +101,15 @@ export function rechecked(s) {
     }
     return {
         turn: asked['turn'],
-        skipped: get(asked, 'skipped', ''),
+        skipped: get(asked, 'skipped', '') ?? '',
         reasoning: reply === null ? null : cpLen(get(reply, 'reasoning_content') || ''),
         changed: (get(st, 'changed') || []).map((entry) => entry[2]).filter((p) => moved.has(p)),
     };
 }
 /** A file's text in a tree object, or null when the tree has no such file. */
-export function blob(root, treeId, path) {
+export function blob(root, treeId, file) {
     try {
-        return git(root, ['show', `${treeId}:${path}`]);
+        return git(root, ['show', `${treeId}:${file}`]);
     }
     catch (e) {
         if (e instanceof Fail)
@@ -283,7 +270,7 @@ export function checkedFindings(s, end, changed, raw, number) {
             dropped++;
             continue;
         }
-        places.add(place);
+        places.add(place); // a line was found, so the place is its text
         const found = { id: `R${number}-F${kept.length + 1}` };
         for (const k of FINDING)
             found[k] = cpHead(folded(get(f, k)), 500);
@@ -304,8 +291,8 @@ export async function independentReview(s, cfg, turn, over, done) {
     if (calls.length >= get(cfg, 'reviewer_calls', 2) || calls.some((r) => has(r, 'skipped')))
         return '';
     const [end, changed] = changes(s);
-    if (!changed.length)
-        return '';
+    if (!changed.length || end === null)
+        return ''; // no tree, no change: there is nothing to look at
     if (over) {
         s.add('reviewer', { turn, skipped: `no ${over} left` });
         return '';
@@ -316,7 +303,7 @@ export async function independentReview(s, cfg, turn, over, done) {
             if (f['severity'] !== 'minor')
                 prior.push(f);
     const [text, left] = reviewInput(s, cfg, end, changed, prior, done);
-    const name = s.profile, profile = get(cfg['profiles'], name), effort = get(cfg, 'reviewer_effort', 'low');
+    const name = s.profile, profile = get(cfg['profiles'], name), effort = get(cfg, 'reviewer_effort', 'low') ?? 'low';
     if (text === null || !claimSlot(cfg, name)) { // the process holds a slot there already, unless a failover moved it
         s.add('reviewer', { turn, skipped: text === null ? left : `no free slot on ${name}` });
         return '';

@@ -2,17 +2,12 @@
 const fs = process.getBuiltinModule('node:fs');
 const os = process.getBuiltinModule('node:os');
 const path = process.getBuiltinModule('node:path');
-import { Fail, G, Interrupted, RUNNER, SCRIPTS, STATE, checkInterrupt, comma, cpHead, cpLen, dumps, eprint, exitStatus, expandUser, fingerprint, fixed, flock, flockWait, fmtPercent, format, get, has, interruptOnSignals, killGroup, now, onInterrupt, print, pyFloat, pyJson, pyRound, pythonPath, readFd, runSync, sha256, shell, shlexQuote, shlexSplit, sleep, tempFile, tokenHex, write, xdg } from './base.js';
+import { Interrupted, RUNNER, checkInterrupt, cpHead, dumps, exitStatus, get, has, killGroup, now, onInterrupt, pythonPath, sha256, isOsError } from './base.js';
 import { searchKey } from './config.js';
 import { scope } from './gates.js';
 import { sandboxed } from './sandbox.js';
-import { job } from './stats.js';
 import { SECRET } from './texts.js';
 import { post } from './wire.js';
-/** Python's except OSError: a Node system error carries a string code (ENOENT, EPIPE...). */
-function isOsError(e) {
-    return typeof e === 'object' && e !== null && typeof e.code === 'string';
-}
 /** The environment for scripts, sh() and checks: mine, minus everything that looks like a credential. */
 export function cleanEnv(cfg, sdir) {
     const keys = new Set();

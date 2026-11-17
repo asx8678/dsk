@@ -1,9 +1,8 @@
 // The commands that start and drive a session (run, answer, continue, show, wait, bench), and resume(), which
 // refuses a command the session's state does not admit.
 const fs = process.getBuiltinModule('node:fs');
-const os = process.getBuiltinModule('node:os');
 const path = process.getBuiltinModule('node:path');
-import { Fail, G, Interrupted, RUNNER, SCRIPTS, STATE, checkInterrupt, comma, cpHead, cpLen, dumps, eprint, exitStatus, expandUser, fingerprint, fixed, flock, flockWait, fmtPercent, format, get, has, interruptOnSignals, killGroup, now, onInterrupt, print, pyFloat, pyJson, pyRound, pythonPath, readFd, runSync, sha256, shell, shlexQuote, shlexSplit, sleep, tempFile, tokenHex, write, xdg } from './base.js';
+import { Fail, G, Interrupted, STATE, dumps, eprint, flock, get, has, now, print, runSync, sleep, isOsError, pyRepr, relPath } from './base.js';
 import { makeWorktree, refuseIgnored, removeWorktree, treeLock } from './accept.js';
 import { apiKey, searchKey } from './config.js';
 import { answerText, changes, halt, scope, settle, snapshot, tree } from './gates.js';
@@ -12,7 +11,7 @@ import { report, reportJson, turnLine, workerDiff } from './reports.js';
 import { sandboxMode } from './sandbox.js';
 import { Session } from './session.js';
 import { bench, fastOrder, orderedRoute, speedText } from './speed.js';
-import { sessions } from './stats.js';
+import { autoPrune, sessions } from './stats.js';
 import { EXIT, MAX_TOKENS, SYSTEM } from './texts.js';
 import { STATUSES, admits } from './lifecycle.js';
 /** Remove a tree as shutil.rmtree(path, ignore_errors=True) did: failures to delete are not failures of the caller. */
@@ -21,7 +20,7 @@ function rmTree(dir) {
         fs.rmSync(dir, { recursive: true, force: true });
     }
     catch (e) {
-        if (typeof e?.code !== 'string')
+        if (!isOsError(e))
             throw e;
     }
 }
@@ -31,7 +30,7 @@ function isFile(p) {
         return fs.statSync(p).isFile();
     }
     catch (e) {
-        if (typeof e?.code === 'string')
+        if (isOsError(e))
             return false;
         throw e;
     }
@@ -42,15 +41,10 @@ function isDir(p) {
         return fs.statSync(p).isDirectory();
     }
     catch (e) {
-        if (typeof e?.code === 'string')
+        if (isOsError(e))
             return false;
         throw e;
     }
-}
-/** os.path.relpath(target, base), where Python says "." for the base itself and Node says "". */
-function relPath(target, base) {
-    const rel = path.relative(path.resolve(base), path.resolve(target));
-    return rel === '' ? '.' : rel;
 }
 /** The lines of a text as Python readlines() gave them: each keeps its newline, and the last may have none. */
 function linesOf(text) {
@@ -69,37 +63,6 @@ function errorText(e) {
 function errorName(e) {
     return e && typeof e === 'object' && e.constructor && typeof e.constructor.name === 'string' && e.constructor.name
         ? e.constructor.name : typeof e;
-}
-/** Python's repr() of a config value, as the effort error prints it: quotes for text, None and True/False as Python did. */
-function pyRepr(value) {
-    if (value === null || value === undefined)
-        return 'None';
-    if (value === true)
-        return 'True';
-    if (value === false)
-        return 'False';
-    if (typeof value !== 'string')
-        return String(value);
-    const quote = value.includes("'") && !value.includes('"') ? '"' : "'";
-    let escaped = '';
-    for (const ch of value) {
-        const code = ch.codePointAt(0);
-        if (ch === '\\')
-            escaped += '\\\\';
-        else if (ch === quote)
-            escaped += `\\${quote}`;
-        else if (ch === '\n')
-            escaped += '\\n';
-        else if (ch === '\r')
-            escaped += '\\r';
-        else if (ch === '\t')
-            escaped += '\\t';
-        else if (code < 0x20 || code === 0x7f)
-            escaped += `\\x${code.toString(16).padStart(2, '0')}`;
-        else
-            escaped += ch;
-    }
-    return `${quote}${escaped}${quote}`;
 }
 /** Run the loop to its next stop, print the report, return the exit code. Any failure becomes `error`. */
 export async function drive(s, cfg, extra = "") {
@@ -124,7 +87,7 @@ export async function drive(s, cfg, extra = "") {
     if (s.status() === "done" && s.head["worktree"]) // nothing was changed: there is nothing left to accept
         removeWorktree(s.head);
     print(G.json ? dumps(reportJson(s, cfg)) : report(s, false, cfg));
-    return get(EXIT, s.status(), 0);
+    return get(EXIT, s.status(), 0) ?? 0;
 }
 /** Load and lock a session that `command` may act on: admits() in lifecycle.ts says which. */
 export function resume(sid, command) {
@@ -151,15 +114,16 @@ export function close(s, status) {
     const last = Object.fromEntries(Object.entries(s.last("state")).filter(([k]) => k !== "t"));
     s.add("state", { ...last, status });
 }
+/** The root of the git repository the command was called in, or null outside one. */
 export function projectRoot() {
     const top = runSync("git", ["rev-parse", "--show-toplevel"]);
     return top.code === 0 ? top.out.trim() : null;
 }
 /** The text of a file, or of stdin for `-`: for a brief, an answer, a defect list or a next task. */
-export function slurp(path) {
-    if (path === "-")
+export function slurp(file) {
+    if (file === "-")
         return fs.readFileSync(0, "utf8").replace(/\r\n?/g, "\n"); // universal newlines, as Python's text mode gave them
-    return fs.readFileSync(path, "utf8").replace(/\r\n?/g, "\n");
+    return fs.readFileSync(file, "utf8").replace(/\r\n?/g, "\n");
 }
 /** [name, text] for one --file: the whole file, or lines A to B of it when the value is PATH:A-B and PATH exists. */
 export function attachment(value, workdir) {
@@ -175,6 +139,7 @@ export function attachment(value, workdir) {
         throw new Fail(`${value}: ${path_} has ${lines.length} lines, so there is no line ${last}`);
     return [`${relPath(path_, workdir)}:${first}-${last}`, lines.slice(first - 1, last).join('')];
 }
+/** `dsk run`: start a session on a brief, in place or in a worktree of its own, and drive it to its first stop. */
 export async function cmdRun(args, cfg) {
     if (Boolean(args.text) === Boolean(args.brief))
         throw new Fail('give the brief as "text" or with --brief FILE, not both');
@@ -182,7 +147,7 @@ export async function cmdRun(args, cfg) {
     if ((args.allow.length || args.worktree) && !root)
         throw new Fail("--allow and --worktree need a git repository");
     if (args.worktree)
-        refuseIgnored(root, args.allow);
+        refuseIgnored(root, args.allow); // a worktree was refused above when there is no repository
     let route = args.profile ? [args.profile] : cfg["route"];
     for (const name of route) {
         if (!has(cfg["profiles"], name))
@@ -190,7 +155,7 @@ export async function cmdRun(args, cfg) {
     }
     if (!args.profile)
         route = await orderedRoute(cfg, route); // fastest first when the setting says so, and measured if that is stale
-    apiKey(get(cfg["profiles"], route[0]));
+    apiKey(cfg["profiles"][route[0]]); // every name on the route was looked up above
     if (args.web)
         searchKey(cfg);
     const effort = args.effort || get(cfg, "effort", "off");
@@ -202,6 +167,7 @@ export async function cmdRun(args, cfg) {
     const dskPath = path.join(workdir, "DSK.md");
     const dskMd = fs.existsSync(dskPath) ? slurp(dskPath) : "";
     const guard = root && !args.worktree ? treeLock(root) : null; // held until this run returns
+    autoPrune(cfg);
     const s = new Session().lock();
     let start;
     let sandbox;
@@ -218,7 +184,7 @@ export async function cmdRun(args, cfg) {
     }
     catch (e) {
         if (args.worktree)
-            removeWorktree({ root, workdir, id: s.id });
+            removeWorktree({ root: root, workdir, id: s.id });
         rmTree(s.dir);
         throw e;
     }
@@ -255,9 +221,10 @@ export function chooseProfile(s, cfg, name) {
     }
     if (!has(cfg["profiles"], name))
         throw new Fail(`unknown profile ${name}`);
-    apiKey(get(cfg["profiles"], name));
+    apiKey(cfg["profiles"][name]);
     s.add("series", { why: "failover", profile: name, status: "chosen" }); // also when it is there already: this holds it there
 }
+/** `dsk answer`: give the worker the lead's answer to its question, and drive the run on. */
 export async function cmdAnswer(args, cfg) {
     if (Boolean(args.text) === Boolean(args.brief))
         throw new Fail('give the answer as "text" or with --brief FILE, not both');
@@ -267,6 +234,7 @@ export async function cmdAnswer(args, cfg) {
     s.add("answer", { text });
     return await drive(s, cfg, "\n\nlead's answer: " + text);
 }
+/** `dsk show`: a session's report, or its review packet, its whole diff, its turns, or its whole answer. */
 export function cmdShow(args, cfg) {
     const s = new Session(args.id);
     let text;

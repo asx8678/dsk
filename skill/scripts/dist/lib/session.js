@@ -21,8 +21,10 @@ export class Session {
     treeLock = null;
     constructor(sid = null) {
         const fresh = sid === null;
-        while (sid === null) {
-            sid = tokenHex(2);
+        // Four hex characters while a free one is easy to find. After eight taken in a row most of the 65,536 are, so
+        // the id grows to six characters, and then to eight: a state folder nobody prunes cannot run out of names.
+        for (let taken = 0; sid === null; taken++) {
+            sid = tokenHex(taken < 8 ? 2 : taken < 16 ? 3 : 4);
             fs.mkdirSync(path.join(STATE, sid), { recursive: true });
             try {
                 fs.mkdirSync(path.join(STATE, sid, 'out'));

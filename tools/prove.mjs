@@ -36,6 +36,15 @@ const RULES = [
       replace: "if (command === 'accept' || command === 'reject') return status === 'question' || status === 'review'",
       law: 'only work that stopped for review or ran out is accepted' },
   ] },
+  { file: 'prune.ts', entry: 'prunable', mode: 'standalone', broken: [
+    { bug: 'work that waits for review is deleted once it is old', find: "status !== 'dropped' && status !== 'done'",
+      replace: "status !== 'dropped' && status !== 'done' && status !== 'review'",
+      law: "work that waits for the lead's decision is never deleted" },
+    { bug: 'a session another dsk process holds is deleted', find: '  if (held) return false\n', replace: '',
+      law: 'a session another dsk process holds is never deleted' },
+    { bug: 'the days kept are not counted', find: '  return age >= keep\n', replace: '  return true\n',
+      law: 'nothing younger than the days kept is deleted' },
+  ] },
   { file: 'retry.ts', entry: 'retries', mode: 'standalone', broken: [
     { bug: 'used-up credit is retried', find: '  if (last || spent) return false', replace: '  if (last) return false',
       law: 'credit that is used up is never retried' },

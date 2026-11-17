@@ -2,7 +2,7 @@
 // the checks, and the stops they lead to.
 const fs = process.getBuiltinModule('node:fs')
 const path = process.getBuiltinModule('node:path')
-import { Fail, cpHead, get, has, now, runSync, shell, type Cfg, type Rec } from './base.ts'
+import { Fail, cpHead, get, has, now, runSync, shell, realPath, relPath, type Cfg, type Changed, type Rec } from './base.ts'
 import { matcher } from './glob.ts'
 import { sandboxed } from './sandbox.ts'
 import type { Session } from './session.ts'
@@ -11,25 +11,6 @@ import { verdict } from './revert.ts'
 /** Python's os.path.join for the two parts here: absolute `b` replaces `a`. */
 function pyJoin(a: string, b: string): string {
   return path.isAbsolute(b) ? b : path.join(a, b)
-}
-
-/** Python's os.path.relpath: the path from `start` to `p`, with "." for the same directory. */
-function pyRel(p: string, start: string): string {
-  const rel = path.relative(start, p)
-  return rel === '' ? '.' : rel
-}
-
-/** Python's os.path.realpath(strict=False): resolve the part that exists, and keep an unresolved tail as it is. */
-function realPath(p: string): string {
-  const abs = path.resolve(p)
-  try {
-    return fs.realpathSync(abs)
-  } catch (e: any) {
-    if (e?.code !== 'ENOENT' && e?.code !== 'ENOTDIR') throw e
-    const parent = path.dirname(abs)
-    if (parent === abs) return abs
-    return path.join(realPath(parent), path.basename(abs))
-  }
 }
 
 /** shutil.copy2 for a file: contents, mode and both times, so git sees the index's own mtime. */
@@ -66,7 +47,8 @@ function cpTail(text: string, n: number): string {
   return [...text].slice(-n).join('')
 }
 
-export function git(cwd: any, args: any[] = [], options: { env?: any; stdin?: any } = {}): any {
+/** Run git in `cwd` and return what it printed. A failure is a Fail that names the subcommand and gives git's own words. */
+export function git(cwd: string, args: string[] = [], options: { env?: NodeJS.ProcessEnv; stdin?: string } = {}): string {
   // errors="surrogateescape" in dsk.py: a diff of a file that is not UTF-8 goes back to `git apply` byte for byte.
   const done = runSync('git', args, { cwd, env: options.env ?? undefined, input: options.stdin ?? undefined, escape: true })
   if (done.code) {
@@ -77,8 +59,11 @@ export function git(cwd: any, args: any[] = [], options: { env?: any; stdin?: an
   return done.out
 }
 
-/** The working tree as a tree object, built in the session's own index so mine is untouched. The index is */
-export function snapshot(cwd: any, index: any): any {
+/**
+ * The working tree as a tree object, built in the session's own index so mine is untouched. The index is
+ * kept between snapshots, so only files that changed are hashed again.
+ */
+export function snapshot(cwd: string, index: string): string {
   const mine = pyJoin(cwd, git(cwd, ['rev-parse', '--git-path', 'index']).trim())
   if (!fs.existsSync(index) && fs.existsSync(mine)) {
     copy2(mine, index) // the index's own mtime, which git needs to spot same-second edits
@@ -88,17 +73,18 @@ export function snapshot(cwd: any, index: any): any {
   return git(cwd, ['write-tree'], { env }).trim()
 }
 
-export function tree(s: Session): any {
+/** The session's working tree as it is now, as a tree object. */
+export function tree(s: Session): string {
   return snapshot(s.head['workdir'], path.join(s.dir, 'index'))
 }
 
 /** The terms of the round in flight: the last `base` record's, or the head's when the lead sent no next task. */
-export function scope(s: Session): any {
+export function scope(s: Session): Rec {
   return s.last('base') || s.head
 }
 
 /** The turn limit of the round in flight: a `reject` may set one, and then it holds for that round alone. */
-export function roundLimit(recs: Rec[]): any {
+export function roundLimit(recs: Rec[]): number {
   let start: Rec | null = null
   for (let i = recs.length - 1; i >= 0; i--) {
     if (recs[i]['t'] === 'base' || recs[i]['t'] === 'reject') {
@@ -119,8 +105,12 @@ export function roundLimit(recs: Rec[]): any {
   return (base || recs[0])['max_turns']
 }
 
-/** Attribute to the worker what changed since the tree `before`, taken just before a script or the checks */
-export function settle(s: Session, before: any, turn: any = null): any {
+/**
+ * Attribute to the worker what changed since the tree `before`, taken just before a script or the checks
+ * ran: edits anyone else makes between turns are never the worker's. Changes outside --allow are undone, and a
+ * copy of what is undone stays in the session directory. Logs the result and returns the reverted paths.
+ */
+export function settle(s: Session, before: string | null, turn: number | null = null): string[] {
   if (!before) {
     return []
   }
@@ -139,7 +129,7 @@ export function settle(s: Session, before: any, turn: any = null): any {
     const here = realPath(workdir)
     for (const r of calls) {
       if (r['fn'] === 'write' || r['fn'] === 'edit') {
-        wrote.add(pyRel(realPath(pyJoin(here, r['arg'])), here))
+        wrote.add(relPath(realPath(pyJoin(here, r['path'] ?? r['arg'])), here))  // `path`: the whole of one the ledger cut
       }
     }
   }
@@ -157,7 +147,8 @@ export function settle(s: Session, before: any, turn: any = null): any {
       move(current, kept)
     }
     if (kind !== 'A') {
-      git(workdir, ['restore', `--source=${before}`, '--worktree', '--', p])
+      // The path as it is, not as a pattern: restoring `src/[ab].txt` as one also restored src/a.txt, the worker's own edit.
+      git(workdir, ['restore', `--source=${before}`, '--worktree', '--', ':(literal)' + p])
     }
     if (kind === 'M') { // caches keyed on mtime and size (Python bytecode) must not mistake it for the undone edit
       const t = Math.max(now(), undone + 1)
@@ -170,8 +161,11 @@ export function settle(s: Session, before: any, turn: any = null): any {
   return reverted
 }
 
-/** Open a window in which changes are the worker's. It is logged before anything runs, so that a run which */
-export function span(s: Session): any {
+/**
+ * Open a window in which changes are the worker's. It is logged before anything runs, so that a run which
+ * dies in the middle can still be settled by the next command on the session.
+ */
+export function span(s: Session): string | null {
   const before = scope(s)['start'] && tree(s)
   if (before) {
     s.add('span', { before })
@@ -180,20 +174,21 @@ export function span(s: Session): any {
 }
 
 /** After done(): the checks, run by dsk itself. Returns what failed, for the worker, or ''. */
-export async function gates(s: Session, cfg: Cfg, env: any): Promise<any> {
+export async function gates(s: Session, cfg: Cfg, env: NodeJS.ProcessEnv): Promise<string> {
   const checks = scope(s)['checks']
   if (!checks || (Array.isArray(checks) && !checks.length)) {
     return ''
   }
   const before = span(s)
-  const results: any[] = []
+  const results = []
   let problem = ''
   try {
     for (const cmd of checks) {
       s.add('doing', { arg: cmd })
       // In the sandbox too: a check runs what the worker wrote, such as its tests.
+      // Only the end of what it printed is read back: a check may print for ten minutes, and 2,000 characters are kept.
       const [code, out] = await shell(cmd, cfg['limits']['turn_seconds'], env, s.head['workdir'], undefined,
-                                      sandboxed(s, cfg))
+                                      sandboxed(s, cfg), 8192)
       results.push([cmd, code])
       if (code) {
         problem = `check failed: ${cmd} → ${code}\n${cpTail(out, 2000).trim()}`
@@ -207,8 +202,11 @@ export async function gates(s: Session, cfg: Cfg, env: any): Promise<any> {
   return problem
 }
 
-/** (The tree of the working directory now, [added, deleted, path] for each file the worker changed since the */
-export function changes(s: Session): any {
+/**
+ * (The tree of the working directory now, [added, deleted, path] for each file the worker changed since the
+ * start.) A file that only someone else changed during the run is not part of the worker's change set.
+ */
+export function changes(s: Session): [string | null, Changed[]] {
   const head = s.head
   if (!scope(s)['start']) {
     return [null, []]
@@ -222,23 +220,26 @@ export function changes(s: Session): any {
     }
   }
   const stat = git(head['workdir'], ['diff', '--numstat', '--no-renames', '-z', scope(s)['start'], end])
-  const changed = stat.split('\0').filter((entry: string) => entry).map((entry: string) => entry.split('\t'))
-    .filter((entry: string[]) => touched.has(entry[2]))
+  const changed = stat.split('\0').filter((entry: string) => entry).map((entry: string) => entry.split('\t') as Changed)
+    .filter((entry) => touched.has(entry[2]))
   return [end, changed]
 }
 
 /** The long answer written to @answer, or else the done() summary. */
-export function answerText(s: Session, summary: any = ""): any {
+export function answerText(s: Session, summary = ""): string {
   const file = path.join(s.dir, 'answer')
   if (fs.existsSync(file)) {
     const text = fs.readFileSync(file, 'utf8') // Python's text mode translates \r\n and \r to \n
     return text.replace(/\r\n/g, '\n').replace(/\r/g, '\n')
   }
-  return summary || get(s.last('state') || {}, 'summary', '')
+  return summary || (get(s.last('state') || {}, 'summary', '') ?? '')
 }
 
-/** The paths the worker wrote with write() or edit() in the round in flight, sorted and relative to the working */
-export function ignoredWrites(s: Session, changed: any): any {
+/**
+ * The paths the worker wrote with write() or edit() in the round in flight, sorted and relative to the working
+ * directory, that are not in `changed`, still exist and that git ignores: in no diff, and gone with a worktree.
+ */
+export function ignoredWrites(s: Session, changed: Changed[]): string[] {
   if (!scope(s)['start']) {
     return []
   }
@@ -253,11 +254,11 @@ export function ignoredWrites(s: Session, changed: any): any {
         || String(r['arg']).startsWith('@')) {
       continue
     }
-    const full = realPath(pyJoin(workdir, r['arg']))
+    const full = realPath(pyJoin(workdir, r['path'] ?? r['arg']))
     if (full !== workdir && !full.startsWith(workdir + path.sep)) {
       continue // outside the working directory: not the worker's to report here, and git cannot say
     }
-    const rel = pyRel(full, workdir)
+    const rel = relPath(full, workdir)
     if (!tracked.has(rel) && fs.existsSync(full)) {
       paths.add(rel)
     }
@@ -271,7 +272,7 @@ export function ignoredWrites(s: Session, changed: any): any {
 }
 
 /** Record a stop: snapshot the tree, measure what the worker changed, log the state. */
-export function halt(s: Session, status: any = null, info: Record<string, any> = {}): any {
+export function halt(s: Session, status: string | null = null, info: Record<string, any> = {}): string {
   info = { ...info } // Python's **info is a fresh dict: neither the caller's nor the previous stop's fields
   const [end, changed] = changes(s)
   const ignored = ignoredWrites(s, changed) // a hand-in of nothing but ignored files still changed the worktree

@@ -3,24 +3,18 @@ const fs = process.getBuiltinModule('node:fs')
 const os = process.getBuiltinModule('node:os')
 const path = process.getBuiltinModule('node:path')
 import type { ChildProcess } from 'node:child_process'
-import { Fail, G, Interrupted, RUNNER, SCRIPTS, STATE, checkInterrupt, comma, cpHead, cpLen, dumps, eprint, exitStatus, expandUser, fingerprint, fixed, flock, flockWait, fmtPercent, format, get, has, interruptOnSignals, killGroup, now, onInterrupt, print, pyFloat, pyJson, pyRound, pythonPath, readFd, runSync, sha256, shell, shlexQuote, shlexSplit, sleep, tempFile, tokenHex, write, xdg, type Args, type Cfg, type Head, type Profile, type Rec } from './base.ts'
+import { Interrupted, RUNNER, checkInterrupt, cpHead, dumps, exitStatus, get, has, killGroup, now, onInterrupt, pythonPath, sha256, isOsError, type Cfg, type Rec } from './base.ts'
 import { searchKey } from './config.ts'
 import { scope } from './gates.ts'
 import { sandboxed } from './sandbox.ts'
-import { job } from './stats.ts'
 import { SECRET } from './texts.ts'
 import { post } from './wire.ts'
 import type { Session } from './session.ts'
 
-/** Python's except OSError: a Node system error carries a string code (ENOENT, EPIPE...). */
-function isOsError(e: unknown): e is NodeJS.ErrnoException {
-  return typeof e === 'object' && e !== null && typeof (e as { code?: unknown }).code === 'string'
-}
-
 /** The environment for scripts, sh() and checks: mine, minus everything that looks like a credential. */
-export function cleanEnv(cfg: Cfg, sdir: any): any {
+export function cleanEnv(cfg: Cfg, sdir: string): Record<string, string> {
   const keys = new Set<unknown>()
-  for (const block of Object.values((cfg as any)['profiles'] as Record<string, any>)) keys.add(block['key_env'])
+  for (const block of Object.values(cfg['profiles'] as Record<string, any>)) keys.add(block['key_env'])
   keys.add((cfg as any)['search']['key_env'])
   const pass = (cfg as any)['env_pass'] as string[]
   const env: Record<string, string> = {}
@@ -42,7 +36,7 @@ export function cleanEnv(cfg: Cfg, sdir: any): any {
 }
 
 /** One raw search or fetch on the official tools API. No model is involved. */
-export async function webTool(cfg: Cfg, kind: any, target: any, count: any = 5): Promise<any> {
+export async function webTool(cfg: Cfg, kind: string, target: string, count = 5): Promise<[number, any]> {
   const payload = kind === 'search' ? { query: target, count } : { url: target }
   const base = (cfg as any)['search']['base_url'] as string
   const url = `${base.replace(/\/+$/, '')}/v1/tools/${kind}`
@@ -51,7 +45,7 @@ export async function webTool(cfg: Cfg, kind: any, target: any, count: any = 5):
 
 /** search() and fetch() for a script. The ledger records what was asked and which URLs came back. A page is
  * fetched once per session: workers read long pages a slice per turn, and every real fetch is billed. */
-export async function webCall(s: Session, cfg: Cfg, turn: any, kind: any, args: Args): Promise<any> {
+export async function webCall(s: Session, cfg: Cfg, turn: number, kind: string, args: unknown[]): Promise<{ ok: unknown } | { err: string }> {
   const argv = args as unknown as any[]
   const page = path.join((s as any).dir, 'pages', sha256(argv[0]).slice(0, 16))
   if (kind === 'fetch' && fs.existsSync(page)) {
@@ -137,9 +131,9 @@ async function nextLine(lines: AsyncIterator<string>, deadline: number, interrup
 }
 
 /** Run one script in a fresh child process. Returns (output, error, the ask/done record or None). */
-export async function runScript(s: Session, cfg: Cfg, env: any, turn: any, script: any): Promise<any> {
-  const limit = (cfg as any)['limits']['turn_seconds']
-  const outPath = path.join((s as any).dir, 'out', String(turn))
+export async function runScript(s: Session, cfg: Cfg, env: NodeJS.ProcessEnv, turn: number, script: string): Promise<[string, string, Rec | null]> {
+  const limit = cfg['limits']['turn_seconds']
+  const outPath = path.join(s.dir, 'out', String(turn))
   const out = fs.openSync(outPath, 'w')
   let proc: ChildProcess
   try {
@@ -159,10 +153,10 @@ export async function runScript(s: Session, cfg: Cfg, env: any, turn: any, scrip
   const interrupt = new Promise<void>((resolve) => { resolveInterrupt = resolve })
   const offInterrupt = onInterrupt(() => { interrupted = true; resolveInterrupt() })
   const interruptedLine = interrupt.then(() => 'interrupt' as const)
-  const job = { dir: (s as any).dir, script, allow: (scope(s) as any)['allow'], web: (s as any).head['web'], sh_deny: (cfg as any)['sh_deny'] }
-  ;(s as any).shelled = null
+  const job = { dir: s.dir, script, allow: (scope(s) as any)['allow'], web: s.head['web'], sh_deny: cfg['sh_deny'] }
+  ;s.shelled = null
   const deadline = now() + limit
-  let running: any = null, error: any = '', stop: any = null, ended = false, code = 0
+  let running = null, error: any = '', stop: any = null, ended = false, code = 0
   try {
     await writeLine(sock, dumps(job) + '\n')
     while (true) {
@@ -182,7 +176,7 @@ export async function runScript(s: Session, cfg: Cfg, env: any, turn: any, scrip
         running = (s as any).shelled = record['pgid']
         s.add('doing', { turn, arg: get(record, 'cmd', '') })
       } else if (has(record, 'rpc')) {
-        const reply = await webCall(s, cfg, turn, record['rpc'], record['args'] as Args)
+        const reply = await webCall(s, cfg, turn, record['rpc'], record['args'] as unknown[])
         if (!interrupted) await writeLine(sock, dumps(reply) + '\n')
       } else if (has(record, 'error')) {
         error = record['error']

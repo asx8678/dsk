@@ -10,14 +10,63 @@ const path = process.getBuiltinModule('node:path')
 
 // ---------------------------------------------------------------- shapes
 
-/** One record of a session's log: `t` is its kind, `at` when it was written (epoch seconds). */
+/** One record of a session's log: `t` is its kind, `at` when it was written (epoch seconds). Its other fields depend on the kind. */
 export type Rec = { t: string; at?: number; [field: string]: any }
+/** One provider profile of the configuration. A user's config may add keys of its own. */
+export type Profile = {
+  base_url: string
+  key_env: string
+  model: string
+  compact_at?: number
+  extra?: Record<string, unknown>
+  max_sessions?: number
+  price?: { in: number; cached: number; out: number }
+  headers?: Record<string, string>
+  pause_hours?: number
+  [field: string]: any
+}
+/** The limits of a run, in seconds, tokens and characters. */
+export type Limits = {
+  turn_seconds: number; run_seconds: number; run_tokens: number; output_chars: number; read_chars: number
+  idle_seconds: number; reply_seconds: number; reviewer_seconds: number
+}
 /** The merged configuration: defaults, then the plugin's options, then ~/.config/dsk/config.json. */
-export type Cfg = Record<string, any>
-/** One provider profile of the configuration. */
-export type Profile = Record<string, any>
-/** The first record of a session's log, which holds its terms. */
-export type Head = Record<string, any>
+export type Cfg = {
+  route: string[]
+  profiles: Record<string, Profile>
+  search: { base_url: string; key_env: string }
+  sh_deny: string[]
+  env_pass: string[]
+  effort: string
+  backoff: number[]
+  limits: Limits
+  [field: string]: any
+}
+/** A file the worker changed, as `git diff --numstat` gives it: lines added and deleted ('-' for a binary file), and its path. */
+export type Changed = [added: string, deleted: string, path: string]
+/** The first record of a session's log, which holds its terms. A log an older dsk wrote may lack the later fields. */
+export type Head = {
+  t: string
+  id: string
+  root: string
+  workdir: string
+  worktree: boolean
+  start: string | null
+  allow: string[]
+  checks: string[]
+  web: boolean
+  effort: string
+  max_turns: number
+  owner: string
+  route: string[]
+  brief: string
+  files: [string, string][]
+  dsk_md: string
+  date: string
+  created: number
+  at?: number
+  [field: string]: any
+}
 /** The parsed command line, under argparse's names: `args.max_turns`, `args.no_sandbox`, `args.key_stdin`. */
 export type Args = Record<string, any>
 
@@ -32,6 +81,27 @@ export function has(d: object | null | undefined, key: string): boolean {
 /** Python's d.get(key, fallback) for a dict: own keys only, and a stored null is returned as null. */
 export function get<T = any>(d: object | null | undefined, key: string, fallback: T | null = null): T | null {
   return has(d, key) ? (d as Record<string, T>)[key] as T : fallback
+}
+
+/** Whether a value that came out of JSON is a dict, as Python's isinstance(value, dict) asked. */
+export function isDict(value: unknown): value is Record<string, any> {
+  return value !== null && typeof value === 'object' && !Array.isArray(value)
+}
+
+/** Python's truth of a JSON value: false for null, false, 0 and "", and for an empty list or dict. */
+export function truthy(value: unknown): boolean {
+  if (value === null || value === undefined || value === false || value === 0 || value === '') return false
+  if (Array.isArray(value)) return value.length > 0
+  if (typeof value === 'object') return Object.keys(value).length > 0
+  return true
+}
+
+/**
+ * Python's except OSError: an error with a code (ENOENT, EACCES, and Node's ERR_FS_EISDIR from rm or cp), unless it
+ * is a TypeError or RangeError, which Node throws for a call it was given wrongly: a bug, which keeps its stack.
+ */
+export function isOsError(e: unknown): e is NodeJS.ErrnoException {
+  return typeof (e as { code?: unknown } | null)?.code === 'string' && !(e instanceof TypeError || e instanceof RangeError)
 }
 
 /** A failure dsk reports as `dsk · error: <message>`, as a Python `Fail` was. */
@@ -145,7 +215,7 @@ const FLOAT_KEYS = new Set(['at', 'created', 'active', 'cached', 'first', 'until
  */
 export function pyJson(value: unknown, sep: [string, string] = [', ', ': '], ascii = false): string {
   const text = serialize(value, sep, false)
-  return ascii ? text.replace(/[\u0080-\uffff]/g, (c) => '\\u' + c.charCodeAt(0).toString(16).padStart(4, '0')) : text
+  return ascii ? asciiEscaped(text) : text
 }
 
 function serialize(value: unknown, sep: [string, string], float: boolean): string {
@@ -178,6 +248,16 @@ function serialize(value: unknown, sep: [string, string], float: boolean): strin
     }).join(sep[0]) + '}'
   }
   throw new TypeError(`Object of type ${typeof value} is not JSON serializable`)
+}
+
+/** json.dumps as Python calls it with no arguments: spaces after the separators, every non-ASCII character escaped. */
+export function pyJsonAscii(value: unknown): string {
+  return pyJson(value, [', ', ': '], true)
+}
+
+/** A text with every character outside ASCII as a \\uXXXX escape, as json.dumps writes it by default. */
+export function asciiEscaped(text: string): string {
+  return text.replace(/[\u0080-\uffff]/g, (c) => '\\u' + c.charCodeAt(0).toString(16).padStart(4, '0'))
 }
 
 /** dsk.py's dumps(): compact JSON, non-ASCII kept as it is. The only serializer of a request. */
@@ -213,6 +293,54 @@ export function cpHead(text: string, n: number): string {
   return text.slice(0, i)
 }
 
+/** Python's " ".join(text.split()): the words of a text, with every run of whitespace made one space. */
+export function words(text: unknown): string {
+  const trimmed = String(text).trim()
+  return trimmed ? trimmed.split(/\s+/).join(' ') : ''
+}
+
+/** Python's str.splitlines(): every line separator Python knows, and no empty last line after a final one. */
+export function splitLines(text: string): string[] {
+  if (!text) return []
+  const lines = text.split(/\r\n|[\n\r\v\f\x1c-\x1e\x85\u2028\u2029]/)
+  if (lines[lines.length - 1] === '') lines.pop()
+  return lines
+}
+
+/**
+ * Python's repr() of a value that came out of JSON, as dsk.py's messages quoted one: a string in the quote that saves
+ * escaping, with control characters escaped; None, True and False by name; lists and dicts as Python prints them.
+ */
+export function pyRepr(value: unknown): string {
+  if (typeof value === 'string') {
+    const quote = value.includes("'") && !value.includes('"') ? '"' : "'"
+    let out = quote
+    for (const ch of value) {
+      const code = ch.codePointAt(0) ?? 0
+      if (ch === '\\' || ch === quote) out += '\\' + ch
+      else if (ch === '\n') out += '\\n'
+      else if (ch === '\r') out += '\\r'
+      else if (ch === '\t') out += '\\t'
+      else if (code < 0x20 || (code >= 0x7f && code < 0xa0)) out += '\\x' + code.toString(16).padStart(2, '0')
+      else out += ch
+    }
+    return out + quote
+  }
+  if (value === null || value === undefined) return 'None'
+  if (typeof value === 'number') {
+    // Python keeps 7 and 7.0 distinct; an integer JSON value reads as an int here, and repr has no .0 then.
+    if (Object.is(value, -0)) return '-0.0'
+    return Number.isInteger(value) ? String(value) : pyFloat(value)
+  }
+  if (typeof value === 'boolean') return value ? 'True' : 'False'
+  if (Array.isArray(value)) return '[' + value.map(pyRepr).join(', ') + ']'
+  if (typeof value === 'object') {
+    return '{' + Object.entries(value).map(([k, v]) => pyRepr(k) + ': ' + pyRepr(v)).join(', ') + '}'
+  }
+  return String(value)
+}
+
+/** The SHA-256 of a text or of bytes, in hex. */
 export function sha256(text: string | Buffer): string {
   return crypto.createHash('sha256').update(text).digest('hex')
 }
@@ -328,6 +456,26 @@ export function xdg(variable: string, fallback: string): string {
 
 /** Sessions, slots and caches: ~/.local/state/dsk. Read once, at startup, as dsk.py read it. */
 export const STATE = xdg('XDG_STATE_HOME', '~/.local/state')
+
+/**
+ * os.path.realpath(): symlinks resolved, and a path that does not exist yet kept as its resolved parent plus its own
+ * name, where Node's realpathSync throws. The scope gate compares written paths this way, and the sandbox profile names
+ * build caches that may not exist yet.
+ */
+export function realPath(p: string): string {
+  const abs = path.resolve(p)
+  try {
+    return fs.realpathSync(abs)
+  } catch {
+    const parent = path.dirname(abs)
+    return parent === abs ? abs : path.join(realPath(parent), path.basename(abs))
+  }
+}
+
+/** os.path.relpath(target, base): "." for the base itself, where Node says "". */
+export function relPath(target: string, base: string): string {
+  return path.relative(path.resolve(base), path.resolve(target)) || '.'
+}
 
 /** os.path.expanduser. */
 export function expandUser(p: string): string {
@@ -528,13 +676,14 @@ export function exitStatus(code: number | null, signal: NodeJS.Signals | null): 
   return -(os.constants.signals[signal as keyof typeof os.constants.signals] ?? 1)
 }
 
-/** Read a whole file through a descriptor, from its start, whatever its position. */
-export function readFd(fd: number): Buffer {
+/** Read a file through a descriptor, whatever its position: all of it, or its last `tail` bytes. */
+export function readFd(fd: number, tail = Infinity): Buffer {
   const size = fs.fstatSync(fd).size
-  const buffer = Buffer.alloc(size)
+  const from = Math.max(0, size - tail)
+  const buffer = Buffer.alloc(size - from)
   let got = 0
-  while (got < size) {
-    const n = fs.readSync(fd, buffer, got, size - got, got)
+  while (got < buffer.length) {
+    const n = fs.readSync(fd, buffer, got, buffer.length - got, from + got)
     if (n === 0) break
     got += n
   }
@@ -553,10 +702,12 @@ export function tempFile(): number {
  * dsk.py's shell(): run a command in its own process group, output and errors together, and kill the group when it
  * returns, so nothing outlives it. `wrap` is a prefix such as the sandbox's, which the command then runs under.
  * Returns [exit code, output]; 124 and a note when it ran out of time. A signal kills the group and rejects with
- * Interrupted, as KeyboardInterrupt did.
+ * Interrupted, as KeyboardInterrupt did. `tail` keeps the last bytes of the output alone, for a caller that shows
+ * only its end: 50 MB of output, read whole and cut afterwards, took a second and 660 MB of memory.
  */
 export async function shell(cmd: string, timeout: number, env?: NodeJS.ProcessEnv, cwd?: string,
-                            started: (pid: number) => void = () => {}, wrap: string[] = []): Promise<[number, string]> {
+                            started: (pid: number) => void = () => {}, wrap: string[] = [],
+                            tail = Infinity): Promise<[number, string]> {
   const out = tempFile()
   try {
     const argv = [...wrap, '/bin/sh', '-c', cmd]
@@ -576,7 +727,7 @@ export async function shell(cmd: string, timeout: number, env?: NodeJS.ProcessEn
     })
     killGroup(pid)
     if (interrupted) throw new Interrupted()
-    const text = readFd(out).toString('utf8')
+    const text = readFd(out, tail).toString('utf8')
     return timedOut ? [124, text + `\n[killed after ${timeout}s]`] : [code, text]
   } finally {
     fs.closeSync(out)

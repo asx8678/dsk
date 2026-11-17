@@ -1,18 +1,17 @@
 // The commands that start and drive a session (run, answer, continue, show, wait, bench), and resume(), which
 // refuses a command the session's state does not admit.
 const fs = process.getBuiltinModule('node:fs')
-const os = process.getBuiltinModule('node:os')
 const path = process.getBuiltinModule('node:path')
-import { Fail, G, Interrupted, RUNNER, SCRIPTS, STATE, checkInterrupt, comma, cpHead, cpLen, dumps, eprint, exitStatus, expandUser, fingerprint, fixed, flock, flockWait, fmtPercent, format, get, has, interruptOnSignals, killGroup, now, onInterrupt, print, pyFloat, pyJson, pyRound, pythonPath, readFd, runSync, sha256, shell, shlexQuote, shlexSplit, sleep, tempFile, tokenHex, write, xdg, type Args, type Cfg, type Head, type Profile, type Rec } from './base.ts'
+import { Fail, G, Interrupted, STATE, dumps, eprint, flock, get, has, now, print, runSync, sleep, isOsError, pyRepr, relPath, type Args, type Cfg, type Head } from './base.ts'
 import { makeWorktree, refuseIgnored, removeWorktree, treeLock } from './accept.ts'
 import { apiKey, searchKey } from './config.ts'
 import { answerText, changes, halt, scope, settle, snapshot, tree } from './gates.ts'
-import { firstMessage, loop, runHeader } from './loop.ts'
+import { firstMessage, loop, runHeader, type Terms } from './loop.ts'
 import { report, reportJson, turnLine, workerDiff } from './reports.ts'
 import { sandboxMode } from './sandbox.ts'
 import { Session } from './session.ts'
 import { bench, fastOrder, orderedRoute, speedText } from './speed.ts'
-import { sessions } from './stats.ts'
+import { autoPrune, sessions } from './stats.ts'
 import { EXIT, MAX_TOKENS, SYSTEM } from './texts.ts'
 import { STATUSES, admits, type Command, type Status } from './lifecycle.ts'
 
@@ -21,7 +20,7 @@ function rmTree(dir: string): void {
   try {
     fs.rmSync(dir, { recursive: true, force: true })
   } catch (e: any) {
-    if (typeof e?.code !== 'string') throw e
+    if (!isOsError(e)) throw e
   }
 }
 
@@ -30,7 +29,7 @@ function isFile(p: string): boolean {
   try {
     return fs.statSync(p).isFile()
   } catch (e: any) {
-    if (typeof e?.code === 'string') return false
+    if (isOsError(e)) return false
     throw e
   }
 }
@@ -40,15 +39,9 @@ function isDir(p: string): boolean {
   try {
     return fs.statSync(p).isDirectory()
   } catch (e: any) {
-    if (typeof e?.code === 'string') return false
+    if (isOsError(e)) return false
     throw e
   }
-}
-
-/** os.path.relpath(target, base), where Python says "." for the base itself and Node says "". */
-function relPath(target: string, base: string): string {
-  const rel = path.relative(path.resolve(base), path.resolve(target))
-  return rel === '' ? '.' : rel
 }
 
 /** The lines of a text as Python readlines() gave them: each keeps its newline, and the last may have none. */
@@ -63,40 +56,19 @@ function today(): string {
 }
 
 /** str(e) for an exception: an Error's message, else the value itself. */
-function errorText(e: any): string {
+function errorText(e: unknown): string {
   return e instanceof Error ? e.message : String(e)
 }
 
 /** type(e).__name__ for an exception: its constructor's name, as near as JavaScript has one. */
-function errorName(e: any): string {
+function errorName(e: unknown): string {
   return e && typeof e === 'object' && e.constructor && typeof e.constructor.name === 'string' && e.constructor.name
     ? e.constructor.name : typeof e
 }
 
 
-/** Python's repr() of a config value, as the effort error prints it: quotes for text, None and True/False as Python did. */
-function pyRepr(value: any): string {
-  if (value === null || value === undefined) return 'None'
-  if (value === true) return 'True'
-  if (value === false) return 'False'
-  if (typeof value !== 'string') return String(value)
-  const quote = value.includes("'") && !value.includes('"') ? '"' : "'"
-  let escaped = ''
-  for (const ch of value) {
-    const code = ch.codePointAt(0) as number
-    if (ch === '\\') escaped += '\\\\'
-    else if (ch === quote) escaped += `\\${quote}`
-    else if (ch === '\n') escaped += '\\n'
-    else if (ch === '\r') escaped += '\\r'
-    else if (ch === '\t') escaped += '\\t'
-    else if (code < 0x20 || code === 0x7f) escaped += `\\x${code.toString(16).padStart(2, '0')}`
-    else escaped += ch
-  }
-  return `${quote}${escaped}${quote}`
-}
-
 /** Run the loop to its next stop, print the report, return the exit code. Any failure becomes `error`. */
-export async function drive(s: Session, cfg: Cfg, extra: any = ""): Promise<any> {
+export async function drive(s: Session, cfg: Cfg, extra = ""): Promise<number> {
   eprint(`dsk ${s.id} · running · ${s.profile}`)
   s.add("state", { status: "running" })
   try {
@@ -114,11 +86,11 @@ export async function drive(s: Session, cfg: Cfg, extra: any = ""): Promise<any>
   if (s.status() === "done" && s.head["worktree"])  // nothing was changed: there is nothing left to accept
     removeWorktree(s.head)
   print(G.json ? dumps(reportJson(s, cfg)) : report(s, false, cfg))
-  return get(EXIT, s.status(), 0)
+  return get(EXIT, s.status(), 0) ?? 0
 }
 
 /** Load and lock a session that `command` may act on: admits() in lifecycle.ts says which. */
-export function resume(sid: any, command: Command): any {
+export function resume(sid: string, command: Command): Session {
   const s = new Session(sid).lock()
   if (s.head["start"] && !s.head["worktree"])
     s.treeLock = treeLock(s.head["root"])
@@ -138,26 +110,27 @@ export function resume(sid: any, command: Command): any {
 }
 
 /** End a session as accepted or dropped, keeping what its last stop measured. */
-export function close(s: Session, status: any): any {
+export function close(s: Session, status: 'accepted' | 'dropped'): void {
   rmTree(path.join(s.dir, "scratch"))  // throwaway files, of no use after this
   const last = Object.fromEntries(Object.entries(s.last("state")).filter(([k]) => k !== "t"))
   s.add("state", { ...last, status })
 }
 
-export function projectRoot(): any {
+/** The root of the git repository the command was called in, or null outside one. */
+export function projectRoot(): string | null {
   const top = runSync("git", ["rev-parse", "--show-toplevel"])
   return top.code === 0 ? top.out.trim() : null
 }
 
 /** The text of a file, or of stdin for `-`: for a brief, an answer, a defect list or a next task. */
-export function slurp(path: any): any {
-  if (path === "-")
+export function slurp(file: string): string {
+  if (file === "-")
     return fs.readFileSync(0, "utf8").replace(/\r\n?/g, "\n")  // universal newlines, as Python's text mode gave them
-  return fs.readFileSync(path, "utf8").replace(/\r\n?/g, "\n")
+  return fs.readFileSync(file, "utf8").replace(/\r\n?/g, "\n")
 }
 
 /** [name, text] for one --file: the whole file, or lines A to B of it when the value is PATH:A-B and PATH exists. */
-export function attachment(value: any, workdir: any): any {
+export function attachment(value: string, workdir: string): [string, string] {
   const match = /^(.+):(\d+)-(\d+)\n?$/s.exec(value)
   if (!match || !isFile(match[1] as string))
     return [value === "-" ? "@stdin" : relPath(value, workdir), slurp(value)]
@@ -171,7 +144,8 @@ export function attachment(value: any, workdir: any): any {
   return [`${relPath(path_, workdir)}:${first}-${last}`, lines.slice(first - 1, last).join('')]
 }
 
-export async function cmdRun(args: Args, cfg: Cfg): Promise<any> {
+/** `dsk run`: start a session on a brief, in place or in a worktree of its own, and drive it to its first stop. */
+export async function cmdRun(args: Args, cfg: Cfg): Promise<number> {
   if (Boolean(args.text) === Boolean(args.brief))
     throw new Fail('give the brief as "text" or with --brief FILE, not both')
 
@@ -179,7 +153,7 @@ export async function cmdRun(args: Args, cfg: Cfg): Promise<any> {
   if ((args.allow.length || args.worktree) && !root)
     throw new Fail("--allow and --worktree need a git repository")
   if (args.worktree)
-    refuseIgnored(root, args.allow)
+    refuseIgnored(root!, args.allow)  // a worktree was refused above when there is no repository
   let route = args.profile ? [args.profile] : cfg["route"]
   for (const name of route) {
     if (!has(cfg["profiles"], name))
@@ -187,7 +161,7 @@ export async function cmdRun(args: Args, cfg: Cfg): Promise<any> {
   }
   if (!args.profile)
     route = await orderedRoute(cfg, route)  // fastest first when the setting says so, and measured if that is stale
-  apiKey(get(cfg["profiles"], route[0]))
+  apiKey(cfg["profiles"][route[0]])  // every name on the route was looked up above
   if (args.web)
     searchKey(cfg)
   const effort = args.effort || get(cfg, "effort", "off")
@@ -199,6 +173,7 @@ export async function cmdRun(args: Args, cfg: Cfg): Promise<any> {
   const dskPath = path.join(workdir, "DSK.md")
   const dskMd = fs.existsSync(dskPath) ? slurp(dskPath) : ""
   const guard = root && !args.worktree ? treeLock(root) : null  // held until this run returns
+  autoPrune(cfg)
   const s = new Session().lock()
   let start: any
   let sandbox: any
@@ -207,13 +182,13 @@ export async function cmdRun(args: Args, cfg: Cfg): Promise<any> {
     start = null
     if (args.worktree) {
       workdir = path.join(s.dir, "wt")
-      makeWorktree(s, root, workdir)
+      makeWorktree(s, root!, workdir)
     }
     if (root)
       start = snapshot(workdir, path.join(s.dir, "index"))
     ;[sandbox, unsandboxed] = sandboxMode(cfg, workdir, s.dir, args.no_sandbox)
   } catch (e: any) {
-    if (args.worktree) removeWorktree({ root, workdir, id: s.id })
+    if (args.worktree) removeWorktree({ root: root!, workdir, id: s.id })
     rmTree(s.dir)
     throw e
   }
@@ -234,7 +209,7 @@ export async function cmdRun(args: Args, cfg: Cfg): Promise<any> {
   }
   s.add("series", { why: "start", profile: route[0] })
   s.add("msg", { turn: 0, m: { role: "system", content: SYSTEM } })
-  s.add("msg", { turn: 0, m: { role: "user", content: firstMessage(head) } })
+  s.add("msg", { turn: 0, m: { role: "user", content: firstMessage(head as Head) } })
   s.add("round")
   const code = await drive(s, cfg)
   void guard
@@ -242,7 +217,7 @@ export async function cmdRun(args: Args, cfg: Cfg): Promise<any> {
 }
 
 /** Run a session's next round on the profile the lead named with --profile, and hold it there (see later_profiles). It is logged as a failover, because that is the one kind of series record that keeps the messages. */
-export function chooseProfile(s: Session, cfg: Cfg, name: any): any {
+export function chooseProfile(s: Session, cfg: Cfg, name: string | null): void {
   if (!name) {
     if (!has(cfg["profiles"], s.profile))  // `dsk provider remove` took it away after the last round
       throw new Fail(`session ${s.id} ran on ${s.profile}, which was removed; choose another with --profile, one of: `
@@ -251,11 +226,12 @@ export function chooseProfile(s: Session, cfg: Cfg, name: any): any {
   }
   if (!has(cfg["profiles"], name))
     throw new Fail(`unknown profile ${name}`)
-  apiKey(get(cfg["profiles"], name))
+  apiKey(cfg["profiles"][name])
   s.add("series", { why: "failover", profile: name, status: "chosen" })  // also when it is there already: this holds it there
 }
 
-export async function cmdAnswer(args: Args, cfg: Cfg): Promise<any> {
+/** `dsk answer`: give the worker the lead's answer to its question, and drive the run on. */
+export async function cmdAnswer(args: Args, cfg: Cfg): Promise<number> {
   if (Boolean(args.text) === Boolean(args.brief))
     throw new Fail('give the answer as "text" or with --brief FILE, not both')
   const text = args.text || slurp(args.brief)
@@ -265,7 +241,8 @@ export async function cmdAnswer(args: Args, cfg: Cfg): Promise<any> {
   return await drive(s, cfg, "\n\nlead's answer: " + text)
 }
 
-export function cmdShow(args: Args, cfg: Cfg): any {
+/** `dsk show`: a session's report, or its review packet, its whole diff, its turns, or its whole answer. */
+export function cmdShow(args: Args, cfg: Cfg): number {
   const s = new Session(args.id)
   let text: any
   if (args.diff) {
@@ -282,7 +259,7 @@ export function cmdShow(args: Args, cfg: Cfg): any {
 }
 
 /** Give a finished session the lead's next task: same conversation, new terms, fresh round. */
-export async function cmdContinue(args: Args, cfg: Cfg): Promise<any> {
+export async function cmdContinue(args: Args, cfg: Cfg): Promise<number> {
   if (Boolean(args.text) === Boolean(args.brief))
     throw new Fail('give the task as "text" or with --brief FILE, not both')
   const text = args.text || slurp(args.brief)
@@ -318,7 +295,7 @@ export async function cmdContinue(args: Args, cfg: Cfg): Promise<any> {
   const start = head["start"] ? tree(s) : null
   s.add("base", { start, allow, checks, max_turns: turns, task: text, recheck, reviewer })
   s.add("round")
-  const terms: Record<string, any> = { allow, checks, max_turns: turns }
+  const terms: Terms = { allow, checks, max_turns: turns }
   for (const key of ["output_chars", "read_chars", "scratch"])
     if (has(head, key)) terms[key] = head[key]
   const extra = ("\n\nthe lead has the next task for this session. What you did before stands.\n\n"
@@ -329,7 +306,7 @@ export async function cmdContinue(args: Args, cfg: Cfg): Promise<any> {
 
 /** Block until the named sessions, or this project's running ones, have stopped, printing each report as it
  * comes. Runs started together from one shell command give no notice of their own; this is the notice. */
-export async function cmdWait(args: Args, cfg: Cfg): Promise<any> {
+export async function cmdWait(args: Args, cfg: Cfg): Promise<number> {
   const ids = args.id ?? []
   let started = now(), seen = now()
   const waiting = [...new Set(ids)] as string[]
@@ -388,7 +365,7 @@ export async function cmdWait(args: Args, cfg: Cfg): Promise<any> {
 }
 
 /** Measure the provider profiles (all of the route's by default) and print them fastest first. */
-export async function cmdBench(args: Args, cfg: Cfg): Promise<any> {
+export async function cmdBench(args: Args, cfg: Cfg): Promise<number> {
   const names = [...new Set((args.profile && args.profile.length ? args.profile : cfg["route"]) as any[])]
   for (const name of names) {
     if (!has(cfg["profiles"], name))

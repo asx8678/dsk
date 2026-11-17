@@ -4,12 +4,12 @@
 // This file is the command line: the port of dsk.py's argparse setup and main(). Node's util.parseArgs knows no
 // subcommands, abbreviations or choices, so the parser is a table of the same commands and flags, and it answers a
 // mistake in argparse's words.
-import { Fail, G, Interrupted, OutputClosed, dumps, eprint, interruptOnSignals, print, write, type Args, type Cfg } from './lib/base.ts'
+import { Fail, G, Interrupted, OutputClosed, dumps, eprint, interruptOnSignals, print, write, isOsError, pyRepr, type Args, type Cfg } from './lib/base.ts'
 import { cmdAccept, cmdReject } from './lib/accept.ts'
 import { cmdAnswer, cmdBench, cmdContinue, cmdRun, cmdShow, cmdWait } from './lib/commands.ts'
 import { config } from './lib/config.ts'
 import { cmdDoctor, cmdProvider, cmdWeb } from './lib/providers.ts'
-import { cmdConfigure, cmdStats, cmdStatus } from './lib/stats.ts'
+import { cmdConfigure, cmdPrune, cmdStats, cmdStatus } from './lib/stats.ts'
 import { MAX_TOKENS } from './lib/texts.ts'
 
 /**
@@ -136,6 +136,11 @@ function commands(): Command[] {
     json('as JSON'),
     { flags: ['--sessions'], dest: 'sessions', action: 'store_true', help: 'add a line per session' })
 
+  command('prune', 'delete settled sessions that are old enough, and name the ones that wait for you', cmdPrune).options.push(
+    { flags: ['--days'], dest: 'days', action: 'store', type: 'int', metavar: 'N',
+      help: 'delete what was settled more than N days ago (default: `keep_days` in the config, else 30)' },
+    { flags: ['--dry-run'], dest: 'dry_run', action: 'store_true', help: 'say what would go, and delete nothing' })
+
   command('search', 'raw web search, no model', cmdWeb, 'target').options.push(
     { flags: ['--count'], dest: 'count', action: 'store', type: 'int', default: 5, metavar: 'N', help: 'how many results (default 5)' })
   command('fetch', 'raw page fetch, no model', cmdWeb, 'target')
@@ -166,12 +171,6 @@ function commands(): Command[] {
   return list
 }
 
-/** Python's repr() of a string, as argparse quotes a value in its messages. */
-function repr(text: string): string {
-  const quote = text.includes("'") && !text.includes('"') ? '"' : "'"
-  return quote + text.replace(/\\/g, '\\\\').replace(new RegExp(quote, 'g'), '\\' + quote) + quote
-}
-
 /** The characters two strings have in common, as difflib's SequenceMatcher counts them (no junk: the strings are short). */
 function matching(a: string, b: string): number {
   let best = 0, at = 0, bt = 0
@@ -198,8 +197,8 @@ function closest(value: string, choices: string[]): string | null {
 /** argparse's own words for a value that is not one of the choices, with Python 3.15's guess at what was meant. */
 function badChoice(name: string, value: string, choices: string[]): ParseError {
   const guess = closest(value, choices)
-  return new ParseError(`argument ${name}: invalid choice: ${repr(value)}${guess ? `, maybe you meant ${repr(guess)}?` : ''} ` +
-                        `(choose from ${choices.map(repr).join(', ')})`)
+  return new ParseError(`argument ${name}: invalid choice: ${pyRepr(value)}${guess ? `, maybe you meant ${pyRepr(guess)}?` : ''} ` +
+                        `(choose from ${choices.map(pyRepr).join(', ')})`)
 }
 
 /**
@@ -211,7 +210,7 @@ function converted(opt: Opt, value: string): unknown {
   if (opt.type) {
     const n = Number(value)
     const decimal = opt.type === 'int' ? /^\s*\+?\d+\s*$/ : /^\s*\+?(\d+\.?\d*|\.\d+)(e[+-]?\d+)?\s*$/i
-    if (!decimal.test(value) || !Number.isFinite(n)) throw new ParseError(`argument ${name}: invalid ${opt.type} value: ${repr(value)}`)
+    if (!decimal.test(value) || !Number.isFinite(n)) throw new ParseError(`argument ${name}: invalid ${opt.type} value: ${pyRepr(value)}`)
     return n
   }
   if (opt.choices && !opt.choices.includes(value)) throw badChoice(name, value, opt.choices)
@@ -322,7 +321,7 @@ function parse(argv: string[]): [Command, Args] {
       groupSeen.set(opt.group, name)
     }
     if (opt.action !== 'store' && opt.action !== 'append') {
-      if (found.value !== undefined) throw new ParseError(`argument ${name}: ignored explicit argument ${repr(found.value)}`)
+      if (found.value !== undefined) throw new ParseError(`argument ${name}: ignored explicit argument ${pyRepr(found.value)}`)
       if (opt.action === 'help') {
         write(help(all, c))
         throw new HelpShown()
@@ -369,20 +368,12 @@ function parse(argv: string[]): [Command, Args] {
   return [c, args]
 }
 
-/**
- * Python's except OSError: an error with a code (ENOENT, EACCES, and Node's ERR_FS_EISDIR from rm or cp), unless it
- * is a TypeError or RangeError, which Node throws for a call it was given wrongly: a bug, which keeps its stack.
- */
-function isSystemError(e: any): e is NodeJS.ErrnoException {
-  return typeof e?.code === 'string' && !(e instanceof TypeError || e instanceof RangeError)
-}
-
 /** str() of an OSError as Python printed it: `[Errno 2] No such file or directory: 'brief.md'`. */
 function osErrorText(e: NodeJS.ErrnoException): string {
   const described = /^[A-Z0-9_]+: ([^,]*)/.exec(e.message)?.[1] ?? e.message
   const text = described.charAt(0).toUpperCase() + described.slice(1)
   const errno = typeof e.errno === 'number' ? Math.abs(e.errno) : null
-  return (errno !== null ? `[Errno ${errno}] ` : '') + text + (e.path ? `: ${repr(e.path)}` : '')
+  return (errno !== null ? `[Errno ${errno}] ` : '') + text + (e.path ? `: ${pyRepr(e.path)}` : '')
 }
 
 /** dsk.py's main(): parse, run the command, and turn a Fail or an OS error into `dsk · error: ...` and exit code 1. */
@@ -406,7 +397,7 @@ async function main(argv: string[] = process.argv.slice(2)): Promise<number> {
     return Number(await c.run(args, config())) || 0
   } catch (e: any) {
     if (e instanceof OutputClosed) return 1  // `dsk status | head -1`: the reader has all it wanted
-    if (e instanceof Fail || isSystemError(e)) {
+    if (e instanceof Fail || isOsError(e)) {
       const message = e instanceof Fail ? e.message : osErrorText(e)
       print(G.json ? dumps({ error: message }) : `dsk · error: ${message}`)
       return 1

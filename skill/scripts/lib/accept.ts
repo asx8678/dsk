@@ -2,7 +2,7 @@
 // in-place run per tree.
 const fs = process.getBuiltinModule('node:fs')
 const path = process.getBuiltinModule('node:path')
-import { Fail, G, STATE, dumps, flock, get, print, runSync, sha256, type Args, type Cfg, type Head } from './base.ts'
+import { Fail, G, STATE, dumps, flock, get, print, runSync, sha256, type Args, type Cfg, type Head, type Lock } from './base.ts'
 import { chooseProfile, close, drive, resume, slurp } from './commands.ts'
 import { git, scope, snapshot, tree } from './gates.ts'
 import { matcher } from './glob.ts'
@@ -10,14 +10,14 @@ import { workerDiff } from './reports.ts'
 import type { Session } from './session.ts'
 
 /** Remove a session's worktree and branch. Best effort: either may already be gone. */
-export function removeWorktree(head: Head): any {
+export function removeWorktree(head: Pick<Head, 'root' | 'workdir' | 'id'>): void {
   for (const args of [['worktree', 'remove', '--force', head.workdir], ['branch', '-D', `dsk/${head.id}`]])
     runSync('git', args, { cwd: head.root })
 }
 
 /** One dsk process at a time may change a tree in place: a run undoes what leaves its scope while its scripts
  * execute, and that must never be another run's work. A worktree run needs this only when `accept` applies it. */
-export function treeLock(root: any): any {
+export function treeLock(root: string): Lock {
   fs.mkdirSync(STATE, { recursive: true })
   const name = 'tree-' + sha256(String(root)).slice(0, 12)
   return flock(path.join(STATE, name), 'another dsk run is working in this tree: wait for it, or use --worktree')
@@ -26,8 +26,8 @@ export function treeLock(root: any): any {
 /** The --allow patterns that name paths git ignores. Each is tried on a sample path, the pattern with an `x` in
  * place of every wildcard, so `docs/*.md` is asked as `docs/x.md`: a rule may ignore a folder and spare some of its
  * files. The sample need not exist. */
-export function ignoredPatterns(root: any, globs: any): any {
-  const found: any[] = []
+export function ignoredPatterns(root: string, globs: string[]): string[] {
+  const found = []
   for (const pattern of globs) {
     const sample = String(pattern).replace(/\*+|\?|\[[^\]]*\]/g, 'x')
     if (runSync('git', ['check-ignore', '-q', '--', sample], { cwd: root }).code === 0) found.push(pattern)
@@ -37,14 +37,14 @@ export function ignoredPatterns(root: any, globs: any): any {
 
 /** A worktree hands in only what git tracks or would track: accept applies a git diff and the worktree is then
  * deleted, so a file written to an ignored path there is lost without a word. Such a task has to run in place. */
-export function refuseIgnored(root: any, globs: any): any {
+export function refuseIgnored(root: string, globs: string[]): void {
   const found = ignoredPatterns(root, globs)
   if (found.length)
     throw new Fail(`--allow ${found.join(', ')} names paths git ignores, and a worktree run cannot hand those in: dsk accept applies only what git tracks, and the worktree is then deleted. Run this task without --worktree`)
 }
 
 /** A worktree at `workdir`, on branch dsk/<id>, holding the main tree as it is now, uncommitted state and all. */
-export function makeWorktree(s: Session, root: any, workdir: any): any {
+export function makeWorktree(s: Session, root: string, workdir: string): void {
   if (runSync('git', ['-C', root, 'rev-parse', '--verify', '-q', 'HEAD']).code)
     throw new Fail('--worktree needs a commit to start from, and this repository has none: '
                    + 'make a first commit (git add -A && git commit -m start), or run without --worktree')
@@ -54,13 +54,17 @@ export function makeWorktree(s: Session, root: any, workdir: any): any {
     git(workdir, ['apply'], { stdin: seed })
 }
 
-export function cmdAccept(args: Args, cfg: Cfg): any {
+/**
+ * `dsk accept`: mark the work as reviewed. A worktree session's change is applied to the main tree as the worktree
+ * stands, the lead's own edits inside --allow included, and the worktree goes; a change made in place is there already.
+ */
+export function cmdAccept(args: Args, cfg: Cfg): number {
   const s = resume(args.id, 'accept')
   const st = s.last('state')
   const head = s.head
   let count = st.changed.length
-  let now: any = null
-  let applied: any = null
+  let now = null
+  let applied = null
   let saved = ''
   const late: string[] = []
   if (head.worktree) {
@@ -121,7 +125,11 @@ export function cmdAccept(args: Args, cfg: Cfg): any {
   return 0
 }
 
-export async function cmdReject(args: Args, cfg: Cfg): Promise<any> {
+/**
+ * `dsk reject`: send the lead's defects back into the session, which starts a new round, or with --drop discard the
+ * work: the worktree goes, or a change made in place is taken out of the tree again.
+ */
+export async function cmdReject(args: Args, cfg: Cfg): Promise<number> {
   if ((Number(Boolean(args.text)) + Number(Boolean(args.brief)) + Number(Boolean(args.drop))) !== 1)
     throw new Fail('give the defects as "text" or with --brief FILE, or --drop to discard the work, not two of them')
   const text = args.text || (args.brief ? slurp(args.brief) : '')

@@ -6,8 +6,11 @@ import { claimSlot, secret } from './config.ts'
 import { BENCH_PROMPT, SYSTEM } from './texts.ts'
 import { headers, paused, release, requestBody, send } from './wire.ts'
 
+/** What `dsk bench` measured of one profile: the seconds of its quicker reply, or null and why not, and when. */
+export type Speed = { seconds: number | null; why: string; at?: number | null }
+
 /** The last measurement of every profile, {name: {"seconds", "why", "at"}}; {} when there is none or it is broken. */
-export function speeds(): any {
+export function speeds(): Record<string, Speed> {
   let found
   try {
     found = JSON.parse(fs.readFileSync(path.join(STATE, 'speed.json'), 'utf8'))
@@ -19,7 +22,7 @@ export function speeds(): any {
 }
 
 /** Time profile `name` with two small requests: {"seconds": the smaller one, rounded, or None, "why": why not}. */
-export async function probe(cfg: Cfg, name: any): Promise<any> {
+export async function probe(cfg: Cfg, name: string): Promise<Speed> {
   const profile = get(get(cfg, 'profiles'), name)
   const key = secret(profile.key_env)
   if (!key) return { seconds: null, why: 'no key' }
@@ -44,7 +47,7 @@ export async function probe(cfg: Cfg, name: any): Promise<any> {
 }
 
 /** Probe the profiles at the same time, one thread each, and merge the result into STATE/speed.json. */
-export async function bench(cfg: Cfg, names: any): Promise<any> {
+export async function bench(cfg: Cfg, names: string[]): Promise<Record<string, Speed>> {
   const results = new Map<string, any>()
 
   // Promise.all is the join the threads needed; a rejected probe is recorded, never fatal to the benchmark.
@@ -76,13 +79,13 @@ export async function bench(cfg: Cfg, names: any): Promise<any> {
 }
 
 /** How long ago, for the line about a kept measurement: whole minutes up to an hour and a half, else hours. */
-export function ago(seconds: any): any {
+export function ago(seconds: number): string {
   const minutes = Math.max(0, Math.floor(seconds / 60))
   return minutes < 90 ? `${minutes}m` : `${pyRound(minutes / 60)}h`
 }
 
 /** What one profile's line says: its time, or why it has none, and a busy profile's last time and when. */
-export function speedText(entry: any, now: any = null): any {
+export function speedText(entry: Partial<Speed>, now: number | null = null): string {
   const seconds = get(entry, 'seconds')
   if (seconds === null) return get(entry, 'why') || 'no answer'
   const text = `${fixed(seconds, 2)}s`
@@ -93,21 +96,21 @@ export function speedText(entry: any, now: any = null): any {
 }
 
 /** `route` fastest first: the profiles with a time by ascending time, then the rest as they are listed. */
-export function fastOrder(found: any, route: any): any {
+export function fastOrder(found: Record<string, Speed>, route: string[]): string[] {
   const timed = route.filter((name: any) => get(get(found, name) || {}, 'seconds') !== null)
-  timed.sort((a: any, b: any) => get(get(found, a), 'seconds') - get(get(found, b), 'seconds'))
+  timed.sort((a, b: any) => get(get(found, a), 'seconds') - get(get(found, b), 'seconds'))
   return timed.concat(route.filter((name: any) => !timed.includes(name)))
 }
 
 /** The route to try: as listed, or fastest first from measurements fresh enough to trust (measuring first). */
-export async function orderedRoute(cfg: Cfg, route: any): Promise<any> {
+export async function orderedRoute(cfg: Cfg, route: string[]): Promise<string[]> {
   if (get<string>(cfg, 'route_order', 'listed') !== 'fastest' || route.length < 2) {
     return [...route]  // a route of one profile has nothing to order
   }
   fs.mkdirSync(STATE, { recursive: true })
   // waits: runs started together measure once, not once each
   const handle = flockWait(path.join(STATE, 'bench.lock'))
-  let found: any = {}
+  let found = {}
   try {
     found = speeds()
     const fresh = timeNow() - 60 * Number(get(cfg, 'bench_minutes', 15))

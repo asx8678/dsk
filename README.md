@@ -96,7 +96,7 @@ One command, typed like any other slash command, with a word after it for all bu
 A provider is an API that serves a DeepSeek model: DeepSeek's own (`official`), or any OpenAI-compatible endpoint you add (a custom provider). `/dsk config` lists them in the order a run tries them, each with its model, its endpoint and whether its key is set. It looks roughly like this:
 
 ```
-dsk 0.11.2 · settings
+dsk 0.12.0 · settings
   Delegation   ● on  Claude hands the hands-on work to dsk
   Job display  ● on  running jobs show above the prompt, /dsk lists them
   Route order  your priority  providers are tried as numbered below
@@ -320,7 +320,7 @@ A `DSK.md` at a repository's root opens every run's first message: the layout, h
 
 ## Guardrails, stated honestly
 
-The AST gate, the scrubbed environment, the denylist and the scope gate stop an obedient but mistaken model. On macOS, scripts, `sh()` and checks also run under `sandbox-exec`: writing outside the working directory, the session's scratch folder, the temp folders and the usual build caches fails, and so does writing in `.git`, whose hooks and config would run code outside the sandbox. dsk's key file, the plugin's `options.json` (where its form keeps the keys) and the `.new` copy written beside it, `~/.ssh`, `~/.aws` and other credential stores cannot be read. It does not cover the network or git-ignored files inside the tree, and on Linux there is none: there a worker with `sh()` is as powerful as a shell and can read any file you can. Keep `--web` off for tasks that also need `sh()` in a repository with secrets, because fetched pages are untrusted input. Nothing here prevents running `dsk` inside a container.
+The AST gate, the audit hook behind it (which refuses a script that opens a file for writing or starts a process outside `write()`, `edit()` and `sh()`), the scrubbed environment, the denylist and the scope gate stop an obedient but mistaken model. On macOS, scripts, `sh()` and checks also run under `sandbox-exec`: writing outside the working directory, the session's scratch folder, the temp folders and the usual build caches fails, and so does writing in `.git`, whose hooks and config would run code outside the sandbox. dsk's key file, the plugin's `options.json` (where its form keeps the keys) and the `.new` copy written beside it, `~/.ssh`, `~/.aws` and other credential stores cannot be read. It does not cover the network or git-ignored files inside the tree, and on Linux there is none: there a worker with `sh()` is as powerful as a shell and can read any file you can. Keep `--web` off for tasks that also need `sh()` in a repository with secrets, because fetched pages are untrusted input. Nothing here prevents running `dsk` inside a container.
 
 An in-place run cannot tell its own script's side effects from an edit someone else makes during the same seconds. Such an edit outside `--allow` is undone with the script's (a copy is kept). Use `--worktree` when anyone else is working in the tree.
 

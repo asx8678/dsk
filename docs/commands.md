@@ -27,6 +27,8 @@ dsk wait [ID ...]          block until those sessions (default: yours in this pr
 dsk status --json          the last day's sessions on any project, as JSON, for a display to poll
 dsk stats [ID ...]         what sessions measured: outcomes, where the turns went, tokens, time, per profile
         [--days 7] [--project] [--sessions] [--json]
+dsk prune [--days N]       delete the settled sessions (accepted, dropped, done) nothing was written to for N days
+        [--dry-run]        (default: `keep_days` in the config, else 30); never one that waits for your decision
 dsk search "query"         raw web search, no model
 dsk fetch URL              raw page fetch, no model
 dsk doctor [--profile NAME]
